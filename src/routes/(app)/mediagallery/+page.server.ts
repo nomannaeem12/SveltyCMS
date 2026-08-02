@@ -21,12 +21,14 @@ import type { MediaAccess } from "@root/src/utils/media/media-models";
 import { dbAdapter } from "@src/databases/db";
 import { cacheService } from "@src/databases/cache/cache-service";
 import { MediaService } from "@src/utils/media/media-service.server";
-import { error, redirect, isHttpError, isRedirect } from "@sveltejs/kit";
+import { error, isHttpError, isRedirect } from "@sveltejs/kit";
+import { getAuthenticatedUser } from "@utils/page-guards.server";
 // System Logger
 import { type LoggableValue, logger } from "@utils/logger";
 import { getImageSizes, moveMediaToTrash } from "@utils/media/media-storage.server";
 import { resolveMediaPublicPath } from "@utils/media/media-utils";
 import type { Actions, PageServerLoad } from "./$types";
+import { matchesJsonPathFilter } from "@utils/json-path-filter";
 
 /**
  * 🚀 Fast serializer: converts _id/parent ObjectIds to strings.
@@ -55,19 +57,22 @@ export const load: PageServerLoad = async ({ locals, url }) => {
   }
 
   try {
-    // User is already validated in hooks.server.ts
-    const { user, isAdmin, roles: tenantRoles } = locals;
-    if (!user) {
-      throw redirect(302, "/login");
-    }
+    const user = getAuthenticatedUser(locals);
+    const isAdmin =
+      locals.isAdmin === true ||
+      (user as any)?.isAdmin === true ||
+      (locals.isAdmin == null && (user.role === "admin" || user.role === "super-admin"));
+    // Admin early-return in handleAuthorization can leave locals.roles undefined — never
+    // call Object.values on undefined (that 500s the whole media gallery).
+    const tenantRoles = (locals.roles ?? []) as Array<{ permissions?: string[] }>;
 
     // Check if user has permission to access media gallery
     const hasMediaPermission =
       isAdmin ||
-      Object.values(tenantRoles).some(
+      tenantRoles.some(
         (role) =>
-          ((role as { permissions?: string[] }).permissions || []).includes("media:read") ||
-          ((role as { permissions?: string[] }).permissions || []).includes("media:write"),
+          (role.permissions || []).includes("media:read") ||
+          (role.permissions || []).includes("media:write"),
       );
 
     if (!hasMediaPermission) {
@@ -77,24 +82,41 @@ export const load: PageServerLoad = async ({ locals, url }) => {
 
     const folderId = url.searchParams.get("folderId"); // Get folderId from URL
     const recursive = url.searchParams.get("recursive") === "true";
-    logger.info(
-      `Loading media gallery for folderId: ${folderId || "root"} (recursive: ${recursive})`,
+    // Server-side JSON path filter (shareable via URL; same syntax as client filter)
+    const jsonPath = (url.searchParams.get("jsonPath") || url.searchParams.get("jsonpath") || "")
+      .trim()
+      .slice(0, 500);
+    logger.debug(
+      `Loading media gallery for folderId: ${folderId || "root"} (recursive: ${recursive}${jsonPath ? `, jsonPath` : ""})`,
     );
 
     // 🚀 Fetch virtual folders with SWR (5 min fresh, 30 min stale)
+    // Soft-fail: empty tree is preferable to a 500 on the whole gallery.
     const vfCacheKey = `mediagallery:virtualFolders:${locals.tenantId || "global"}`;
-    const virtualFoldersData = await cacheService.getOrSetSWR<any[]>(
-      vfCacheKey,
-      async () => {
-        const result = await dbAdapter.system.virtualFolder.getAll();
-        if (!result.success) throw new Error("Virtual folder fetch failed");
-        return Array.isArray(result.data) ? result.data : [];
-      },
-      300_000, // Fresh: 5 min
-      1_800_000, // Stale: 30 min (serve stale while refreshing)
-    );
+    let virtualFoldersData: any[] = [];
+    try {
+      virtualFoldersData =
+        (await cacheService.getOrSetSWR<any[]>(
+          vfCacheKey,
+          async () => {
+            const result = await dbAdapter.system.virtualFolder.getAll();
+            if (!result.success) {
+              logger.warn("Virtual folder fetch failed — returning empty list");
+              return [];
+            }
+            return Array.isArray(result.data) ? result.data : [];
+          },
+          300_000, // Fresh: 5 min
+          1_800_000, // Stale: 30 min (serve stale while refreshing)
+        )) || [];
+    } catch (vfErr) {
+      logger.warn(
+        `Virtual folder load failed (non-fatal): ${vfErr instanceof Error ? vfErr.message : String(vfErr)}`,
+      );
+      virtualFoldersData = [];
+    }
 
-    const serializedVirtualFolders = virtualFoldersData.map((folder) =>
+    const serializedVirtualFolders = (virtualFoldersData || []).map((folder) =>
       serializeIds(folder as unknown),
     );
 
@@ -105,28 +127,38 @@ export const load: PageServerLoad = async ({ locals, url }) => {
       : null;
     logger.trace("Current folder determined:", currentFolder);
 
-    // Use db-agnostic adapter method to fetch media
-    const mediaResult = await dbAdapter.media.files.getByFolder(
-      folderId as DatabaseId | undefined,
-      {
-        pageSize: 100,
-        page: 1,
-        sortField: "updatedAt",
-        sortDirection: "desc",
-        user, // Pass user for ownership filtering
-      },
-      recursive,
-    );
+    // Use db-agnostic adapter method to fetch media (soft-fail: empty list > 500)
+    let allMediaResults: Record<string, unknown>[] = [];
+    try {
+      const getByFolder = dbAdapter.media?.files?.getByFolder;
+      if (typeof getByFolder !== "function") {
+        logger.warn("media.files.getByFolder is unavailable — returning empty media list");
+      } else {
+        const mediaResult = await getByFolder(folderId as DatabaseId | undefined, {
+          pageSize: 100,
+          page: 1,
+          sortField: "updatedAt",
+          sortDirection: "desc",
+          recursive,
+          user, // Pass user for ownership filtering
+          // Push metadata.* clauses into SQLite JSON1 / PG jsonb / Mongo when possible
+          ...(jsonPath ? { jsonPath } : {}),
+        });
+        if (mediaResult?.success && mediaResult.data) {
+          allMediaResults = (mediaResult.data.items as unknown as Record<string, unknown>[]) || [];
+        }
+      }
+    } catch (mediaErr) {
+      logger.warn(
+        `Media getByFolder failed (non-fatal): ${mediaErr instanceof Error ? mediaErr.message : String(mediaErr)}`,
+      );
+      allMediaResults = [];
+    }
 
-    const allMediaResults: Record<string, unknown>[] =
-      mediaResult.success && mediaResult.data
-        ? (mediaResult.data.items as unknown as Record<string, unknown>[])
-        : [];
-
-    logger.info(`Fetched ${allMediaResults.length} media items for folder ${folderId || "root"}`);
+    logger.debug(`Fetched ${allMediaResults.length} media items for folder ${folderId || "root"}`);
 
     if (allMediaResults.length === 0) {
-      logger.info("No media items found");
+      logger.debug("No media items found");
     }
 
     // Process and flatten media results - Filter and validate media items before processing
@@ -158,7 +190,10 @@ export const load: PageServerLoad = async ({ locals, url }) => {
           const publicUrl = resolveMediaPublicPath(mediaItem);
 
           // Use DB-stored thumbnails directly (already has correct URLs from upload)
-          const thumbnails = (mediaItem.thumbnails ?? {}) as Record<string, { url: string }>;
+          const thumbnails = (mediaItem.thumbnails ?? {}) as Record<
+            string,
+            { url: string; width?: number; height?: number; size?: number }
+          >;
           const thumbnailEntry = thumbnails.thumbnail ?? thumbnails.sm ?? null;
 
           return {
@@ -169,9 +204,14 @@ export const load: PageServerLoad = async ({ locals, url }) => {
             url: publicUrl,
             thumbnail: thumbnailEntry ? { url: thumbnailEntry.url } : { url: publicUrl },
             thumbnails,
-            width: (mediaItem as any).width ?? (mediaItem.metadata as any)?.advancedMetadata?.width,
+            width:
+              (mediaItem as any).width ??
+              (mediaItem.metadata as any)?.width ??
+              (mediaItem.metadata as any)?.advancedMetadata?.width,
             height:
-              (mediaItem as any).height ?? (mediaItem.metadata as any)?.advancedMetadata?.height,
+              (mediaItem as any).height ??
+              (mediaItem.metadata as any)?.height ??
+              (mediaItem.metadata as any)?.advancedMetadata?.height,
           };
         } catch (err) {
           logger.error("Error processing media item", {
@@ -183,20 +223,63 @@ export const load: PageServerLoad = async ({ locals, url }) => {
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
 
-    logger.info(`Fetched ${processedMedia.length} media items for folder ${folderId || "root"}`);
-    logger.info(`Fetched ${serializedVirtualFolders.length} total virtual folders`);
+    // Optional server-side JSON path filter (reduces payload when linked via ?jsonPath=)
+    let filteredMedia = processedMedia;
+    if (jsonPath) {
+      filteredMedia = processedMedia.filter((item) => matchesJsonPathFilter(item, jsonPath));
+      logger.debug(
+        `JSON path filter "${jsonPath}" reduced media ${processedMedia.length} → ${filteredMedia.length}`,
+      );
+    }
 
-    const returnData = {
-      user: {
-        // Ensure user data is serializable
-        role: user.role,
-        _id: user._id.toString(), // Convert user ID to string
-        avatar: user.avatar,
-      },
-      media: processedMedia, // Use the processed and filtered media
-      systemVirtualFolders: serializedVirtualFolders as SystemVirtualFolder[], // All folders for the VirtualFolders component
-      currentFolder: currentFolder as SystemVirtualFolder | null, // The specific folder object for the current view
-    };
+    logger.debug(`Fetched ${filteredMedia.length} media items for folder ${folderId || "root"}`);
+    logger.debug(`Fetched ${serializedVirtualFolders.length} total virtual folders`);
+
+    // 🚀 Check which media items are referenced by published content
+    // Soft-fail: never 500 the gallery if reference scanning crashes
+    const publishedMediaIds: string[] = [];
+    try {
+      const mediaService = new MediaService(dbAdapter);
+      const publishedRefResults = await Promise.allSettled(
+        filteredMedia.map((item) =>
+          mediaService.isReferencedByPublishedContent(item._id as string, null),
+        ),
+      );
+      for (let i = 0; i < publishedRefResults.length; i++) {
+        const result = publishedRefResults[i];
+        if (result.status === "fulfilled" && result.value.referenced) {
+          publishedMediaIds.push(filteredMedia[i]!._id as string);
+        }
+      }
+      logger.debug(`Found ${publishedMediaIds.length} media items referenced by published content`);
+    } catch (refErr) {
+      logger.warn(
+        `Published-content reference scan failed (non-fatal): ${refErr instanceof Error ? refErr.message : String(refErr)}`,
+      );
+    }
+
+    // Force JSON-safe payload — Buffers/ObjectIds in avatar or media metadata
+    // previously crashed SvelteKit serialization after a successful load (500 UI).
+    const returnData = JSON.parse(
+      JSON.stringify({
+        user: {
+          role: user.role,
+          _id: String(user._id),
+          avatar:
+            typeof user.avatar === "string"
+              ? user.avatar
+              : user.avatar
+                ? String((user.avatar as any).url || (user.avatar as any).toString?.() || "")
+                : undefined,
+        },
+        media: filteredMedia,
+        systemVirtualFolders: serializedVirtualFolders as SystemVirtualFolder[],
+        currentFolder: currentFolder as SystemVirtualFolder | null,
+        publishedMediaIds,
+        /** Echo server-applied JSON path filter for client sync / shareable URLs */
+        jsonPathFilter: jsonPath || "",
+      }),
+    );
 
     return returnData;
   } catch (err) {
@@ -218,11 +301,7 @@ export const actions: Actions = {
     }
 
     try {
-      const user = locals.user;
-      if (!user) {
-        logger.warn("No user found in locals during file upload");
-        throw redirect(302, "/login");
-      }
+      const user = getAuthenticatedUser(locals);
 
       const formData = await request.formData();
       const files = formData.getAll("files");
@@ -240,11 +319,12 @@ export const actions: Actions = {
               user._id as any,
               access,
               (locals.tenantId as DatabaseId | null) ?? null,
+              folder, // _basePath — target virtual folder; "global" keeps root
             );
             if (!result.success) {
               throw new Error(result.message || "Failed to save media file");
             }
-            logger.info(`File uploaded successfully to ${folder}: ${file.name}`);
+            logger.debug(`File uploaded successfully to ${folder}: ${file.name}`);
           }),
       );
 
@@ -282,7 +362,7 @@ export const actions: Actions = {
       const formData = await request.formData();
       const imageDataStr = formData.get("imageData");
 
-      logger.info("Delete request received, imageDataStr:", imageDataStr);
+      logger.debug("Delete request received, imageDataStr:", imageDataStr);
 
       if (!imageDataStr || typeof imageDataStr !== "string") {
         logger.error("Invalid image data received - not a string");
@@ -290,8 +370,7 @@ export const actions: Actions = {
       }
 
       const image = JSON.parse(imageDataStr);
-      logger.warn("Parsed image data:", image);
-      logger.trace("Received delete request for image:", image);
+      logger.debug("Delete request parsed for image:", image?._id);
 
       if (!image?._id) {
         logger.error("Invalid image data received - no _id");
@@ -338,7 +417,7 @@ export const actions: Actions = {
             const dynamicFolders = Object.keys(configuredSizes);
             const allSizes = [...new Set([...standardFolders, ...dynamicFolders])];
 
-            logger.info(
+            logger.debug(
               `Deleting all variants for file: ${fileName} in ${basePath} - Sizes: ${allSizes.join(", ")}`,
             );
 
@@ -346,7 +425,7 @@ export const actions: Actions = {
               const sizePath = `${basePath}/${size}/${fileName}`;
               try {
                 await moveMediaToTrash(sizePath);
-                logger.info(`Deleted ${size} variant:`, sizePath);
+                logger.debug(`Deleted ${size} variant:`, sizePath);
               } catch {
                 // File might not exist in this size folder - that's OK
                 logger.debug(`No ${size} variant found (or already deleted):`, sizePath);
@@ -355,7 +434,7 @@ export const actions: Actions = {
           } else {
             // Fallback: just try to delete the exact path
             await moveMediaToTrash(cleanPath);
-            logger.info("File moved to trash (fallback):", cleanPath);
+            logger.debug("File moved to trash (fallback):", cleanPath);
           }
         } else {
           logger.warn("No path or url found for file deletion:", image._id);
@@ -384,12 +463,12 @@ export const actions: Actions = {
       }
 
       // Use db-agnostic media adapter for deletion
-      logger.info(`Deleting media item: ${image._id}`);
+      logger.debug(`Deleting media item: ${image._id}`);
 
       const result = await dbAdapter.media.files.delete(image._id.toString());
 
       if (result.success) {
-        logger.info("Media item deleted successfully");
+        logger.debug("Media item deleted successfully");
         // Invalidate media gallery cache after deletion
         try {
           const { cacheService } = await import("@src/databases/cache/cache-service");
@@ -414,11 +493,7 @@ export const actions: Actions = {
     }
 
     try {
-      const user = locals.user;
-      if (!user) {
-        logger.warn("No user found in locals during file upload");
-        throw redirect(302, "/login");
-      }
+      const user = getAuthenticatedUser(locals);
 
       const formData = await request.formData();
       const remoteUrls = JSON.parse(formData.get("remoteUrls") as string) as string[];
@@ -441,17 +516,17 @@ export const actions: Actions = {
               return;
             }
             const arrayBuffer = await response.arrayBuffer();
-            const buffer = Buffer.from(arrayBuffer);
             const contentType = response.headers.get("content-type") || "application/octet-stream";
             const filename = url.substring(url.lastIndexOf("/") + 1);
-            const file = new File([buffer], filename, { type: contentType });
+            const file = new File([arrayBuffer], filename, { type: contentType });
             await mediaService.saveMedia(
               file,
               user._id as any,
               access,
               (locals.tenantId as DatabaseId | null) ?? null,
+              folder, // _basePath — target virtual folder; "global" keeps root
             );
-            logger.info(`Remote file uploaded successfully to ${folder}: ${file.name}`);
+            logger.debug(`Remote file uploaded successfully to ${folder}: ${file.name}`);
           } catch (fileError) {
             const errorMessage = fileError instanceof Error ? fileError.message : String(fileError);
             if (errorMessage.includes("duplicate")) {

@@ -2,24 +2,25 @@
 @file src/components/left-sidebar.svelte
 
 @component
-**LeftSidebar component displaying collection fields, publish options and translation status.**
+**LeftSidebar — context-aware primary navigation**
+
+Route-driven sidebar content (no dual collapsible section headers):
+- Default / collections → collection tree only
+- Media gallery → virtual folders + back to collections
+- System settings → SettingsMenu
 
 @example
 <LeftSidebar />
 
-#### Props
-- `mode` {object} - The current mode object from the mode store
-- `collection` {object} - The current collection object from the collection store
-
-#### Features
-- Displays collection fields
-- Displays publish options
-- Displays translation status
-- Optimized event handlers
+### Features:
+- Context-switched collections tree vs media folders
+- Pinned items (when any)
+- User / theme / language / sign-out footer
 -->
 
 <script lang="ts">
 	import Button from '@components/ui/button.svelte';
+	import Input from '@components/ui/input.svelte';
 	// Native UI Components
 	import Dropdown from "@components/ui/dropdown.svelte";
 	import Collections from '@src/components/collections.svelte';
@@ -33,31 +34,29 @@
 	import SystemTooltip from '@src/components/system/system-tooltip.svelte';
 	import ThemeToggle from '@src/components/theme-toggle.svelte';
 	import VersionCheck from '@src/components/version-check.svelte';
-	import type { ContentNode } from '@src/content/types'; // Import Schema type (collection definition)
+	import type { ContentNode } from '@src/content/types';
 	// Paraglide Messages
 	import {
 		applayout_signout,
 		applayout_systemconfiguration,
 		applayout_systemlanguage,
 		applayout_userprofile,
-		Collections_MediaGallery
 	} from '@src/paraglide/messages';
 	import type { Locale } from '@src/paraglide/runtime';
 	import { locales as availableLocales, getLocale } from '@src/paraglide/runtime';
-	import { goto } from '$app/navigation';
+	import { goto, invalidateAll } from '$app/navigation';
 	// Stores
-	import { contentStructure, setMode } from '@src/stores/collection-store.svelte';
-	import { ui, uiStateManager, toggleUIElement, userPreferredState } from '@src/stores/ui-store.svelte';
+	import { contentStructure } from '@src/stores/collection-store.svelte';
+	import { ui, toggleUIElement } from '@src/stores/ui-store.svelte';
+	import { modeTransitionGuard } from '@src/stores/mode-transition-guard.svelte';
 	import { publicEnv } from '@src/stores/global-settings.svelte';
-	import { avatarSrc, systemLanguage } from '@src/stores/store.svelte';
+	import { app, systemLanguage } from '@src/stores/store.svelte';
 	import { themeStore } from '@src/stores/theme-store.svelte';
 	import { pinnedStore } from '@src/stores/pinned-store.svelte';
 	import { getLanguageName } from '@utils/language-utils';
 	import { logger } from '@utils/logger';
-		import Avatar from '@components/ui/avatar.svelte';
-	// Removed axios import
+	import Avatar from '@components/ui/avatar.svelte';
 	import { browser } from '$app/environment';
-	// Import necessary utilities and types
 	import { page } from '$app/state';
 	import { scale } from 'svelte/transition';
 	import { getThemeContext } from '@components/ui/theme-context.svelte';
@@ -76,25 +75,12 @@
 	const currentPath = $derived(page.url.pathname);
 	const collections: ContentNode[] = $derived(contentStructure.value || []);
 	let searchQuery = $state('');
-	// Removed isDropdownOpen and dropdownRef as Menu handles this
 
-	// Collapsible Sidebar Sections State
+	// Route context: exclusive modes — never show both trees at once
+	const isMediaGalleryRoute = $derived(currentPath.includes('/mediagallery'));
+
+	// Collapsible: pinned section only
 	let isPinnedOpen = $state(true);
-	let isCollectionsOpen = $state(true);
-	let isMediaOpen = $state(false);
-
-	$effect(() => {
-		// Context-aware sidebar: sections are route-specific to match user intent.
-		// - /mediagallery             → Media only
-		// - default (collections)     → Collections only
-		if (currentPath.includes('/mediagallery')) {
-			isMediaOpen = true;
-			isCollectionsOpen = false;
-		} else {
-			isCollectionsOpen = true;
-			isMediaOpen = false;
-		}
-	});
 
 	// Derived values
 	const isSidebarFull = $derived(ui.state.leftSidebar === 'full');
@@ -121,7 +107,12 @@
 
 	const showLanguageDropdown = $derived(availableLanguages.length > LANGUAGE_DROPDOWN_THRESHOLD);
 
-	let languageTag = $state<Locale>('en' as Locale);
+	let languageTag = $state<Locale>(getLocale() as Locale);
+
+	// Keep languageTag in sync when the Paraglide locale changes externally
+	$effect(() => {
+		languageTag = getLocale() as Locale;
+	});
 
 	const filteredLanguages = $derived(
 		availableLanguages
@@ -135,7 +126,7 @@
 	);
 
 	const avatarUrl = $derived.by(() => {
-		let src = avatarSrc.value;
+		let src = user?.avatar;
 		if (!src || src === 'Default_User.svg' || src === '/Default_User.svg') {
 			return '/Default_User.svg';
 		}
@@ -144,11 +135,8 @@
 		}
 
 		// Normalize path
-		// 1. Remove leading slashes
 		src = src.replace(/^\/+/, '');
-		// 2. Remove prefixes
 		src = src.replace(/^mediaFolder\//, '').replace(/^files\//, '');
-		// 3. Remove leading slashes again just in case
 		src = src.replace(/^\/+/, '');
 
 		return `/files/${src}?t=${AVATAR_CACHE_BUSTER}`;
@@ -170,92 +158,100 @@
 		return browser && window.innerWidth < MOBILE_BREAKPOINT;
 	}
 
-
 	// Event handlers
 	function handleLanguageSelection(lang: AvailableLanguage): void {
+		app.systemLanguage = lang;
 		systemLanguage.set(lang as Locale);
 		languageTag = lang as Locale;
 		searchQuery = '';
 	}
 
-	// Unused settings helper removed
-
 	function toggleSidebar(): void {
-		const current = uiStateManager.uiState.value.leftSidebar;
-		const newState: SidebarState = current === 'full' ? 'collapsed' : 'full';
+		const newState: SidebarState = ui.state.leftSidebar === 'full' ? 'collapsed' : 'full';
 		toggleUIElement('leftSidebar', newState);
-		userPreferredState.set(newState);
 	}
 
 	function handleUserClick(): void {
 		if (isMobile()) {
 			toggleUIElement('leftSidebar', 'hidden');
 		}
-		setMode('view');
+		modeTransitionGuard.setMode('view');
 	}
 
 	function handleConfigClick(): void {
 		if (isMobile()) {
 			toggleUIElement('leftSidebar', 'hidden');
 		}
-		setMode('view');
+		modeTransitionGuard.setMode('view');
 	}
 
 	async function signOut(): Promise<void> {
 		try {
-			await fetch('/api/user/logout', {
+			let res = await fetch('/api/user/logout', {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
 					'X-CSRF-Token': page.data.csrfToken
 				}
 			});
+			if (!res.ok && res.status === 403) {
+				await invalidateAll();
+				await new Promise(r => setTimeout(r, 100));
+				await fetch('/api/user/logout', {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'X-CSRF-Token': page.data.csrfToken
+					}
+				});
+			}
 		} catch (error) {
 			logger.error('Error during sign-out:', error instanceof Error ? error.message : 'Unknown error');
 		} finally {
-			// Always redirect to login, even if logout fails
-			if (browser) {
-				window.location.href = '/login';
-			}
+			if (browser) window.location.href = '/login';
 		}
 	}
 
-	function handleCollectionsClick(): void {
-		isCollectionsOpen = !isCollectionsOpen;
-		if (isCollectionsOpen) {
-			isMediaOpen = false;
-		}
+	/** Leave media gallery and restore collections navigation */
+	function handleBackToCollections(): void {
 		if (collections.length === 0) {
 			goto('/config/collectionbuilder');
 		} else {
 			goto(firstCollectionPath);
 		}
+		if (isMobile()) {
+			toggleUIElement('leftSidebar', 'collapsed');
+		}
 	}
 
-	$effect(() => {
-		if (firstCollectionPath === undefined) return;
-	});
+	/** Navigate to the media gallery from collection builder context */
+	function handleGoToMediaGallery(): void {
+		goto('/mediagallery');
+		if (isMobile()) {
+			toggleUIElement('leftSidebar', 'collapsed');
+		}
+	}
 </script>
 
 <div class="sidebar-root flex h-full w-full flex-col justify-between bg-transparent">
 	<!-- Corporate Identity -->
 	{#if isSidebarFull}
-		<a href="/" aria-label="SveltyCMS Logo" class="-ms-2 flex items-center pt-1 no-underline!" data-sveltekit-preload-data="hover">
+		<a href="/" aria-label="SveltyCMS Logo" class="-ms-2 flex min-h-12 shrink-0 items-center pt-2 no-underline!" data-sveltekit-preload-data="hover">
 			<SveltyCMSLogo fill="red" className="h-9" />
-			<span class="base-font-color relative -ms-1 text-2xl font-bold"><SiteName siteName={publicEnv.SITE_NAME} highlight="CMS" /></span>
+			<span class="base-font-color relative -ms-1 text-2xl font-bold leading-none"><SiteName siteName={publicEnv.SITE_NAME} highlight="CMS" /></span>
 		</a>
 	{:else}
-		<div class="flex justify-start gap-2">
+		<div class="flex min-h-12 shrink-0 items-center justify-start gap-2 pt-2">
 			<Button variant="ghost"
 				type="button"
 				onclick={() => toggleUIElement('leftSidebar', 'hidden')}
 				aria-label="Close Sidebar"
-			 class="p-0! min-w-0 preset-outline-surface-500 mt-1">
+			 class="p-0! min-w-0 preset-outline-surface-500">
 				<iconify-icon icon="mingcute:menu-fill" width="24"></iconify-icon>
 			</Button>
 
-			<a href="/" aria-label="SveltyCMS Logo" class="flex justify-center pt-2 no-underline!">
-				<SveltyCMSLogo fill="red" className="h-9 -ml-2 ltr:mr-2 rtl:ml-2 rtl:-mr-2" />
+			<a href="/" aria-label="SveltyCMS Logo" class="flex items-center no-underline!">
+				<SveltyCMSLogo fill="red" className="h-9 -ms-2" />
 			</a>
 		</div>
 	{/if}
@@ -263,8 +259,8 @@
 	<!-- Expand/Collapse Button -->
 	<SystemTooltip
 		title={isSidebarFull ? 'Collapse Sidebar' : 'Expand Sidebar'}
-		positioning={{ placement: 'right' }}
-		triggerClass="absolute top-2 z-20 ltr:-end-4 rtl:-start-4"
+		positioning={{ placement: 'right-end' }}
+		triggerClass="absolute top-3 z-20 ltr:-end-4 rtl:-start-4"
 	>
 		<Button variant="ghost"
 			type="button"
@@ -276,7 +272,7 @@
 			<iconify-icon
 				icon="bi:arrow-left-circle-fill"
 				width="34"
-				class="rounded-full bg-surface-500 text-white transition-transform hover:cursor-pointer hover:bg-error-600 dark:bg-white dark:text-surface-600 dark:hover:bg-error-600 {isSidebarFull
+				class="rounded-full bg-surface-500 text-white transition-transform dark:bg-white dark:text-surface-600 {isSidebarFull
 					? 'rotate-0 rtl:rotate-180'
 					: 'rotate-180 rtl:rotate-0'}"
 			></iconify-icon>
@@ -316,11 +312,12 @@
 					{#if isPinnedOpen}
 						<div class="space-y-0.5" transition:scale={{ duration: 150, start: 0.95 }}>
 							{#each pinnedStore.items as item (item.id)}
-								<div class="group relative flex items-center justify-between rounded hover:bg-surface-100/50 dark:hover:bg-surface-500/20">
+								<div class="group relative flex items-center justify-between rounded hover:bg-[color-mix(in_srgb,var(--admin-bg-sidebar)_80%,var(--admin-border-default))]">
 									<a
 										href={item.path}
 										data-sveltekit-preload-data="hover"
-										class="flex flex-1 items-center gap-2 px-2 py-2 text-sm text-surface-900 dark:text-surface-100 no-underline!"
+										class="flex flex-1 items-center gap-2 px-2 py-2 text-sm no-underline!"
+										style="color: var(--admin-text-body)"
 										onclick={() => {
 											if (isMobile()) toggleUIElement('leftSidebar', 'hidden');
 										}}
@@ -335,8 +332,8 @@
 											type="button"
 											onclick={() => pinnedStore.unpin(item.id)}
 											title="Unpin"
-										aria-label="Unpin" class="-xs rounded-full p-0.5 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:bg-surface-200 dark:hover:bg-surface-800">
-											<iconify-icon icon="bi:x" width="16" class="text-surface-500"></iconify-icon>
+										aria-label="Unpin" class="-xs rounded-full p-0.5 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:bg-(--admin-border-subtle)]">
+											<iconify-icon icon="bi:x" width="16" style="color: var(--admin-text-muted)"></iconify-icon>
 										</Button>
 									{/if}
 								</div>
@@ -344,79 +341,65 @@
 						</div>
 					{/if}
 				</div>
-				<div class="mx-1 border-0 border-t border-surface-200/50 dark:border-surface-700/50"></div>
+				<div class="mx-1 border-0 border-t" style="border-color: var(--admin-border-default)"></div>
 			{/if}
 
-			<!-- 2. Collections -->
-			<div class="space-y-1">
-				<Button variant="ghost"
-					type="button"
-					onclick={handleCollectionsClick}
-					class="flex w-full items-center justify-between py-2 text-xs font-bold uppercase tracking-wider rounded {isSidebarFull ? 'px-2' : 'justify-center'}"
-				 aria-label="Toggle collections">
-					<span class="flex items-center gap-1.5">
-						<iconify-icon icon="bi:collection" width="16" class="text-tertiary-500 dark:text-primary-500"></iconify-icon>
-						{#if isSidebarFull}Collections{/if}
-					</span>
-					{#if isSidebarFull}
-						<iconify-icon
-							icon="bi:chevron-down"
-							width="12"
-							class="transform transition-transform duration-200 {isCollectionsOpen ? '' : '-rotate-90'}"
-						></iconify-icon>
-					{/if}
-				</Button>
-				{#if isCollectionsOpen && showCollectionsHere}
-					<div class="px-1">
-						<Collections />
-					</div>
-				{/if}
-			</div>
-			<div class="mx-1 border-0 border-t border-surface-200/50 dark:border-surface-700/50"></div>
-
-			<!-- 3. Media Gallery -->
-			<div class="space-y-1">
-				<Button variant="ghost"
-					type="button"
-					onclick={() => {
-						goto('/mediagallery');
-						if (isMobile()) {
-							toggleUIElement('leftSidebar', 'collapsed');
-						}
-					}}
-					class="flex w-full items-center justify-between py-2 text-xs font-bold uppercase tracking-wider rounded {isSidebarFull ? 'px-2' : 'justify-center'}"
-				>
-					<span class="flex items-center gap-1.5">
-						<iconify-icon icon="bi:images" width="16" class="text-tertiary-500 dark:text-primary-500"></iconify-icon>
-						{#if isSidebarFull}{Collections_MediaGallery()}{/if}
-					</span>
-					{#if isSidebarFull}
-						<iconify-icon
-							icon="bi:chevron-down"
-							width="12"
-							class="transform transition-transform duration-200 {isMediaOpen ? '' : '-rotate-90'}"
-						></iconify-icon>
-					{/if}
-				</Button>
-				{#if isMediaOpen}
-					<div class="px-1 space-y-2">
-						{#if isSidebarFull && !currentPath.includes('/mediagallery')}
-							<a
-								href="/mediagallery"
-								data-sveltekit-preload-data="hover"
-								class="flex items-center gap-2 rounded px-3 py-2 text-xs font-semibold text-tertiary-500 dark:text-primary-500 bg-tertiary-500/10 hover:bg-tertiary-500/20 dark:bg-primary-500/10 hover:dark:bg-primary-500/20 no-underline! transition-colors"
-								onclick={() => {
-									if (isMobile()) toggleUIElement('leftSidebar', 'collapsed');
-								}}
-							>
-								<iconify-icon icon="bi:images" width="14"></iconify-icon>
-								Open Media Gallery
-							</a>
-						{/if}
+			<!-- 2. Route-context navigation: collections tree OR media folders (never both) -->
+			{#if isMediaGalleryRoute}
+				<!-- Media gallery: virtual folder tree first, then back button -->
+				<div class="space-y-2" data-testid="sidebar-media-context">
+					<div class="px-1 space-y-2" role="region" aria-label="Media folders">
 						<MediaFolders />
 					</div>
-				{/if}
-			</div>
+
+					<SystemTooltip
+						title="Back to Collections"
+						positioning={{ placement: 'right' }}
+						triggerClass="w-full"
+					>
+						<Button
+							variant="ghost"
+							type="button"
+							onclick={handleBackToCollections}
+							aria-label="Back to Collections"
+							class="flex w-full items-center gap-1.5 rounded py-2 text-xs font-bold uppercase tracking-wider {isSidebarFull ? 'justify-start px-2' : 'justify-center'}"
+							style="color: var(--admin-text-muted)"
+						>
+							<iconify-icon icon="bi:arrow-left" width="16" class="shrink-0 text-tertiary-500 dark:text-primary-500"></iconify-icon>
+							{#if isSidebarFull}
+								<span class="truncate">Collections</span>
+							{/if}
+						</Button>
+					</SystemTooltip>
+				</div>
+			{:else if showCollectionsHere}
+				<!-- Default: collection tree only — no redundant section header button -->
+				<div class="w-full ps-0 pe-1 text-start" data-testid="sidebar-collections-context" role="region" aria-label="Collections">
+					<Collections />
+				</div>
+
+				<div class="mx-1 border-0 border-t" style="border-color: var(--admin-border-default)"></div>
+
+				<SystemTooltip
+					title="Go to Media Gallery"
+					positioning={{ placement: 'right' }}
+					triggerClass="w-full"
+				>
+					<Button
+						variant="ghost"
+						type="button"
+						onclick={handleGoToMediaGallery}
+						aria-label="Go to Media Gallery"
+						class="flex w-full items-center gap-1.5 rounded py-2 text-xs font-bold uppercase tracking-wider {isSidebarFull ? 'justify-start px-2' : 'justify-center'}"
+						style="color: var(--admin-text-muted)"
+					>
+						<iconify-icon icon="bi:image" width="16" class="shrink-0 text-tertiary-500 dark:text-primary-500"></iconify-icon>
+						{#if isSidebarFull}
+							<span class="truncate">Media Gallery</span>
+						{/if}
+					</Button>
+				</SystemTooltip>
+			{/if}
 		{/if}
 	</div>
 
@@ -424,20 +407,21 @@
 	<div class="mt-2 w-full px-1"><Slot name="sidebar" /></div>
 	<!-- Footer -->
 	<div class="mb-2 mt-auto w-full px-1">
-		<div class="mx-1 mb-2 border-0 border-t border-surface-500"></div>
+		<div class="mx-1 mb-2 border-0 border-t" style="border-color: var(--admin-border-subtle)"></div>
 
-		<div class="grid w-full items-center justify-center gap-1 text-surface-700 dark:text-surface-200 {isSidebarFull ? 'grid-cols-3' : 'grid-cols-2'}">
+		<div class="grid w-full items-center justify-center gap-1 {isSidebarFull ? 'grid-cols-3' : 'grid-cols-2'}" style="color: var(--admin-text-body)">
 			<!-- Avatar -->
 			<div class="{isSidebarFull ? 'order-1 row-span-2' : 'order-1'} flex items-center justify-center">
 				<SystemTooltip title={applayout_userprofile()} positioning={{ placement: 'right' }}>
 					<a
 						href="/user"
 						data-sveltekit-preload-data="hover"
+						data-testid="nav-user-profile"
 						onclick={handleUserClick}
 						aria-label="User Profile"
 						class="{isSidebarFull
-							? 'flex w-full flex-col items-center justify-center rounded p-2 hover:bg-surface-500/20'
-							: 'h-8 w-8 rounded-full hover:bg-surface-500/20'} relative flex items-center justify-center text-center no-underline!"
+							? 'flex w-full flex-col items-center justify-center rounded p-2 hover:bg-(--admin-border-subtle)]'
+							: 'h-8 w-8 rounded-full hover:bg-(--admin-border-subtle)]'} relative flex items-center justify-center text-center no-underline!"
 						>
 							<Avatar src={avatarUrl} alt="User Avatar" size={isSidebarFull ? 'size-12' : 'size-10'} rounded="rounded-full" class="mx-auto" />
 						{#if isSidebarFull && user?.username}
@@ -457,21 +441,22 @@
  				<SystemTooltip title={themeTooltipText} positioning={{ placement: 'right' }}>
  					<!-- Wrapper div needed because ThemeToggle might not forward all events/props or to serve as reliable trigger anchor -->
  					<div class="flex items-center justify-center">
-						<ThemeToggle showTooltip={false} buttonClass="btn-icon  rounded-full hover:bg-surface-300/20" iconSize={28} />
+						<ThemeToggle showTooltip={false} buttonClass="btn-icon hover:bg-[var(--admin-border-subtle)]" iconSize={28} />
  					</div>
  				</SystemTooltip>
  			</div>
 
  			<!-- Language Selector -->
  			<div class="{isSidebarFull ? 'order-3 row-span-2' : 'order-4'} flex items-center justify-center px-1">
- 				<SystemTooltip title={applayout_systemlanguage()} positioning={{ placement: 'right' }}>
- 					<div class="language-selector relative">
+  				<SystemTooltip title={applayout_systemlanguage()} positioning={{ placement: 'right' }} role={null} tabindex={null}>
+ 					<div class="language-selector relative" data-testid="language-selector">
  						<Dropdown position="right-start" class="w-56">
  							{#snippet trigger()}
  								<Button
  									variant="surface"
  									rounded
  									aria-label="Select language"
+ 									data-testid="language-selector-trigger"
  									class="mb-3 flex items-center justify-center uppercase hover:bg-surface-400 {isSidebarFull ? 'h-12 w-12 text-xs font-semibold' : 'h-11 w-11 text-xs font-semibold'}"
  								>
  									{languageTag}
@@ -485,36 +470,36 @@
 
  							{#if showLanguageDropdown}
  								<div class="px-2 pb-2 mb-1 border-b border-surface-200 dark:border-surface-50">
- 									<input
- 										type="text"
- 										bind:value={searchQuery}
- 										placeholder="Search language..."
- 										class="w-full rounded bg-surface-200 dark:bg-surface-800 px-3 py-2 text-sm placeholder:text-surface-400 focus:outline-none focus:ring-2 focus:ring-primary-500 text-surface-900 dark:text-white border-none"
- 										aria-label="Search languages"
- 										onclick={(e) => e.stopPropagation()}
- 									/>
+									<Input aria-label="Search"
+										type="text"
+										bind:value={searchQuery}
+										placeholder="Search language..."
+										inputClass="w-full rounded bg-surface-200 dark:bg-surface-800 px-3 py-2 text-sm placeholder:text-surface-400 focus:outline-none focus:ring-2 focus:ring-primary-500 text-surface-900 dark:text-white border-none"
+									/>
  								</div>
 
  								<div class="max-h-64 divide-y divide-surface-200 dark:divide-surface-700 overflow-y-auto">
  									{#each filteredLanguages as lang (lang)}
-										<button
+										<Button
+											variant="ghost"
 											class="w-full text-start px-3 py-2 flex items-center justify-between rounded-sm cursor-pointer hover:bg-surface-200/50 dark:hover:bg-surface-800/50 text-surface-900 dark:text-surface-200"
 											onclick={() => handleLanguageSelection(lang)}
 										>
 											<span class="text-sm font-medium text-surface-900 dark:text-surface-200">{getLanguageName(lang)}</span>
 											<span class="text-xs font-normal text-tertiary-500 dark:text-primary-500 ms-2">{lang.toUpperCase()}</span>
-										</button>
- 									{/each}
- 								</div>
+										</Button>
+									{/each}
+								</div>
 							{:else}
 								{#each availableLanguages.filter((l) => l !== languageTag) as lang (lang)}
-									<button
+									<Button
+										variant="ghost"
 										class="w-full text-start px-3 py-2 flex items-center justify-between rounded-sm cursor-pointer hover:bg-surface-200/50 dark:hover:bg-surface-800/50 text-surface-900 dark:text-surface-200"
 										onclick={() => handleLanguageSelection(lang)}
 									>
 										<span class="text-sm font-medium">{getLanguageName(lang)}</span>
 										<span class="text-xs font-normal text-tertiary-500 dark:text-primary-500 ms-2">{lang.toUpperCase()}</span>
-									</button>
+									</Button>
 								{/each}
  							{/if}
  						</Dropdown>
@@ -525,8 +510,15 @@
 			<!-- Sign Out -->
 			<div class="{isSidebarFull ? 'order-4' : 'order-3'} flex items-center justify-center">
 				<SystemTooltip title={applayout_signout()} positioning={{ placement: 'right' }}>
-					<Button variant="ghost" onclick={signOut} type="button" aria-label="Sign Out" class="flex h-12 w-12 items-center justify-center rounded-full p-0! min-w-0">
-						<iconify-icon icon="uil:signout" width="32" class=""></iconify-icon>
+					<Button
+						variant="ghost"
+						onclick={signOut}
+						type="button"
+						aria-label="Sign Out"
+						data-testid="sign-out-button"
+						class="flex h-12 w-12 items-center justify-center rounded-full p-0! min-w-0"
+					>
+						<iconify-icon icon="uil:signout" width="32" class="" aria-hidden="true"></iconify-icon>
 					</Button>
 				</SystemTooltip>
 			</div>
@@ -547,11 +539,11 @@
  			</div>
 
  			<!-- Version -->
- 			<div class="{isSidebarFull ? 'order-6' : 'order-5'} flex items-center justify-center"><VersionCheck compact={true} /></div>
+ 			<div class="{isSidebarFull ? 'order-7' : 'order-6'} flex items-center justify-center"><VersionCheck compact={true} /></div>
 
  			<!-- Community Links (only when expanded) -->
  			{#if isSidebarFull}
- 				<div class="order-7 flex items-center justify-center gap-1">
+				<div class="order-8 flex items-center justify-center gap-1">
  					<SystemTooltip title="Discord Community" positioning={{ placement: 'right' }}>
  						<a
  							href="https://discord.gg/VrvZF6e2sC"
@@ -577,6 +569,22 @@
 
 	.sidebar-root {
 		max-width: var(--admin-sidebar-width, 240px);
+		position: relative;
+	}
+
+	.sidebar-root::after {
+		content: '';
+		position: absolute;
+		inset-inline-end: -0.5rem;
+		top: 3.5rem;
+		bottom: 0;
+		width: 1px;
+		background-color: var(--color-surface-200, #e2e8f0);
+		pointer-events: none;
+	}
+
+	:global(.dark) .sidebar-root::after {
+		background-color: var(--color-surface-500, #64748b);
 	}
 
 	/* Scrollbar styling */

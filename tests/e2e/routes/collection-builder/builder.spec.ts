@@ -1,267 +1,150 @@
-// tests/playwright/collection-builder.spec.ts
-import { expect, test } from "@playwright/test";
-import { loginAsAdmin } from "../../helpers/auth";
+/**
+ * @file tests/e2e/routes/collection-builder/builder.spec.ts
+ * @description Collection Builder E2E — Testing 2026 pattern (webhooks reference).
+ *
+ * **One domain → shell guard + one golden journey.** Do not re-grow a 9-file suite.
+ *
+ * | Layer | Coverage |
+ * | ----- | -------- |
+ * | E2E shell | Board / add-collection chrome |
+ * | E2E golden | Schema → entry → API (full lifecycle) |
+ * | Unit | collectionbuilder-utils, page.server |
+ * | Integration | collection-structure, structure-persistence*, code-gui-parity |
+ *
+ * Demoted from E2E (do not re-add without ADR review):
+ * empty-state, structure-persistence UI, federation, widget toggles, field reorder,
+ * extensions widget catalog, entry publish UI (API status asserted in golden).
+ */
 
-test.describe("Collection Builder with Modern Widgets", () => {
+import { expect, test } from "@playwright/test";
+import { resetAndSeedDatabase } from "../../helpers/api";
+import {
+  addInputField,
+  openCollectionEntries,
+  openNewCollectionEditor,
+  saveCollectionSchema,
+  uniqueCollectionFixture,
+} from "../../helpers/collection-builder-flow";
+
+test.describe.configure({ mode: "serial", timeout: 120_000 });
+
+test.describe("Collection Builder (Testing 2026 — shell + golden)", () => {
   test.beforeEach(async ({ page }) => {
-    // Login as admin first
-    await loginAsAdmin(page);
+    await resetAndSeedDatabase(page);
   });
 
-  test("should navigate to collection builder", async ({ page }) => {
-    await page.goto("/config/collectionbuilder");
+  /**
+   * Shell guard — primary chrome only.
+   * Matches ADR: minimal testids, no soft-skip.
+   */
+  test("shell: page title and new collection control", async ({ page }) => {
+    await page.goto("/config/collectionbuilder", { waitUntil: "domcontentloaded" });
     await expect(page.getByRole("heading", { level: 1, name: /collection builder/i })).toBeVisible({
-      timeout: 10_000,
+      timeout: 15_000,
     });
+    await expect(
+      page
+        .getByTestId("collection-builder-board")
+        .or(page.getByTestId("add-collection-button").first())
+        .first(),
+    ).toBeVisible({ timeout: 15_000 });
 
     const addCollection = page.getByTestId("add-collection-button").first();
     await expect(addCollection).toBeVisible({ timeout: 10_000 });
     await addCollection.click();
-    await expect(page).toHaveURL(/\/config\/collectionbuilder\/new/, { timeout: 10_000 });
-    await expect(page.getByTestId("collection-editor-stepper")).toBeVisible();
+    await expect(page).toHaveURL(/\/config\/collectionbuilder\/new/, { timeout: 15_000 });
+    await expect(page.getByTestId("collection-editor-tabs")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByTestId("collection-name-input")).toBeVisible({ timeout: 10_000 });
   });
 
-  test("should display widget management page", async ({ page }) => {
-    // Navigate to widget management
-    await page.goto("/config/extensions");
-    await page.getByRole("tab", { name: /widgets/i }).click();
+  /**
+   * Soft-refresh contract — save must not hard-reload the document (session/consent stay).
+   * Complements ContentSync `collection-save` + `invalidate("app:content")` path.
+   */
+  test("soft-refresh: schema save keeps session shell (no hard navigation to login)", async ({
+    page,
+  }) => {
+    await page.goto("/config/collectionbuilder", { waitUntil: "domcontentloaded" });
+    await expect(page).not.toHaveURL(/\/login/, { timeout: 15_000 });
 
-    await expect(page.locator("h1")).toContainText("Extension Management");
+    const fixture = uniqueCollectionFixture("SoftHmr");
+    await openNewCollectionEditor(page);
+    await page.getByTestId("collection-name-input").fill(fixture.name);
+    await addInputField(page, { label: "Title", fieldName: "title" });
 
-    // Check if widgets are loaded - use locator-based waitFor
-    await page
-      .locator('[data-testid="widget-grid"]')
-      .first()
-      .waitFor({ state: "visible", timeout: 5000 })
-      .catch(() => {
-        console.log("[E2E] Widget list container not found, continuing...");
-      });
-
-    // Verify core widgets are visible using regex
-    await expect(page.getByText(/textinput|checkbox|input/i).first()).toBeVisible({
-      timeout: 10_000,
+    // Marker survives soft invalidate; would be wiped by full document reload
+    await page.evaluate(() => {
+      (window as unknown as { __SVELTY_SOFT_HMR_MARK?: number }).__SVELTY_SOFT_HMR_MARK = 42;
     });
-  });
 
-  test("should create a collection with modern widgets", async ({ page }) => {
-    // Navigate to collection builder
-    await page.goto("/config/collectionbuilder");
+    await saveCollectionSchema(page);
 
-    // Start creating a new collection
-    await page.getByTestId("add-collection-button").first().click();
-
-    // Fill collection basic info
-    await page.fill(
-      'input[name="name"], input[placeholder*="name"], input[placeholder*="Name"]',
-      "Test Article",
+    await expect(page).not.toHaveURL(/\/login/, { timeout: 10_000 });
+    const mark = await page.evaluate(
+      () => (window as unknown as { __SVELTY_SOFT_HMR_MARK?: number }).__SVELTY_SOFT_HMR_MARK,
     );
-    await page.fill(
-      'input[name="description"], textarea[name="description"], input[placeholder*="description"]',
-      "Test collection for articles",
+    expect(mark, "Expected in-page mark after schema save (soft invalidate, not hard reload)").toBe(
+      42,
     );
-
-    // Navigate to fields/widgets tab
-    const widgetTab = page.locator(
-      'button:has-text("Fields"), button:has-text("Widgets"), .tab-widgets',
-    );
-    if (await widgetTab.isVisible()) {
-      await widgetTab.click();
-    }
-
-    // Add a text field
-    await page.click('button:has-text("Add Field"), button:has-text("Add Widget"), .add-field-btn');
-
-    // Select a widget from the modal
-    const widgetModal = page.locator('.modal, [data-testid="widget-select-modal"]');
-    await widgetModal.waitFor({ state: "visible" });
-
-    // Select text/input widget
-    await page
-      .getByRole("button", { name: /TextInput|Input/i })
-      .first()
-      .click();
-
-    // Configure the field
-    await page.fill('input[name="label"], input[placeholder*="label"]', "Article Title");
-    await page.fill(
-      'input[name="db_fieldName"], input[placeholder*="field"], input[placeholder*="name"]',
-      "title",
-    );
-    await page.getByRole("checkbox", { name: /required/i }).check();
-
-    // Save the field
-    await page.click('button:has-text("Save"), button:has-text("Add")');
-
-    // Verify field was added
-    await expect(page.locator("text=Article Title")).toBeVisible();
   });
 
-  test("should filter widgets by search", async ({ page }) => {
-    // Navigate to collection builder and start creating
-    await page.goto("/config/collectionbuilder");
-    await page.getByTestId("add-collection-button").first().click();
+  /**
+   * Golden journey — sole mutation/outcome proof for this domain.
+   * Builder → schema (Input field) → save → entry → list → API body.
+   */
+  test("golden: schema → entry → API", async ({ page }) => {
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await expect(page).not.toHaveURL(/\/login/, { timeout: 15_000 });
 
-    // Navigate to widgets and add field
-    await page.click('button:has-text("Add Field"), button:has-text("Add Widget")');
+    const fixture = uniqueCollectionFixture("Golden");
+    await openNewCollectionEditor(page);
+    await page.getByTestId("collection-name-input").fill(fixture.name);
+    await addInputField(page, { label: "Title", fieldName: "title" });
+    await saveCollectionSchema(page);
 
-    // Use search functionality
-    const searchInput = page.locator(
-      'input[placeholder*="search"], input[type="search"], .search-input',
-    );
-    if (await searchInput.isVisible()) {
-      await searchInput.fill("text");
+    // Soft HMR: still authenticated after schema compile
+    await expect(page).not.toHaveURL(/\/login/, { timeout: 10_000 });
 
-      // Verify search results
-      await expect(page.getByText(/textinput|input|text/i).first()).toBeVisible();
+    // openCollectionEntries now polls the API until the collection is registered
+    // (replaces brittle waitForTimeout for async compilation + route registration)
+    await openCollectionEntries(page, fixture.slug);
 
-      // Clear search
-      await searchInput.fill("");
-    }
-  });
-
-  test("should configure widget-specific properties", async ({ page }) => {
-    // Navigate to collection builder
-    await page.goto("/config/collectionbuilder");
-    await page.getByTestId("add-collection-button").first().click();
-
-    // Add a field
-    await page.click('button:has-text("Add Field"), button:has-text("Add Widget")');
-
-    // Select input widget
-    await page
-      .getByRole("button", { name: /TextInput|Input/i })
-      .first()
-      .click();
-
-    // Configure specific properties
-    await page.fill('input[name="label"]', "User Email");
-    await page.fill('input[name="db_fieldName"]', "email");
-    await page.fill('input[name="placeholder"]', "Enter your email");
-    await page.fill('input[name="maxlength"]', "100");
-
-    // Check advanced options tab if available
-    const advancedTab = page.locator('button:has-text("Advanced"), button:has-text("Specific")');
-    if (await advancedTab.isVisible()) {
-      await advancedTab.click();
-
-      // Configure advanced properties
-      await page.check('input[name="required"]');
-    }
-
-    // Save field
-    await page.click('button:has-text("Save")');
-
-    // Verify field configuration
-    await expect(page.locator("text=User Email")).toBeVisible();
-  });
-
-  test("should handle widget dependencies", async ({ page }) => {
-    // Navigate to widget management
-    await page.goto("/config/extensions");
-    await page.getByRole("tab", { name: /widgets/i }).click();
-
-    // Check if dependency information is shown
-    const widgetItems = page.locator(".widget-item, .widget-card, [data-testid]").first();
-
-    if (await widgetItems.isVisible().catch(() => false)) {
-      // Look for dependency information using regex
-      await expect(page.getByText(/dependencies|requires|depends/i).first()).toBeVisible({
-        timeout: 5000,
-      });
-    }
-  });
-
-  test("should enable/disable widgets", async ({ page }) => {
-    // Navigate to widget management
-    await page.goto("/config/extensions");
-    await page.getByRole("tab", { name: /widgets/i }).click();
-
-    // Find a custom widget toggle
-    const toggles = page.locator('button:has-text("Deactivate"), button:has-text("Activate")');
-    const firstToggle = toggles.first();
-
-    if (await firstToggle.isVisible()) {
-      const text = await firstToggle.textContent();
-      const isActive = text?.includes("Deactivate");
-
-      // Toggle the widget
-      await firstToggle.click();
-
-      // Wait for state change
-      await page.waitForTimeout(2000);
-
-      // Verify state changed
-      const newText = await firstToggle.textContent();
-      expect(newText?.includes("Deactivate")).toBe(!isActive);
-    }
-  });
-
-  test("should validate collection creation", async ({ page }) => {
-    // Navigate to collection builder
-    await page.goto("/config/collectionbuilder");
-    await page.getByTestId("add-collection-button").first().click();
-
-    // Try to save without required fields
-    await page.click('button:has-text("Save"), button:has-text("Create")');
-
-    // Check for validation errors
+    // EntryListMultiButton renders data-testid="entry-list-action-create" for empty collections
+    const createBtn = page
+      .getByTestId("entry-list-action-create")
+      .or(page.getByRole("button", { name: /create new entry|create/i }))
+      .first();
     await expect(
-      page.locator(".error, .alert-error, text=required").or(page.getByText(/required/i)),
-    ).toBeVisible({
-      timeout: 5000,
-    });
+      createBtn,
+      `Expected entry list or create control for collection "${fixture.slug}" after schema save`,
+    ).toBeVisible({ timeout: 20_000 });
+    await createBtn.click({ timeout: 10_000 });
 
-    // Fill required information
-    await page.fill('input[name="name"]', "Valid Collection");
-
-    // Add at least one field
-    await page.click('button:has-text("Add Field")');
-    await page
-      .getByRole("button", { name: /TextInput|Input/i })
-      .first()
-      .click();
-    await page.getByPlaceholder(/label/i).fill("Test Field");
+    await page.getByRole("textbox", { name: "Title" }).fill("Golden Entry");
     await page.getByRole("button", { name: /save/i }).first().click();
 
-    // Now save should work
-    await page.click('button:has-text("Save Collection"), button:has-text("Create")');
+    // List may truncate cell text — assert a data row with status affordance
+    await expect(
+      page
+        .getByRole("row")
+        .filter({ hasText: /unpublish|publish|draft/i })
+        .first(),
+    ).toBeVisible({ timeout: 15_000 });
 
-    // Verify success
-    await expect(page.locator("text=Success, text=Created")).toBeVisible({
-      timeout: 10_000,
-    });
-  });
-
-  test("should support field reordering", async ({ page }) => {
-    // Navigate to existing collection or create one
-    await page.goto("/config/collectionbuilder");
-
-    // Look for existing collection or create one
-    const existingCollection = page.locator('.collection-item, a[href*="edit"]').first();
-    if (await existingCollection.isVisible()) {
-      await existingCollection.click();
-    } else {
-      // Create a new collection with multiple fields
-      await page.getByTestId("add-collection-button").first().click();
-      await page.fill('input[name="name"]', "Reorder Test");
-
-      // Add multiple fields
-      for (let i = 0; i < 3; i++) {
-        await page.click('button:has-text("Add Field")');
-        await page
-          .getByRole("button", { name: /TextInput|Input/i })
-          .first()
-          .click();
-        await page.fill('input[name="label"]', `Field ${i + 1}`);
-        await page.click('button:has-text("Save")');
-      }
-    }
-
-    // Look for drag handles or reorder buttons
-    const dragHandles = page.locator('[data-testid="drag-handle"], .drag-handle, .reorder-btn');
-    if ((await dragHandles.count()) > 1) {
-      // Test reordering functionality exists
-      await expect(dragHandles.first()).toBeVisible();
-    }
+    // API is source of truth for field value + default status (not UI publish toggle)
+    await expect(async () => {
+      const apiRes = await page.request.get(
+        `/api/collections/${fixture.slug}?publicationFilter=all&bypassCache=true`,
+      );
+      expect(apiRes.ok()).toBeTruthy();
+      const body = await apiRes.json();
+      const entry = (body.data ?? []).find((e: any) => {
+        const v = e.title;
+        const text = typeof v === "string" ? v : (v?.en ?? v?.[Object.keys(v ?? {})[0]]);
+        return text === "Golden Entry";
+      });
+      expect(entry).toBeDefined();
+      expect(entry.status).toBe("unpublish");
+    }).toPass({ timeout: 25_000 });
   });
 });

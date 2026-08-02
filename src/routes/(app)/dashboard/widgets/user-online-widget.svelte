@@ -125,7 +125,7 @@ export const widgetMeta = {
 			<iconify-icon icon="mdi:lock-outline" class="text-4xl text-amber-500 mb-2"></iconify-icon>
 			<h3 class="text-sm font-semibold text-surface-800 dark:text-surface-200">Premium Extension</h3>
 			<p class="text-xs text-surface-500 mt-1 mb-3">Your 14-day trial for this extension has expired. A valid LICENSE_KEY is required.</p>
-			<a href="https://marketplace.sveltycms.com" target="_blank" class="text-xs font-medium text-primary-600 hover:text-primary-700 dark:text-primary-400">Upgrade License &rarr;</a>
+			<a href="https://marketplace.sveltycms.com" target="_blank" class="text-xs font-medium text-primary-600 hover:text-primary-700 dark:text-primary-500">Upgrade License &rarr;</a>
 		</div>
 	</BaseWidget>
 {:else}
@@ -220,12 +220,11 @@ export const widgetMeta = {
 				<!-- Search (only when >3 users) -->
 				{#if totalOnline > 3}
 					<div class="relative mb-3">
-						<input
+						<input aria-label="Search users"
 							type="text"
 							bind:value={searchTerm}
 							placeholder="Filter users..."
 							class="w-full rounded border border-surface-200 bg-surface-50 py-1.5 pe-9 ps-3 text-sm text-surface-800 placeholder-surface-400 transition-colors focus:border-primary-400 focus:outline-none focus:ring-1 focus:ring-primary-400 dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200 dark:placeholder-surface-500"
-							aria-label="Filter online users"
 						/>
 						<iconify-icon
 							icon="mdi:magnify"

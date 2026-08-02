@@ -1,27 +1,22 @@
 /**
  * @file src/hooks/handle-turbo-get.ts
- * @description Turbo GET fast-path: serves cached responses BEFORE the full
- * auth/authz middleware chain, using a pre-computed session auth cache.
+ * @description
+ * Turbo GET fast-path serving pre-compressed cached responses, including zstd.
  *
- * ### Architecture
- * 1. Only activates for GET/HEAD/OPTIONS requests to cacheable API paths.
- * 2. Reads the session cookie, looks up the auth context from a fast L1 cache
- *    (session ID → { user, roles, bitset, tenantId }).
- * 3. Checks the response cache for the full URL.
- * 4. If both hit: injects auth context into locals, returns pre-encoded response.
- *    This bypasses handleAuthentication, handleAuthorization, CSRF, and all
- *    downstream hooks — reducing cache-hit latency from ~3.6ms toward ~0.2ms.
+ * Short-circuits authenticated GET/HEAD/OPTIONS on cacheable API prefixes when:
+ * 1. A valid session cookie maps to a warm turbo auth context, and
+ * 2. `cacheService.getSync` has a body (plain string/bytes or rich entry with
+ *    optional pre-compressed buffers per algorithm).
  *
- * ### Security
- * - Session cookie is still validated (cached auth context is only trusted if
- *   the original session was validated within SESSION_CACHE_TTL_MS).
- * - Auth context cache is keyed by session ID — a revoked session won't match.
- * - Only GET/HEAD/OPTIONS are eligible (no mutation bypass).
- * - Permission check still runs in the dispatcher via the cached bitset.
+ * ### Features:
+ * - Session-scoped turbo auth cache (TTL + LRU, max 1000 entries)
+ * - Cookie precedence: `__Host-` → `__Secure-` → bare session name
+ * - Pre-compressed cache hits (br/gzip/deflate/zstd) via `entry.compressed[algo]`
+ * - Sync on-the-fly compression fallback (including zstd) via handle-compression
+ * - Security headers applied on the turbo response (same as full pipeline)
+ * - `__turboAuth` flag so auth/audit layers skip redundant session resolution
  *
- * ### Invalidation
- * - Auth context cache auto-expires after SESSION_CACHE_TTL_MS.
- * - Response cache is version-tagged — content mutations invalidate relevant keys.
+ * Placed early in `hooks.server.ts` so hot GETs avoid full auth + handler work.
  */
 
 import type { Handle } from "@sveltejs/kit";
@@ -30,33 +25,34 @@ import type { DatabaseId } from "../content/types";
 import { cacheService } from "@src/databases/cache/cache-service";
 import { SESSION_COOKIE_NAME } from "@src/databases/auth/constants";
 import { applyAllSecurityHeaders } from "./handle-security-headers";
-import { dev } from "$app/environment";
+import { getRequestFlags } from "@utils/hook-utils";
 import {
   negotiateEncoding,
   compressSync,
   hasNativeCompression,
   setCompressionHeaders,
+  type CompressionAlgorithm,
 } from "./handle-compression";
-
-// ─── Auth Context Cache ──────────────────────────────────────────────────────
 
 interface TurboAuthContext {
   user: User;
   roles: Role[];
   bitset: Uint32Array;
   tenantId: DatabaseId | null;
-  /** Absolute expiry timestamp (ms). Fixed at SET time — never extended on GET.
-   *  This prevents timing attacks that infer session liveness from TTL reset patterns. */
   expiresAt: number;
 }
 
-/** Session ID → pre-computed auth context. LRU-limited to 1000 entries. */
+/** Rich cache entry shape: raw body + optional pre-compressed variants. */
+interface TurboCacheRichEntry {
+  body?: string | Uint8Array | null;
+  compressed?: Partial<Record<CompressionAlgorithm, Uint8Array>>;
+}
+
 const turboAuthCache = new Map<string, TurboAuthContext>();
 export { turboAuthCache };
 const TURBO_AUTH_CACHE_MAX = 1000;
-const TURBO_AUTH_TTL_MS = 60_000; // 1 minute — matches session cache TTL
+const TURBO_AUTH_TTL_MS = 60_000;
 
-/** Cacheable API path prefixes — same set as the dispatcher's pre-encode expansion. */
 const CACHEABLE_API_PREFIXES = [
   "/api/collections",
   "/api/content",
@@ -66,13 +62,17 @@ const CACHEABLE_API_PREFIXES = [
   "/api/navigation",
   "/api/themes",
   "/api/config",
+  "/api/media",
+  "/api/widgets",
+  "/api/roles",
+  "/api/permission",
+  "/api/automations",
+  "/api/website-tokens",
 ];
 
-// ─── Public API ──────────────────────────────────────────────────────────────
-
 /**
- * Store a resolved auth context in the turbo cache.
- * Called by handle-authentication after successful session validation.
+ * Store (or refresh) turbo auth context for a session.
+ * Re-inserts existing keys for LRU order; evicts oldest when at capacity.
  */
 export function setTurboAuthContext(
   sessionId: string,
@@ -81,36 +81,48 @@ export function setTurboAuthContext(
   bitset: Uint32Array,
   tenantId: DatabaseId | null,
 ): void {
-  // LRU eviction
-  if (turboAuthCache.size >= TURBO_AUTH_CACHE_MAX) {
+  if (turboAuthCache.has(sessionId)) {
+    // Re-insert to refresh LRU position
+    turboAuthCache.delete(sessionId);
+  } else if (turboAuthCache.size >= TURBO_AUTH_CACHE_MAX) {
     const firstKey = turboAuthCache.keys().next().value;
     if (firstKey) turboAuthCache.delete(firstKey);
   }
+
   turboAuthCache.set(sessionId, {
     user,
     roles,
     bitset,
     tenantId,
-    // Absolute expiry — never slides on access. Prevents timing attacks.
     expiresAt: Date.now() + TURBO_AUTH_TTL_MS,
   });
 }
 
 /**
- * Invalidate a specific session's turbo auth context.
+ * Gets cached auth context with absolute-expiry check and LRU refresh.
  */
+function getTurboAuthContext(sessionId: string): TurboAuthContext | null {
+  const ctx = turboAuthCache.get(sessionId);
+  if (!ctx) return null;
+
+  if (Date.now() > ctx.expiresAt) {
+    turboAuthCache.delete(sessionId);
+    return null;
+  }
+
+  // LRU refresh: re-insert key to mark it most-recently used
+  turboAuthCache.delete(sessionId);
+  turboAuthCache.set(sessionId, ctx);
+  return ctx;
+}
+
 export function invalidateTurboAuthContext(sessionId: string): void {
   turboAuthCache.delete(sessionId);
 }
 
-/**
- * Clear all turbo auth contexts (e.g., on system reset).
- */
 export function clearTurboAuthCache(): void {
   turboAuthCache.clear();
 }
-
-// ─── Hook ────────────────────────────────────────────────────────────────────
 
 function isCacheableApiPath(pathname: string): boolean {
   for (const prefix of CACHEABLE_API_PREFIXES) {
@@ -121,124 +133,98 @@ function isCacheableApiPath(pathname: string): boolean {
 
 export const handleTurboGet: Handle = async ({ event, resolve }) => {
   const { request, url, cookies, locals } = event;
-
-  // ── Gate 1: Only GET/HEAD/OPTIONS ─────────────────────────────────────
   const method = request.method;
-  if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-    return resolve(event);
-  }
+  const flags = getRequestFlags(locals);
 
-  // ── Gate 2: Only cacheable API paths ──────────────────────────────────
-  if (!isCacheableApiPath(url.pathname)) {
-    return resolve(event);
-  }
+  if (flags.isStatic || flags.isBootstrap) return resolve(event);
+  if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") return resolve(event);
+  if (!isCacheableApiPath(url.pathname)) return resolve(event);
 
-  // ── Gate 3: Must have a session cookie ────────────────────────────────
+  // Most restrictive cookie prefixes first — prevent token spoofing via bare name
   const sessionId =
-    cookies.get(SESSION_COOKIE_NAME) ||
     cookies.get(`__Host-${SESSION_COOKIE_NAME}`) ||
-    cookies.get(`__Secure-${SESSION_COOKIE_NAME}`);
+    cookies.get(`__Secure-${SESSION_COOKIE_NAME}`) ||
+    cookies.get(SESSION_COOKIE_NAME);
 
-  if (!sessionId) {
-    return resolve(event); // Public/unauthenticated — pass through
-  }
+  if (!sessionId) return resolve(event);
 
-  // ── Gate 4: Auth context must be in turbo cache ───────────────────────
-  const turboCtx = turboAuthCache.get(sessionId);
-  // 🛡️ Absolute expiry — never slides on access. Prevents timing attacks
-  // that infer session liveness from TTL reset patterns.
-  if (!turboCtx || Date.now() > turboCtx.expiresAt) {
-    if (turboCtx) turboAuthCache.delete(sessionId);
-    return resolve(event);
-  }
+  const turboCtx = getTurboAuthContext(sessionId);
+  if (!turboCtx) return resolve(event);
 
-  // ── Gate 5: Response must be in L1 cache ──────────────────────────────
+  locals.user = turboCtx.user;
+  locals.roles = turboCtx.roles;
+  locals.tenantId = turboCtx.tenantId;
+  (locals as { __turboAuth?: boolean }).__turboAuth = true;
+
   const cacheKey = url.pathname + url.search;
-  const cachedResponse: any = cacheService.getSync<string>(cacheKey, turboCtx.tenantId);
-  if (!cachedResponse) {
-    // No cached response — fall through (auth context is still valid for handler)
-    // Inject the auth context so downstream middleware can skip DB lookups
-    (locals as any).user = turboCtx.user;
-    (locals as any).roles = turboCtx.roles;
-    (locals as any).tenantId = turboCtx.tenantId;
-    (locals as any).__turboAuth = true;
-    return resolve(event);
-  }
+  const cachedResponse = cacheService.getSync<string | Uint8Array | TurboCacheRichEntry>(
+    cacheKey,
+    turboCtx.tenantId,
+  );
+  if (!cachedResponse) return resolve(event);
 
-  // ── HIT: Inject auth context and return pre-encoded response ──────────
-  (locals as any).user = turboCtx.user;
-  (locals as any).roles = turboCtx.roles;
-  (locals as any).tenantId = turboCtx.tenantId;
-  (locals as any).__turboAuth = true;
+  // Cache HIT is intentionally silent at default info — use turbo pipeline debug logs when diagnosing
 
-  if (dev) {
-    const duration = performance.now() - ((locals as any).requestStart || 0);
-    console.log(
-      `[TurboGET] ⚡ ${method} ${cacheKey} → HIT (${duration.toFixed(2)}ms) [session: ${sessionId.slice(0, 8)}...]`,
-    );
-  }
-
-  const isHttps = url.protocol === "https:";
   const responseHeaders = new Headers({
     "Content-Type": "application/json",
     "X-Cache": "TURBO-HIT",
     "Cache-Control": "private, must-revalidate",
+    // Cookie in Vary: tenant/session-scoped payloads must not be shared across users
+    Vary: "Accept-Encoding, Cookie",
   });
-  // Apply full security header suite (CSP, HSTS, X-Frame-Options, etc.)
+
   applyAllSecurityHeaders(
     responseHeaders,
-    isHttps,
+    url.protocol === "https:",
     request.headers.get("Origin") || null,
     url.pathname,
   );
 
-  // 🚀 SMART COMPRESSION ON TURBO HITS: prefer pre-compressed bytes from cache write path.
-  // Falls back to on-the-fly sync compress for payloads > 1KB when client advertises support.
-  // Uses shared setCompressionHeaders for DRY observability headers.
   const isRichEntry =
     typeof cachedResponse === "object" &&
+    cachedResponse !== null &&
     !(cachedResponse instanceof Uint8Array) &&
     !Buffer.isBuffer(cachedResponse);
-  const entry = isRichEntry ? cachedResponse : null;
-  const rawBody: string | Uint8Array | null = isRichEntry
-    ? (cachedResponse.body ?? null)
-    : cachedResponse;
-  let bodyToSend: BodyInit | Uint8Array = rawBody as any;
 
-  if (rawBody && typeof rawBody !== "object") {
-    // string path — try compression
+  const entry = isRichEntry ? (cachedResponse as TurboCacheRichEntry) : null;
+  const rawBody: string | Uint8Array | null = isRichEntry
+    ? ((cachedResponse as TurboCacheRichEntry).body ?? null)
+    : (cachedResponse as string | Uint8Array);
+
+  let bodyToSend: BodyInit | Uint8Array | null = rawBody;
+
+  if (rawBody) {
     const acceptEncoding = request.headers.get("Accept-Encoding") || "";
     const algo = negotiateEncoding(acceptEncoding, hasNativeCompression());
-    const payloadSize = rawBody.length;
+
+    const payloadSize =
+      typeof rawBody === "string" ? Buffer.byteLength(rawBody, "utf-8") : rawBody.byteLength;
+
     if (algo && payloadSize > 1024) {
       try {
-        const pre = entry?.compressed?.[algo as "br" | "gzip"];
-        if (pre) {
-          bodyToSend = pre;
-          setCompressionHeaders(
-            responseHeaders,
-            algo,
-            entry.body?.length || payloadSize,
-            pre.length,
-          );
-          if (dev)
-            console.log(`[TurboGET] pre-comp ${algo} ${payloadSize}B → ${pre.length}B [cache]`);
-        } else if (algo === "br" || algo === "gzip" || algo === "deflate") {
-          const compressed = compressSync(rawBody, algo);
+        // Fast-path 1: Use pre-compressed buffer from cache entry
+        const preallocatedBytes = entry?.compressed?.[algo];
+
+        if (preallocatedBytes) {
+          bodyToSend = preallocatedBytes;
+          setCompressionHeaders(responseHeaders, algo, payloadSize, preallocatedBytes.length);
+        } else {
+          // Fast-path 2: Sync dynamic compression fallback (including zstd)
+          const compressed = compressSync(rawBody, algo as CompressionAlgorithm, payloadSize);
+
           if (compressed && compressed.length < payloadSize) {
             bodyToSend = compressed;
             setCompressionHeaders(responseHeaders, algo, payloadSize, compressed.length);
-            if (dev)
-              console.log(`[TurboGET] compressed ${algo} ${payloadSize}B → ${compressed.length}B`);
           }
         }
       } catch {
-        /* safe raw */
+        /* fall back to raw uncompressed body */
       }
     }
   }
 
-  return new Response(bodyToSend as BodyInit, {
+  return new Response(method === "HEAD" ? null : (bodyToSend as BodyInit), {
+    status: 200,
     headers: responseHeaders,
   });
 };

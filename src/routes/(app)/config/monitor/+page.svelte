@@ -51,17 +51,23 @@ function formatUptime(seconds: number): string {
 >
 	{#snippet actions()}
 		{#if isPolling}
-			<Badge preset="tonal" color="primary" size="sm" class="animate-pulse">Syncing...</Badge>
+			<Badge preset="tonal" color="primary" size="sm" class="animate-pulse" data-testid="monitor-syncing">Syncing...</Badge>
 		{/if}
-		<Badge preset="tonal" color={systemState?.overallState === 'READY' ? 'success' : 'warning'} size="sm">
+		<Badge
+			preset="tonal"
+			color={systemState?.overallState === 'READY' ? 'success' : 'warning'}
+			size="sm"
+			data-testid="monitor-overall-state"
+		>
 			{systemState?.overallState || 'Unknown'}
 		</Badge>
 	{/snippet}
 
+	<div data-testid="monitor-page" class="contents">
     <!-- Stats Grid -->
-    <div class="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-4">
+    <div class="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-4" data-testid="monitor-stats">
         <!-- Security Card -->
-        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50">
+        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50" data-testid="monitor-card-security">
             <div class="flex items-center justify-between">
                 <div class="rounded bg-tertiary-500 p-2 dark:bg-primary-500/10">
                     <iconify-icon icon="mdi:shield-lock" class="text-2xl text-tertiary-500 dark:text-primary-500"></iconify-icon>
@@ -79,7 +85,7 @@ function formatUptime(seconds: number): string {
         </AdminCard>
 
         <!-- System State Card -->
-        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50">
+        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50" data-testid="monitor-card-system">
             <div class="flex items-center justify-between">
                 <div class="rounded bg-tertiary-500/10 p-2">
                     <iconify-icon icon="mdi:server-network" class="text-2xl text-tertiary-500"></iconify-icon>
@@ -88,7 +94,7 @@ function formatUptime(seconds: number): string {
             </div>
             <div>
                 <h3 class="text-sm font-bold uppercase tracking-widest opacity-40">System</h3>
-                <p class="text-3xl font-black">{formatUptime(system?.uptime ?? 0)} <span class="text-base font-normal opacity-50">Uptime</span></p>
+                <p class="text-3xl font-black" data-testid="monitor-uptime">{formatUptime(system?.uptime ?? 0)} <span class="text-base font-normal opacity-50">Uptime</span></p>
             </div>
             <div class="flex justify-between border-t border-surface-200 pt-2 text-xs dark:border-surface-800">
                 <span>Services: <b>{systemState?.services?.length ?? 0}</b></span>
@@ -97,7 +103,7 @@ function formatUptime(seconds: number): string {
         </AdminCard>
 
         <!-- API Traffic Card -->
-        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50">
+        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50" data-testid="monitor-card-requests">
             <div class="flex items-center justify-between">
                 <div class="rounded bg-tertiary-500/10 p-2">
                     <iconify-icon icon="mdi:chart-line" class="text-2xl text-tertiary-500"></iconify-icon>
@@ -115,7 +121,7 @@ function formatUptime(seconds: number): string {
         </AdminCard>
 
         <!-- Quick Actions Card -->
-        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50">
+        <AdminCard class="space-y-4 border border-surface-200 bg-white p-6 shadow-sm backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/50" data-testid="monitor-card-actions">
             <div class="flex items-center justify-between">
                 <div class="rounded bg-tertiary-500/10 p-2">
                     <iconify-icon icon="mdi:lightning-bolt" class="text-2xl text-tertiary-500"></iconify-icon>
@@ -127,11 +133,11 @@ function formatUptime(seconds: number): string {
                 <p class="text-sm opacity-60">Jump to common admin tools</p>
             </div>
             <div class="space-y-2 border-t border-surface-200 pt-2 dark:border-surface-800">
-                <Button variant="tertiary" size="sm" href="/config/system-settings" class="w-full justify-between" data-sveltekit-preload-data="hover">
+                <Button variant="tertiary" size="sm" href="/config/system-settings" class="w-full justify-between" data-sveltekit-preload-data="hover" data-preload="hover" data-testid="monitor-link-settings">
                     <span>System Settings</span>
                     <iconify-icon icon="mdi:arrow-right"></iconify-icon>
                 </Button>
-                <Button variant="tertiary" size="sm" href="/config/collectionbuilder" class="w-full justify-between" data-sveltekit-preload-data="hover">
+                <Button variant="tertiary" size="sm" href="/config/collectionbuilder" class="w-full justify-between" data-sveltekit-preload-data="hover" data-preload="hover" data-testid="monitor-link-builder">
                     <span>Collection Builder</span>
                     <iconify-icon icon="mdi:arrow-right"></iconify-icon>
                 </Button>
@@ -140,7 +146,7 @@ function formatUptime(seconds: number): string {
     </div>
 
     <!-- Service Health Table -->
-    <AdminCard class="border border-surface-200 bg-white p-6 shadow-sm dark:border-surface-800 dark:bg-surface-900">
+    <AdminCard class="border border-surface-200 bg-white p-6 shadow-sm dark:border-surface-800 dark:bg-surface-900" data-testid="monitor-service-health">
         <h2 class="mb-4 text-lg font-bold">Service Health</h2>
         {#if systemState?.services?.length > 0}
             <div class="overflow-x-auto">
@@ -155,7 +161,7 @@ function formatUptime(seconds: number): string {
                         </tr>
                     </thead>
                     <tbody>
-                        {#each systemState.services as svc}
+                        {#each systemState.services as svc (svc.name)}
                             <tr class="border-b border-surface-100 dark:border-surface-800">
                                 <td class="py-2 font-medium">{svc.name}</td>
                                 <td class="py-2">
@@ -190,7 +196,7 @@ function formatUptime(seconds: number): string {
              </div>
              <div class="space-y-4">
                 {#if data.security?.recentIncidents?.length > 0}
-                    {#each data.security.recentIncidents as incident}
+                    {#each data.security.recentIncidents as incident (incident._id)}
                         {const inc = incident as any}
                         <div class="flex items-center gap-4 rounded border-s-4 border-error-500 bg-surface-50 p-3 dark:bg-surface-800">
                             <iconify-icon icon="mdi:alert-decagram" class="text-xl text-error-500"></iconify-icon>
@@ -229,4 +235,62 @@ function formatUptime(seconds: number): string {
             </AdminCard>
         </div>
     </div>
+
+    <!-- Cryptographic Audit Logs -->
+    <AdminCard class="border border-surface-200 bg-white p-6 shadow-sm dark:border-surface-800 dark:bg-surface-900">
+        <div class="mb-6 flex items-center justify-between">
+            <div>
+                <h2 class="text-lg font-bold">Cryptographic Audit Trail</h2>
+                <p class="text-xs text-surface-500 dark:text-surface-400">Verifiable SHA-256 tamper-evident log chain isolation</p>
+            </div>
+            <Button variant="ghost" size="sm" onclick={() => window.open('/api/logs/download?type=latest&format=text', '_blank')}>Export Raw Chain</Button>
+        </div>
+
+        {#if data.auditLogs && data.auditLogs.length > 0}
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm text-start border-collapse table-auto">
+                    <thead>
+                        <tr class="border-b border-surface-200 text-start dark:border-surface-700 opacity-50 text-xs font-bold uppercase">
+                            <th class="pb-2 text-start">Timestamp</th>
+                            <th class="pb-2 text-start">User / Actor</th>
+                            <th class="pb-2 text-start">Event Type</th>
+                            <th class="pb-2 text-start">Result</th>
+                            <th class="pb-2 text-start hidden md:table-cell">Details</th>
+                            <th class="pb-2 text-end hidden lg:table-cell">SHA-256 Hash</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {#each data.auditLogs as log (log._id)}
+                            <tr class="border-b border-surface-100 dark:border-surface-800 text-xs hover:bg-surface-50 dark:hover:bg-surface-850">
+                                <td class="py-2.5 whitespace-nowrap">{new Date(log.timestamp).toLocaleString()}</td>
+                                <td class="py-2.5 whitespace-nowrap font-medium">{log.actorEmail || 'system'}</td>
+                                <td class="py-2.5 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-tertiary-500/15 text-tertiary-600 dark:text-primary-500">
+                                        {log.eventType}
+                                    </span>
+                                </td>
+                                <td class="py-2.5 whitespace-nowrap">
+                                    <Badge size="sm" variant={log.result === 'success' ? 'primary' : 'error'}>
+                                        {log.result}
+                                    </Badge>
+                                </td>
+                                <td class="py-2.5 max-w-xs truncate hidden md:table-cell opacity-70">
+                                    {JSON.stringify(log.details)}
+                                </td>
+                                <td class="py-2.5 text-end font-mono hidden lg:table-cell text-xs opacity-40">
+                                    {log.hash ? log.hash.substring(0, 12) + '...' : '--'}
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            </div>
+        {:else}
+            <div class="py-8 text-center italic opacity-35">
+                <iconify-icon icon="mdi:script-text-outline" width="32" class="mb-2"></iconify-icon>
+                <p>No audit trail records found for this tenant.</p>
+            </div>
+        {/if}
+    </AdminCard>
+	</div>
 </AdminPageShell>

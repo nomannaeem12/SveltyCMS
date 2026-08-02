@@ -1,54 +1,45 @@
 /**
- * @file src/routes/(app)/config/collectionbuilder/collectionbuilder.remote.ts
- * @description Collection Builder Remote Functions — typed structure operations without JSON double-serialization.
+ * @file src/routes/(app)/config/collectionbuilder/collectionbuilder.server.ts
+ * @description Collection Builder server functions — permission-gated remotes via LocalCMS.
  *
- * Replaces: JSON.parse(formData.get("items")) → direct typed ContentNode[] parameter.
- * Eliminates manual FormData packaging of large schema trees.
+ * ### Features:
+ * - `executeGuiStructureSave` — unified gui-save path (upsert, manifest, SSE)
+ * - `saveContentStructure` / `deleteContentNodes` — permission-gated remotes
+ * - Preset installation with content refresh
  */
 
 import type { RequestEvent } from "@sveltejs/kit";
 import { error, fail } from "@sveltejs/kit";
-import { contentSystem } from "@src/content/index.server";
-import { hasPermissionWithRoles } from "@src/databases/auth/permissions";
+import type { ContentNodeOperation } from "@src/content/types";
+import { hasCollectionBuilderPermission } from "@src/databases/auth/permissions";
 import { logger } from "@utils/logger";
-import path from "node:path";
-import fs from "node:fs";
+import { getAuthenticatedUser } from "@utils/page-guards.server";
+import { executeGuiStructureSave, getCollectionBuilderCms } from "./collectionbuilder-local.server";
 
-export interface ContentNode {
-  _id?: string;
-  path: string;
-  name: string;
-  nodeType: "collection" | "category" | "folder";
-  parentId?: string;
-  order?: number;
-  translations?: Record<string, unknown>[];
-  [key: string]: unknown;
-}
+/** @deprecated Use `ContentNodeOperation` from `@src/content/types` */
+export type UpsertOperation = ContentNodeOperation;
 
-export interface UpsertOperation {
-  type: "create" | "update" | "delete" | "move";
-  node: ContentNode;
-}
+export { executeGuiStructureSave, serializeStructureNodes } from "./collectionbuilder-local.server";
 
 function requirePermission(event: RequestEvent) {
-  const { user, roles: tenantRoles } = event.locals as any;
-  if (!user) throw error(401, "Authentication required");
-  if (!hasPermissionWithRoles(user, "config:collectionbuilder", tenantRoles))
+  const user = getAuthenticatedUser(event.locals);
+  const { roles: tenantRoles, isAdmin } = event.locals as App.Locals;
+  if (!hasCollectionBuilderPermission(user, tenantRoles, isAdmin))
     throw error(403, "Insufficient permissions");
 }
 
-export async function saveContentStructure(event: RequestEvent, operations: UpsertOperation[]) {
+export async function saveContentStructure(
+  event: RequestEvent,
+  operations: ContentNodeOperation[],
+) {
   requirePermission(event);
-  const tenantId = (event.locals as any).tenantId;
+  const tenantId = (event.locals as App.Locals).tenantId ?? null;
 
   if (!(operations && Array.isArray(operations)))
     return fail(400, { message: "Invalid operations" });
 
   try {
-    await contentSystem.upsertContentNodes(operations as any, tenantId);
-    await contentSystem.refresh(tenantId);
-    const updated = await contentSystem.getContentStructureFromDatabase("flat", tenantId);
-    return { success: true, contentStructure: updated };
+    return await executeGuiStructureSave(tenantId, operations);
   } catch (err) {
     logger.error("Error saving structure:", err);
     return fail(500, { message: "Failed to save structure" });
@@ -57,23 +48,14 @@ export async function saveContentStructure(event: RequestEvent, operations: Upse
 
 export async function deleteContentNodes(event: RequestEvent, ids: string[]) {
   requirePermission(event);
-  const tenantId = (event.locals as any).tenantId;
+  const tenantId = (event.locals as App.Locals).tenantId ?? null;
 
   if (!(ids && Array.isArray(ids))) return fail(400, { message: "Invalid IDs" });
 
   try {
-    const current = await contentSystem.getContentStructureFromDatabase("flat", tenantId);
-    const paths = current
-      .filter((n: any) => ids.includes(n._id?.toString()))
-      .map((n: any) => n.path);
-
-    const operations = paths.map((p: string) => ({
-      type: "delete" as const,
-      node: { path: p } as any,
-    }));
-
-    await contentSystem.upsertContentNodes(operations, tenantId);
-    await contentSystem.refresh(tenantId);
+    const cms = await getCollectionBuilderCms(tenantId);
+    const result = await cms.contentStructure.deleteByIds(ids, { tenantId });
+    if (!result.found) return fail(404, { message: "No matching nodes found" });
     return { success: true };
   } catch (err) {
     logger.error("Error deleting nodes:", err);
@@ -83,39 +65,10 @@ export async function deleteContentNodes(event: RequestEvent, ids: string[]) {
 
 export async function installPreset(event: RequestEvent, presetId: string) {
   requirePermission(event);
-  const tenantId = (event.locals as any).tenantId;
+  const tenantId = (event.locals as App.Locals).tenantId ?? null;
 
   if (!presetId || presetId === "blank") return fail(400, { message: "Invalid preset ID" });
 
-  const presetDir = path.resolve(process.cwd(), "src", "presets", presetId);
-  const expectedBase = path.resolve(process.cwd(), "src", "presets");
-
-  if (!presetDir.startsWith(expectedBase) || !fs.existsSync(presetDir))
-    return fail(404, { message: "Preset not found" });
-
-  const targetDir = tenantId
-    ? path.resolve(process.cwd(), "config", tenantId, "collections")
-    : path.resolve(process.cwd(), "config", "collections");
-
-  fs.mkdirSync(targetDir, { recursive: true });
-  fs.cpSync(presetDir, targetDir, { recursive: true, force: true });
-
-  await contentSystem.refresh(tenantId);
-  return { success: true, message: `Preset ${presetId} installed` };
-}
-
-/**
- * Installs collection templates from a Quick-Start preset by creating
- * collection definition files and registering them with the content system.
- */
-export async function installTemplateCollections(event: RequestEvent, presetId: string) {
-  requirePermission(event);
-  const tenantId = (event.locals as any).tenantId;
-
-  if (!presetId || presetId === "blank" || presetId === "demo")
-    return fail(400, { message: "Invalid preset ID" });
-
-  // Dynamically import the preset definitions
   const { PRESETS } = await import("@src/routes/setup/presets");
   const preset = PRESETS.find((p) => p.id === presetId);
 
@@ -125,25 +78,14 @@ export async function installTemplateCollections(event: RequestEvent, presetId: 
     });
   }
 
-  const collectionsDir = tenantId
-    ? path.resolve(process.cwd(), "config", tenantId, "collections")
-    : path.resolve(process.cwd(), "config", "collections");
+  const { writePresetCollectionFiles } =
+    await import("@src/routes/setup/preset-collections.server");
+  await writePresetCollectionFiles(preset.collections, { tenantId });
 
-  fs.mkdirSync(collectionsDir, { recursive: true });
+  const cms = await getCollectionBuilderCms(tenantId);
+  await cms.content.refresh(tenantId);
 
-  const created: string[] = [];
-
-  for (const collection of preset.collections) {
-    const tsContent = generateCollectionTemplate(collection);
-    const filePath = path.join(collectionsDir, `${collection.name}.ts`);
-    fs.writeFileSync(filePath, tsContent, "utf-8");
-    created.push(collection.name);
-    logger.info(`Created collection template: ${collection.name}`);
-  }
-
-  // Trigger content system refresh to pick up the new collections
-  await contentSystem.refresh(tenantId);
-
+  const created = preset.collections.map((c) => c.name);
   return {
     success: true,
     message: `Created ${created.length} collections: ${created.join(", ")}`,
@@ -151,61 +93,33 @@ export async function installTemplateCollections(event: RequestEvent, presetId: 
   };
 }
 
-/**
- * Generates a TypeScript collection definition file from a CollectionPreset template.
- */
-function generateCollectionTemplate(collection: {
-  name: string;
-  label: string;
-  description: string;
-  fields: Array<{
-    db_fieldName: string;
-    label: string;
-    widget: string;
-    required: boolean;
-    translated: boolean;
-    helper: string;
-    default?: unknown;
-    options?: string[];
-  }>;
-}): string {
-  const fieldEntries = collection.fields
-    .map((f) => {
-      const parts: string[] = [];
-      parts.push(`      ${f.db_fieldName}: widgets.${f.widget}({`);
-      parts.push(`        label: "${f.label}",`);
-      if (f.required) parts.push(`        required: true,`);
-      if (f.translated) parts.push(`        translated: true,`);
-      parts.push(`        helper: "${f.helper}",`);
-      if (f.default !== undefined)
-        parts.push(
-          `        default: ${typeof f.default === "string" ? `"${f.default}"` : f.default},`,
-        );
-      if (f.options && f.options.length > 0) {
-        if (f.options.includes("multiple")) {
-          parts.push(`        multiple: true,`);
-        }
-      }
-      parts.push(`      }),`);
-      return parts.join("\n");
-    })
-    .join("\n");
+export async function installTemplateCollections(event: RequestEvent, presetId: string) {
+  requirePermission(event);
+  const tenantId = (event.locals as App.Locals).tenantId ?? null;
 
-  return `/**
- * @file config/collections/${collection.name}.ts
- * @description ${collection.label} — ${collection.description}
- * Auto-generated from Quick-Start Template.
- */
+  if (!presetId || presetId === "blank" || presetId === "demo")
+    return fail(400, { message: "Invalid preset ID" });
 
-import { widgets } from "@src/widgets";
+  const { PRESETS } = await import("@src/routes/setup/presets");
+  const preset = PRESETS.find((p) => p.id === presetId);
 
-export default {
-  name: "${collection.name}",
-  label: "${collection.label}",
-  description: "${collection.description}",
-  fields: [
-${fieldEntries}
-  ],
-};
-`;
+  if (!preset || !preset.collections || preset.collections.length === 0) {
+    return fail(404, {
+      message: `No collections defined for preset "${presetId}"`,
+    });
+  }
+
+  const { writePresetCollectionFiles } =
+    await import("@src/routes/setup/preset-collections.server");
+  await writePresetCollectionFiles(preset.collections, { tenantId });
+
+  const cms = await getCollectionBuilderCms(tenantId);
+  await cms.content.refresh(tenantId);
+
+  const created = preset.collections.map((c) => c.name);
+  return {
+    success: true,
+    message: `Created ${created.length} collections: ${created.join(", ")}`,
+    collections: created,
+  };
 }

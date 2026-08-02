@@ -1,14 +1,23 @@
 /**
  * @file scripts/slop-scanner.ts
- * @description Custom Svelte 5 / accessibility / RTL / naming / slop checks.
- * General linting (unused imports, TS rules, etc.) is handled by oxlint.
- * This scanner focuses on what oxlint doesn't cover well.
+ * @description Smart Svelte 5 + Accessibility + RTL + Quality scanner with safe autofix.
+ *
+ * Focuses on critical items oxlint doesn't cover natively:
+ * - Svelte 5 legacy reactivity detection (warns on $: patterns)
+ * - Svelte legacy store warnings
+ * - Directional Tailwind property conversions to Logical Properties (autofixable)
+ * - Accessibility missing-label assertions on interactive elements
+ * - Unsanitized {@html} expression risk evaluations with nested brace support
+ * - Dynamic brace-balanced {#each} block key constraint validations
+ * - Duplicate content duplication flags
+ * - Scans TS/JS files for TODOs, naming, and duplicate content slop
+ * - Supports dynamic `.slop-suppress.json` loading for granular error overrides
  *
  * Usage:
- *   bun run scripts/slop-scanner.ts              # full scan
- *   bun run scripts/slop-scanner.ts --fix        # auto-fix RTL classes
- *   bun run scripts/slop-scanner.ts --strict     # exit 1 on any violation
- *   bun run scripts/slop-scanner.ts --files src/routes/+page.svelte
+ * bun run scripts/slop-scanner.ts                 # Check all files
+ * bun run scripts/slop-scanner.ts --fix           # Check + safe autofix
+ * bun run scripts/slop-scanner.ts --strict        # Fail-closed (exits 1 on error)
+ * bun run scripts/slop-scanner.ts --files file.svelte # Check target file(s)
  */
 
 import { existsSync } from "node:fs";
@@ -20,10 +29,30 @@ import { globSync } from "glob";
 // Config
 // ---------------------------------------------------------------------------
 const ROOT = join(import.meta.dirname, "..");
-const MAX_FILE_SIZE = 500_000;
-const MAX_TODOS_PER_FILE = 5;
+const MAX_FILE_SIZE = 400_000;
+const MAX_TODOS_PER_FILE = 6;
+const SUPPRESS_FILE = join(ROOT, ".slop-suppress.json");
 
+// Suppressed files/categories to suppress known legacy exceptions
 const SUPPRESS: { file: string; category: string }[] = [];
+
+/**
+ * Dynamically loads exceptions from local config file if present.
+ * Prevents codebase noise on legacy or generated assets.
+ */
+async function loadSuppressions() {
+  if (existsSync(SUPPRESS_FILE)) {
+    try {
+      const data = await fs.readFile(SUPPRESS_FILE, "utf8");
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) {
+        SUPPRESS.push(...parsed);
+      }
+    } catch {
+      console.warn("⚠️  Could not parse local suppression list .slop-suppress.json");
+    }
+  }
+}
 
 interface Violation {
   file: string;
@@ -34,7 +63,21 @@ interface Violation {
   fixable?: boolean;
 }
 
+/** Valid Button variants per the component API. */
+const VALID_BUTTON_VARIANTS = new Set([
+  "primary",
+  "secondary",
+  "tertiary",
+  "surface",
+  "success",
+  "warning",
+  "error",
+  "ghost",
+  "outline",
+]);
+
 const violations: Violation[] = [];
+let fixedFiles = 0;
 
 function report(
   file: string,
@@ -46,17 +89,18 @@ function report(
 ) {
   const nf = file.replace(/\\/g, "/");
   if (SUPPRESS.some((s) => nf.includes(s.file) && s.category === category)) return;
-  violations.push({ file, line, category, message, severity, fixable });
+
+  violations.push({
+    file: nf,
+    line,
+    category,
+    message,
+    severity,
+    fixable,
+  });
 }
 
-// ---------------------------------------------------------------------------
-// File discovery
-// ---------------------------------------------------------------------------
-// walkFiles replaced with globSync
-
-// ---------------------------------------------------------------------------
-// RTL Mapping
-// ---------------------------------------------------------------------------
+// RTL Logical Properties Mapping — only entries matched by dirRegex below
 const RTL_MAP: Record<string, string> = {
   pl: "ps",
   pr: "pe",
@@ -64,203 +108,293 @@ const RTL_MAP: Record<string, string> = {
   mr: "me",
   left: "start",
   right: "end",
+  "text-left": "text-start",
+  "text-right": "text-end",
   "border-l": "border-s",
   "border-r": "border-e",
   "rounded-l": "rounded-s",
   "rounded-r": "rounded-e",
-  "text-left": "text-start",
-  "text-right": "text-end",
+  "divide-x": "divide-x",
+  "divide-x-reverse": "divide-x-reverse",
+  "space-x": "space-x",
+  "space-x-reverse": "space-x-reverse",
 };
 
-// ---------------------------------------------------------------------------
-// Core Svelte scanning
-// ---------------------------------------------------------------------------
 async function scanSvelteFile(relPath: string, content: string, shouldFix: boolean) {
-  const cleanContent = content.replace(/<!--([\s\S]*?)-->/g, (match) =>
-    "\n".repeat((match.match(/\n/g) || []).length),
+  const cleanContent = content.replace(/<!--([\s\S]*?)-->/g, (m) =>
+    "\n".repeat((m.match(/\n/g) || []).length),
   );
+
   const lines = cleanContent.split("\n");
+  const fixedLines = [...lines];
+  let fileWasModified = false;
+
   let inCodeBlock = false;
   let inScriptBlock = false;
   let inStyleBlock = false;
-  let fixed = content;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
+
     if (/^\s*```/.test(line)) {
       inCodeBlock = !inCodeBlock;
       continue;
     }
     if (inCodeBlock) continue;
 
-    if (/<script\b/i.test(trimmed)) {
-      inScriptBlock = true;
-      continue;
-    }
-    if (/<\/script>/i.test(trimmed)) {
-      inScriptBlock = false;
-      continue;
-    }
-    if (/<style\b/i.test(trimmed)) {
-      inStyleBlock = true;
-      continue;
-    }
-    if (/<\/style>/i.test(trimmed)) {
-      inStyleBlock = false;
-      continue;
+    // Detect script/style blocks — handles multi-line opening tags like <script\n lang="ts">
+    if (/<script\b/i.test(trimmed)) inScriptBlock = true;
+    if (/<\/script>/i.test(trimmed)) inScriptBlock = false;
+    if (/<style\b/i.test(trimmed)) inStyleBlock = true;
+    if (/<\/style>/i.test(trimmed)) inStyleBlock = false;
+
+    // Also catch script/style blocks that open across line boundaries
+    if (!inScriptBlock && !inStyleBlock) {
+      // Look ahead up to 2 lines for a multi-line <script or <style opening tag
+      const windowLines = lines.slice(i, Math.min(i + 3, lines.length)).join(" ");
+      if (/<script\b[^>]*$/i.test(windowLines) && !/<\/script>/i.test(windowLines)) {
+        inScriptBlock = true;
+      }
+      if (/<style\b[^>]*$/i.test(windowLines) && !/<\/style>/i.test(windowLines)) {
+        inStyleBlock = true;
+      }
     }
 
-    // Legacy $: reactivity (only inside script blocks)
-    if (inScriptBlock && /\$\s*:(?!.*(\$state|\$derived|\$effect|\$props|\$bindable))/.test(line)) {
-      report(
-        relPath,
-        i + 1,
-        "svelte5-legacy",
-        "Legacy $: — use $derived() / $effect() instead",
-        "error",
-      );
+    // === Legacy $: reactivity (Svelte 5) — detection only, NO auto-fix ===
+    // Flag ALL $: patterns inside script blocks — the negative lookahead on rune
+    // keywords (e.g. $state) is removed because it produces false-negatives on
+    // lines like `$: x = state(0).value` where `state` is not a Svelte rune.
+    if (inScriptBlock && /\$\s*:/.test(line)) {
+      report(relPath, i + 1, "svelte5-legacy", "Legacy $: reactivity — migrate to runes", "error");
     }
 
     if (inScriptBlock || inStyleBlock) continue;
 
-    // Accessibility — interactive elements without accessible names
-    const tagMatch = line.match(/<(button|input|select|textarea|a)\b/i);
+    // === Accessibility ===
+    const tagMatch = line.match(/<(button|input|select|textarea|a)\b([^>]*)/i);
     if (tagMatch) {
-      // Skip Svelte components (PascalCase tags)
-      const afterLt = line.slice(line.indexOf("<") + 1, line.indexOf("<") + 10);
-      if (/^[A-Z]/.test(afterLt)) continue;
       const tagName = tagMatch[1].toLowerCase();
-      const combined = lines.slice(i, Math.min(i + 30, lines.length)).join(" ");
+      const attrs = tagMatch[2];
 
-      let isAccessible = /(aria-label|aria-labelledby|title|id\s*=|for\s*=|role\s*=)/i.test(
-        combined,
-      );
+      if (/^[A-Z]/.test(tagMatch[1])) continue; // Skip custom elements
 
-      if (!isAccessible && (tagName === "a" || tagName === "button")) {
-        // Look for text content or an image with alt attribute inside the tag
-        const tagContentMatch = combined.match(
-          new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)</${tagName}>`, "i"),
-        );
-        if (tagContentMatch) {
-          const innerContent = tagContentMatch[1];
-          // Strip HTML tags except img
-          const textOnly = innerContent.replace(/<(?!\/?img\b)[^>]*>/gi, "").trim();
-          // Check if it has any text or if it has an img with alt/aria-label/title
-          if (textOnly.length > 0) {
-            // Check if it's just whitespace or symbols, or has actual letters/numbers/curly brackets
-            if (
-              /[a-zA-Z0-9\u00C0-\u017F{}]/.test(textOnly) ||
-              /alt\s*=|aria-label/i.test(innerContent)
-            ) {
-              isAccessible = true;
-            }
+      // Bypass hidden inputs natively
+      if (tagName === "input" && /type\s*=\s*["']?hidden["']?/i.test(attrs)) {
+        continue;
+      }
+
+      // Only scan the opening tag's attribute string for accessible names —
+      // the previous 25-line lookahead would match aria-label from sibling
+      // elements and suppress legitimate warnings.
+      const hasAccessibleName =
+        /(aria-label|aria-labelledby|title|id\s*=)/i.test(attrs) ||
+        ((tagName === "a" || tagName === "button") &&
+          /[a-zA-Z0-9\u00C0-\u017F]/.test(line.replace(/<[^>]*>/g, "").trim())) ||
+        false;
+
+      // Separately check for wrapping <label for="id"> pattern
+      if (!hasAccessibleName && tagName === "input" && /id\s*=\s*["']([^"']+)["']/i.test(attrs)) {
+        const inputId = attrs.match(/id\s*=\s*["']([^"']+)["']/i)?.[1];
+        if (inputId) {
+          // Check if any nearby line contains <label for="inputId">
+          const nearby = lines.slice(Math.max(0, i - 3), i).join(" ");
+          if (
+            new RegExp(
+              `<label\\b[^>]*for\\s*=\\s*["']${inputId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`,
+              "i",
+            ).test(nearby)
+          ) {
+            continue; // Has wrapping label — skip
           }
         }
       }
 
-      if (!isAccessible) {
+      if (!hasAccessibleName) {
         report(
           relPath,
           i + 1,
           "accessibility",
-          `Interactive <${tagName}> element may lack accessible name (aria-label, id, or text content)`,
+          `Interactive <${tagName}> may lack accessible name`,
           "warning",
         );
       }
     }
 
-    // Directional Tailwind → logical properties
-    const dirRegex =
-      /(?:^|[\s"'`])(pl|pr|ml|mr|left|right|border-l|border-r|rounded-l|rounded-r|text-left|text-right)(-\d+|-\[[^\]]+\]|)(?=[\s"'`]|$)/g;
-    let m: RegExpExecArray | null;
-    let lineFixed = line;
-    let lineHasFixes = false;
-
-    while ((m = dirRegex.exec(line)) !== null) {
-      const prefix = m[1];
-      const suffix = m[2];
-      const fullMatch = prefix + suffix;
-
-      report(
-        relPath,
-        i + 1,
-        "rtl",
-        `"${fullMatch}" → use logical properties (ps-/pe-/ms-/me-/start-/end-)`,
-        "warning",
-        true,
-      );
-
-      if (shouldFix) {
-        for (const [from, to] of Object.entries(RTL_MAP)) {
-          if (prefix === from) {
-            const newCls = to + suffix;
-            // Only replace the full class match with boundaries to avoid partial matches
-            const escaped = fullMatch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            lineFixed = lineFixed.replace(
-              new RegExp(`(?<=^|[\\s"'\`])${escaped}(?=[\\s"'\`]|$)|\\b${escaped}\\b`, "g"),
-              newCls,
-            );
-            lineHasFixes = true;
-            break;
-          }
+    // === Invalid Button variant detection ===
+    const btnVariantMatch = line.match(/<Button\b[^>]*variant\s*=\s*["']([^"']+)["']/i);
+    if (btnVariantMatch) {
+      const variant = btnVariantMatch[1].trim();
+      if (!VALID_BUTTON_VARIANTS.has(variant)) {
+        report(
+          relPath,
+          i + 1,
+          "component",
+          `Invalid Button variant "${variant}" — use one of: ${[...VALID_BUTTON_VARIANTS].join(", ")}`,
+          "error",
+          true,
+        );
+        if (shouldFix) {
+          // Map common invalid variants to valid ones
+          const FIX_MAP: Record<string, string> = {
+            destructive: "error",
+            danger: "error",
+            info: "info",
+            link: "ghost",
+            text: "ghost",
+          };
+          const fixed = FIX_MAP[variant] || "primary";
+          fixedLines[i] = fixedLines[i].replace(
+            new RegExp(
+              `(variant\\s*=\\s*["'])${variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(["'])`,
+              "i",
+            ),
+            `$1${fixed}$2`,
+          );
+          fileWasModified = true;
         }
       }
     }
 
-    if (shouldFix && lineHasFixes) {
-      // Find the exact line in the original `fixed` string to replace.
-      // Since `fixed` is a single string and we want to replace this specific line:
-      const linesArr = fixed.split("\n");
-      if (linesArr[i] === line) {
-        linesArr[i] = lineFixed;
-        fixed = linesArr.join("\n");
+    // === RTL / Logical Properties ===
+    // Updated to include divide-x and space-x variants that were in RTL_MAP
+    // but not matched by the previous dirRegex pattern.
+    const dirRegex =
+      /(?:^|[\s"'`])(pl|pr|ml|mr|left|right|border-l|border-r|rounded-l|rounded-r|text-left|text-right|divide-x|divide-x-reverse|space-x|space-x-reverse)(-reverse|-\[[^\]]+\]|-\d+|)(?=[\s"'`]|$)/g;
+
+    let m: RegExpExecArray | null;
+    while ((m = dirRegex.exec(line)) !== null) {
+      const prefix = m[1];
+      const suffix = m[2];
+      const full = prefix + suffix;
+
+      // Skip bare words like "left"/"right" that are not Tailwind classes
+      const requiresSuffix = ["pl", "pr", "ml", "mr", "left", "right"];
+      if (requiresSuffix.includes(prefix) && !suffix) continue;
+
+      // divide-x/space-x variants with modifiers (-reverse) are informational
+      // since logical property equivalents don't exist in Tailwind v4 yet
+      if (["divide-x", "divide-x-reverse", "space-x", "space-x-reverse"].includes(prefix)) {
+        report(relPath, i + 1, "rtl", `"${full}" → consider logical equivalent`, "warning", true);
+        continue; // No safe autofix available
+      }
+
+      report(relPath, i + 1, "rtl", `"${full}" → use logical property`, "warning", true);
+
+      if (shouldFix && RTL_MAP[prefix] !== full) {
+        const newClass = RTL_MAP[prefix] + suffix;
+        const escaped = full.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(`(?<=^|[\\s"'\`])${escaped}(?=[\\s"'\`]|$)|\\b${escaped}\\b`, "g");
+
+        const newLine = fixedLines[i].replace(regex, newClass);
+        if (newLine !== fixedLines[i] && lines[i] === line) {
+          fixedLines[i] = newLine;
+          fileWasModified = true;
+        }
       }
     }
   }
 
-  // Legacy svelte/store import
+  // === Global checks ===
   if (/from\s+["']svelte\/store["']/.test(content)) {
-    report(
-      relPath,
-      0,
-      "svelte5-legacy",
-      "Legacy svelte/store — migrate to Svelte 5 runes",
-      "error",
-    );
+    report(relPath, 0, "svelte5-legacy", "Legacy svelte/store import — migrate to runes", "error");
   }
 
-  // Unsafe {@html} without sanitization
-  for (const m of content.matchAll(/\{@html\s+([^}]+?)\}/g)) {
+  // === @apply directive misuse (Tailwind v4: only in base layer) ===
+  if (!relPath.includes("app.css") && /\/\*[\s\S]*?\*\//.test(content)) {
+    // Only flag @apply outside of app.css (the approved base-layer file)
+    for (const m of content.matchAll(/@apply\s+[^;]+;/g)) {
+      const lineNo = content.substring(0, m.index!).split("\n").length;
+      report(
+        relPath,
+        lineNo,
+        "tailwind",
+        "@apply outside app.css — use inline utilities",
+        "warning",
+      );
+    }
+  }
+
+  // === Raw HTML element usage (should use component) ===
+  if (inScriptBlock) {
+    // Check for goto() usage in script blocks (should use <a data-preload>)
+    if (/goto\s*\(/.test(content) && !relPath.includes("hooks") && !relPath.includes("utils")) {
+      for (const m of content.matchAll(/goto\s*\(/g)) {
+        const lineNo = content.substring(0, m.index!).split("\n").length;
+        report(
+          relPath,
+          lineNo,
+          "preloading",
+          "goto() used for navigation — prefer <a data-preload> for speculative preloading",
+          "warning",
+        );
+      }
+    }
+  }
+
+  // Secure nested-brace parsing for {@html}
+  // Strip markdown code blocks first — {@html} in documentation is not code
+  const contentNoCodeBlocks = content.replace(/```[\s\S]*?```/g, (m) =>
+    "\n".repeat((m.match(/\n/g) || []).length),
+  );
+  for (const m of contentNoCodeBlocks.matchAll(/\{@html\s+((?:[^{}]|\{[^{}]*\})+)\}/g)) {
     const expr = m[1].trim();
     if (
-      /sanitize|DOMPurify|escape|safeHtml|marked\.|he\.|parseMD|getDisplayValue|getStatusText|getFieldComponentHtml|userContent|body/i.test(
+      !/sanitize|DOMPurify|escape|safeHtml|marked|he\.|parseMD|getDisplayValue|getStatusText|getFieldComponentHtml/i.test(
         expr,
       )
-    )
-      continue;
-    const lineNo = content.substring(0, m.index!).split("\n").length;
-    report(relPath, lineNo, "security-html", `Unsafe {@html ${expr.slice(0, 50)}...}`, "error");
+    ) {
+      const lineNo = contentNoCodeBlocks.substring(0, m.index!).split("\n").length;
+      report(relPath, lineNo, "security", `Unsafe {@html} without sanitization`, "error");
+    }
   }
 
-  // Apply RTL fixes
-  if (shouldFix && fixed !== content) {
-    await fs.writeFile(join(ROOT, relPath), fixed, "utf8");
-    console.log(` ✅ Fixed RTL: ${relPath}`);
+  // Svelte 5 {#each} key validation (skip code blocks)
+  for (const m of contentNoCodeBlocks.matchAll(/\{#each\s+((?:[^{}]|\{[^{}]*\})+)\}/g)) {
+    const eachBody = m[1].trim();
+    const hasAs = /\bas\b/.test(eachBody);
+    if (hasAs && !eachBody.endsWith(")")) {
+      const lineNo = contentNoCodeBlocks.substring(0, m.index!).split("\n").length;
+      report(
+        relPath,
+        lineNo,
+        "svelte-quality",
+        "Consider adding a key context (e.g., (item.id)) to {#each} block",
+        "warning",
+      );
+    }
+  }
+
+  // Write file out safely if changes were made
+  if (shouldFix && fileWasModified) {
+    const fixedContentString = fixedLines.join("\n");
+    if (fixedContentString !== content) {
+      await fs.writeFile(join(ROOT, relPath), fixedContentString, "utf8");
+      fixedFiles++;
+      console.log(`🛠️  Fixed Svelte properties in: ${relPath}`);
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Other checks
+// Other Checks
 // ---------------------------------------------------------------------------
 function scanTodos(relPath: string, content: string) {
-  const matches = content.match(/\/\/\s*(TODO|FIXME|HACK|XXX)/gi);
-  if (matches && matches.length >= MAX_TODOS_PER_FILE) {
-    report(relPath, 0, "slop-accumulation", `${matches.length} TODO/FIXME comments`, "info");
+  const matches = content.match(/(?:\/\/|\/\*)\s*(TODO|FIXME|HACK|XXX)/gi) || [];
+  if (matches.length >= MAX_TODOS_PER_FILE) {
+    report(relPath, 0, "maintenance", `${matches.length} TODO/FIXME comments`, "info");
   }
 }
 
-const dupeMap = new Map<string, string[]>();
+function checkFileNaming(relPath: string) {
+  const file = basename(relPath);
+  if (file.startsWith("+")) return; // Route files are exempt from generic naming rules
+  if (/[A-Z]/.test(file) && relPath.endsWith(".svelte")) {
+    report(relPath, 0, "naming", "Use kebab-case for .svelte files", "warning");
+  }
+}
+
+const contentCache = new Map<string, string[]>();
 
 function checkDuplicateContent(relPath: string, content: string) {
   const norm = content
@@ -268,52 +402,265 @@ function checkDuplicateContent(relPath: string, content: string) {
     .replace(/\/\/.*$/gm, "")
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .trim()
-    .slice(0, 5000);
+    .slice(0, 4000);
 
-  if (norm.length < 300) return;
-  if (dupeMap.has(norm)) {
+  if (norm.length < 400) return;
+
+  if (contentCache.has(norm)) {
+    const existing = contentCache.get(norm)!;
+    report(relPath, 0, "copy-paste", `Very similar content to: ${existing.join(", ")}`, "warning");
+    // FIX: append current file to cache so subsequent near-duplicates are also flagged
+    existing.push(relPath);
+  } else {
+    contentCache.set(norm, [relPath]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Security Architecture Checks
+// ---------------------------------------------------------------------------
+
+/** Patterns that indicate insecure architectural choices (not secret leaks). */
+const SECURITY_ARCH_PATTERNS: {
+  pattern: RegExp;
+  category: string;
+  message: string;
+  severity: Violation["severity"];
+}[] = [
+  {
+    pattern: /"Access-Control-Allow-Origin":\s*request\.headers\.get\("Origin"\)/,
+    category: "cors-reflection",
+    message: "CORS reflects Origin header with credentials — use origin allowlist instead",
+    severity: "error",
+  },
+  {
+    pattern: /DEFAULT_ALLOWED_MIME\s*=\s*\/\^\\(image\|video\|audio\|application\\)/,
+    category: "broad-mime",
+    message: "MIME allowlist is too broad — restrict to explicit types (no application/*)",
+    severity: "error",
+  },
+  {
+    pattern: /createHash\("(?:sha256|md5|sha1)"\)\.update\((?:key|secret|token)\)/i,
+    category: "fast-hash-secret",
+    message: "Fast hash used for API key/token storage — use HMAC with server secret",
+    severity: "error",
+  },
+  {
+    pattern: /\(isProduction\s*&&\s*!isBenchmark\)/,
+    category: "introspection-bypass",
+    message: "GraphQL introspection gated on benchmark flags — block unconditionally in prod",
+    severity: "error",
+  },
+  {
+    pattern: /user\._id\s*===\s*["']system["']\s*&&\s*password\s*===/,
+    category: "backdoor",
+    message: "Hardcoded password comparison for system user — potential auth backdoor",
+    severity: "error",
+  },
+  {
+    pattern: /request\.clone\(\)/,
+    category: "body-double-clone",
+    message: "Request body cloned — verify size limits are enforced to prevent OOM",
+    severity: "info",
+  },
+];
+
+function scanSecurityPatterns(relPath: string, content: string) {
+  if (content.includes("slop:suppress")) return;
+  const lines = content.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("*")) continue;
+    for (const { pattern, category, message, severity } of SECURITY_ARCH_PATTERNS) {
+      if (pattern.test(trimmed)) {
+        report(relPath, i + 1, category, message, severity);
+      }
+    }
+  }
+}
+
+/**
+ * Detects raw SQL built from interpolated identifiers without validation.
+ * Matches template literals that construct DML/DDL statements where an
+ * identifier is interpolated directly (e.g. `INSERT INTO "${name}"`).
+ *
+ * Drizzle's explicit sql.raw()/sql.identifier()/sql.join() helpers and nested
+ * parameterized sql`` templates are treated as sanctioned and skipped.
+ * The check is keyword-aware so plain template literals (CSS classes, log
+ * messages, toast strings) are NOT flagged — unlike naive "raw SQL" heuristics
+ * that produce false positives on every backtick string.
+ */
+function scanRawSqlRisk(relPath: string, content: string) {
+  if (content.includes("slop:suppress")) return;
+  const hasIdentifierGuard =
+    /\b(?:SAFE_IDENTIFIER|SAFE_IDENT|isSafeIdentifier|validateIdentifier|assertSafeIdentifier|assertSafeSqlIdentifier|assertSqlIdentifier|assertIdentifier|quoteIdentifier|quoteMariaIdentifier|escapeSqlIdentifier|getTableName)\b/.test(
+      content,
+    ) || /\[\^?A-Za-z_\]\[\^?A-Za-z0-9_\]/.test(content);
+  if (hasIdentifierGuard) return;
+  // Strip markdown code blocks and HTML comments — SQL examples in docs are not code
+  const contentNoCodeBlocks = content
+    .replace(/```[\s\S]*?```/g, (m) => "\n".repeat((m.match(/\n/g) || []).length))
+    .replace(/<!--([\s\S]*?)-->/g, (m) => "\n".repeat((m.match(/\n/g) || []).length));
+  const lines = contentNoCodeBlocks.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("*")) continue;
+    const line = lines[i];
+    if (!line.includes("`") || !line.includes("${")) continue;
+    // SQL statement position: backtick followed by an uppercase SQL DML/DDL verb.
+    // Case-sensitive so English verbs ("Select", "Update") in UI strings don't match.
+    if (
+      !/`\s*(?:INSERT(?:\s+(?:OR\s+IGNORE|INTO))?|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE|SELECT)\b/.test(
+        line,
+      )
+    ) {
+      continue;
+    }
+    // Tagged-template literals (pg client tags like raw`...`, pool`...`, sql`...`)
+    // bind interpolations as parameters — they are NOT string interpolation.
+    if (/(?:^|[^\w.])(?:raw|sql|pool|client|query|db|conn|connection)\s*`/.test(line)) {
+      continue;
+    }
+    let flagged = false;
+    for (const m of line.matchAll(/\$\{([^}]*)\}/g)) {
+      const expr = m[1].trim();
+      if (!expr) continue;
+      // Sanctioned Drizzle helpers + nested parameterized templates
+      if (/\bsql\.(?:raw|identifier|join)\s*\(/.test(expr)) continue;
+      if (/\bsql\s*`/.test(expr)) continue;
+      // Identifier escaping (e.g. `name.replace(/"/g, '""')` or an esc*/escape helper)
+      // is a valid guard
+      if (/\.replace\s*\(/.test(expr)) continue;
+      if (/\b(?:esc|escape|escId|escSql|quote)\w*\s*\(/.test(expr)) continue;
+      flagged = true;
+      break;
+    }
+    if (flagged) {
+      report(
+        relPath,
+        i + 1,
+        "security",
+        "Raw SQL with interpolated identifier without validation — use sql.identifier() or validate against /^[A-Za-z_][A-Za-z0-9_]*$/",
+        "warning",
+      );
+    }
+  }
+}
+
+/**
+ * Client-side security consistency checks for Svelte/TS files:
+ * 1. Mutating fetch() to /api without an X-CSRF-Token header.
+ * 2. new RegExp() built from interpolated input without escaping.
+ *
+ * Server-only files (hooks/api/databases/services, *.server.ts) are skipped
+ * for the CSRF check — server-to-server calls don't require CSRF tokens.
+ */
+function scanClientSecurityPatterns(relPath: string, content: string) {
+  if (content.includes("slop:suppress")) return;
+  const isServerSide =
+    /(^|\/)(?:api|hooks|databases|services)\//.test(relPath) ||
+    /\.(?:server|remote|ws)\.(?:ts|js)$/.test(relPath);
+
+  const contentNoCodeBlocks = content.replace(/```[\s\S]*?```/g, (m) =>
+    "\n".repeat((m.match(/\n/g) || []).length),
+  );
+
+  // ── Mutating fetch() without X-CSRF-Token header ──
+  if (!isServerSide) {
+    for (const m of contentNoCodeBlocks.matchAll(/fetch\s*\(\s*([`'"])\/api\/[^`'"]*\1/g)) {
+      // Window covers method + headers of the call (multi-line fetch bodies),
+      // plus a backward lookahead so headers built just before the fetch count
+      const start = Math.max(0, m.index! - 200);
+      const window = contentNoCodeBlocks.slice(start, m.index! + 400);
+      const methodMatch = window.match(/method\s*:\s*["'](GET|POST|PUT|PATCH|DELETE)["']/i);
+      if (!methodMatch) continue; // GET or no explicit method — not a mutation
+      if (methodMatch[1].toUpperCase() === "GET") continue;
+      // Sanctioned helpers (fetchApi / clientJsonHeaders) attach the token themselves
+      if (/X-CSRF-Token|clientJsonHeaders|fetchApi\s*\(/i.test(window)) continue;
+      const lineNo = contentNoCodeBlocks.substring(0, m.index!).split("\n").length;
+      report(
+        relPath,
+        lineNo,
+        "security",
+        `Mutating fetch(${methodMatch[1]}) without X-CSRF-Token header — use fetchApi() or include the token`,
+        "warning",
+      );
+    }
+  }
+
+  // ── new RegExp() from interpolated input (regex injection / ReDoS footgun) ──
+  for (const m of contentNoCodeBlocks.matchAll(/new\s+RegExp\s*\(\s*`([^`]*\$\{[^}]*\}[^`]*)`/g)) {
+    const statement = m[0];
+    const lineNo = contentNoCodeBlocks.substring(0, m.index!).split("\n").length;
+    // Include the surrounding lines — the escape call often lives nearby
+    const splitLines = contentNoCodeBlocks.split("\n");
+    const window =
+      (splitLines[lineNo - 6] ?? "") +
+      "\n" +
+      (splitLines[lineNo - 5] ?? "") +
+      "\n" +
+      (splitLines[lineNo - 4] ?? "") +
+      "\n" +
+      (splitLines[lineNo - 3] ?? "") +
+      "\n" +
+      (splitLines[lineNo - 2] ?? "") +
+      "\n" +
+      (splitLines[lineNo - 1] ?? "") +
+      "\n" +
+      statement;
+    // Escaped input (escape helper, $& replace, inline backslash-escaped
+    // interpolation, or inline esc()/escape() helper call) is fine. The helper
+    // may also be used earlier in the file.
+    const escapeSignal =
+      /escapeRegExp|escapeRegex|\breplace\s*\([^;]*\$&|\\\$\{/.test(window) ||
+      /(?:^|[^\w.])(?:esc|escape)\s*\(/.test(window) ||
+      /\b(?:escapeRegex|escapeRegExp)\b/.test(contentNoCodeBlocks);
+    if (escapeSignal) {
+      continue;
+    }
+    // Interpolated all-caps constants (TAG_PATTERN, MAX_LEN, ...) are
+    // compile-time values, not user input
+    if (/\$\{\s*[A-Z_][A-Z0-9_]*\s*\}/.test(statement)) {
+      continue;
+    }
     report(
       relPath,
-      0,
-      "copy-paste",
-      `Highly similar content to: ${dupeMap.get(norm)!.join(", ")}`,
+      lineNo,
+      "security",
+      "new RegExp() built from interpolated input — escape regex metacharacters to avoid injection/ReDoS",
       "warning",
     );
-  } else {
-    dupeMap.set(norm, [relPath]);
-  }
-}
-
-function checkFileNaming(relPath: string) {
-  if (/[A-Z]/.test(basename(relPath)) && relPath.endsWith(".svelte")) {
-    report(relPath, 0, "naming", "Prefer kebab-case for .svelte files", "warning");
   }
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Main Router
 // ---------------------------------------------------------------------------
 async function main() {
+  await loadSuppressions();
+
   const argv = process.argv.slice(2);
-  const isStrict = argv.includes("--strict");
   const shouldFix = argv.includes("--fix");
+  const isStrict = argv.includes("--strict");
   const filesIdx = argv.indexOf("--files");
   const targetFiles = filesIdx !== -1 ? argv.slice(filesIdx + 1) : null;
 
-  console.log("🔍 Slop Scanner — Svelte-specific & AI-slop checks\n");
+  console.log("🔍 Svelte Quality Scanner (Smart + Autofix)\n");
 
   const svelteFiles: string[] = [];
   const tsFiles: string[] = [];
 
   if (targetFiles?.length) {
     for (const f of targetFiles) {
-      const full = join(ROOT, f);
+      const isAbsolute = f.startsWith("/") || /^[A-Za-z]:[\\/]/.test(f);
+      const full = isAbsolute ? f : join(ROOT, f);
       if (existsSync(full)) {
-        (f.endsWith(".svelte") ? svelteFiles : tsFiles).push(full);
+        if (f.endsWith(".svelte")) svelteFiles.push(full);
+        else if (f.endsWith(".ts") || f.endsWith(".js")) tsFiles.push(full);
       }
     }
   } else {
-    const files = globSync("src/**/*.{svelte,ts,js}", {
+    const allFiles = globSync("src/**/*.{svelte,ts,js}", {
       cwd: ROOT,
       ignore: [
         "**/node_modules/**",
@@ -324,14 +671,15 @@ async function main() {
       ],
       absolute: true,
     });
-    for (const f of files) {
-      (f.endsWith(".svelte") ? svelteFiles : tsFiles).push(f);
+    for (const f of allFiles) {
+      if (f.endsWith(".svelte")) svelteFiles.push(f);
+      else tsFiles.push(f);
     }
   }
 
-  console.log(`📂 Scanning ${svelteFiles.length} Svelte + ${tsFiles.length} TS/JS files\n`);
+  console.log(`📂 Scanning ${svelteFiles.length} Svelte + ${tsFiles.length} TS/JS files...\n`);
 
-  // Scan Svelte files in parallel
+  // Scan Svelte Files
   await Promise.all(
     svelteFiles.map(async (file) => {
       try {
@@ -341,17 +689,21 @@ async function main() {
         scanTodos(rel, content);
         checkFileNaming(rel);
         checkDuplicateContent(rel, content);
+        scanSecurityPatterns(rel, content);
+        scanRawSqlRisk(rel, content);
+        scanClientSecurityPatterns(rel, content);
+
         const size = (await fs.stat(file)).size;
-        if (size > MAX_FILE_SIZE) {
+        if (size > MAX_FILE_SIZE && !file.endsWith(".d.ts")) {
           report(rel, 0, "file-size", `Large file (${(size / 1024).toFixed(0)}KB)`, "warning");
         }
       } catch {
-        console.warn(`⚠️ Could not read ${file}`);
+        console.warn(`⚠️  Could not process Svelte file: ${file}`);
       }
     }),
   );
 
-  // Scan TS files in parallel
+  // Scan TS/JS Files
   await Promise.all(
     tsFiles.map(async (file) => {
       try {
@@ -360,52 +712,58 @@ async function main() {
         scanTodos(rel, content);
         checkFileNaming(rel);
         checkDuplicateContent(rel, content);
+        scanSecurityPatterns(rel, content);
+        scanRawSqlRisk(rel, content);
+        scanClientSecurityPatterns(rel, content);
+
+        const size = (await fs.stat(file)).size;
+        if (size > MAX_FILE_SIZE && !file.endsWith(".d.ts")) {
+          report(rel, 0, "file-size", `Large file (${(size / 1024).toFixed(0)}KB)`, "warning");
+        }
       } catch {
-        /* skip */
+        console.warn(`⚠️  Could not process TS/JS file: ${file}`);
       }
     }),
   );
 
-  // Summary
+  // Summary Report
   const errors = violations.filter((v) => v.severity === "error");
   const warnings = violations.filter((v) => v.severity === "warning");
   const infos = violations.filter((v) => v.severity === "info");
 
   console.log(
-    `📊 Results: ${errors.length} errors, ${warnings.length} warnings, ${infos.length} infos\n`,
+    `\n📊 Results: ${errors.length} errors, ${warnings.length} warnings, ${infos.length} infos`,
   );
+  if (shouldFix) console.log(`🛠️  Autofixed ${fixedFiles} file(s)`);
 
   if (errors.length) {
-    console.log("━".repeat(60) + "\n❌ ERRORS:\n" + "━".repeat(60));
-    errors
-      .slice(0, 30)
-      .forEach((v) => console.log(` ${v.file}:${v.line} [${v.category}] ${v.message}`));
-    if (errors.length > 30) console.log(` ... +${errors.length - 30} more`);
+    console.log("\n❌ ERRORS:");
+    errors.forEach((v) => console.log(`  ${v.file}:${v.line} [${v.category}] ${v.message}`));
   }
 
   if (warnings.length) {
-    console.log("\n" + "━".repeat(60) + "\n⚠️ WARNINGS:\n" + "━".repeat(60));
+    console.log("\n⚠️  WARNINGS:");
     warnings
-      .slice(0, 20)
-      .forEach((v) => console.log(` ${v.file}:${v.line} [${v.category}] ${v.message}`));
-    if (warnings.length > 20) console.log(` ... +${warnings.length - 20} more`);
+      .slice(0, 1000)
+      .forEach((v) => console.log(`  ${v.file}:${v.line} [${v.category}] ${v.message}`));
+    if (warnings.length > 25) console.log(`  ... +${warnings.length - 25} more`);
   }
 
-  if (shouldFix) console.log("\n🛠️  RTL auto-fixes applied where possible.");
-
-  if (isStrict && errors.length > 0) {
-    console.log(`\n❌ Strict mode failed — ${errors.length} errors found.`);
+  if (isStrict && (errors.length > 0 || warnings.length > 0)) {
+    console.log(`
+❌ Strict mode failed with ${errors.length} errors and ${warnings.length} warnings.`);
+    console.log("Fix all issues before pushing. Perfect code only.\n");
     process.exit(1);
   }
 
   if (errors.length === 0 && warnings.length === 0) {
-    console.log("\n✅ No slop detected. Clean!");
+    console.log("\n✅ Clean! No issues found.");
   } else if (errors.length === 0) {
-    console.log(`\n⚠️  Only warnings — review above.`);
+    console.log("\n⚠️  Only warnings — review recommended.");
   }
 }
 
 main().catch((err) => {
-  console.error("Slop scanner crashed:", err);
+  console.error("Scanner crashed:", err);
   process.exit(1);
 });

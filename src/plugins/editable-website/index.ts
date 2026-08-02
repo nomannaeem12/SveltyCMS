@@ -1,15 +1,24 @@
 /**
  * @file src/plugins/editable-website/index.ts
- * @description Editable Website & Live Preview Plugin.
- * Provides real-time bidirectional live preview with visual editing and handshake protocol.
+ * @description Editable Website & Live Preview Plugin — CMS↔frontend visual editing bridge.
+ *
+ * ### Licensing (€14.99, 14-day trial):
+ * - **Gated**: Live Preview tab, `/api/preview/authorize`, bidirectional iframe sync, Svedit edit mode in preview
+ * - **Free**: Public site, Svedit rendering, CMS form/JSON editing on `pages` — no license required
+ *
+ * Features:
+ * - Real-time bidirectional live preview with visual editing
+ * - Dynamic origin from collection schema's previewTargetUrl
+ * - Ephemeral preview token authorization
+ * - Handshake protocol via postMessage
  */
 
-import { slotRegistry } from "@src/plugins/slot-registry";
-import type { Plugin } from "@src/plugins/types";
+import { slotRegistry } from "@src/plugins/slot-registry.svelte.ts";
+import { definePlugin } from "../define-plugin";
+import { collectionHasLivePreview } from "./license-gate";
 
 const livePreviewComponent = "./live-preview.svelte";
 
-// Register the Live Preview slot with a condition
 slotRegistry.register({
   id: "live_preview",
   zone: "entry_edit",
@@ -18,18 +27,19 @@ slotRegistry.register({
     label: "Live Preview",
     icon: "mdi:eye-outline",
   },
-  // Only show if the collection has livePreview enabled
-  condition: (context: any) => context?.collection?.livePreview === true,
+  condition: (context: { collection?: { livePreview?: unknown } }) =>
+    collectionHasLivePreview(context?.collection?.livePreview),
 });
 
-export const editableWebsitePlugin: Plugin = {
+export const editableWebsitePlugin = definePlugin({
   metadata: {
     id: "editable-website",
     name: "Editable Website & Live Preview",
-    version: "1.1.0",
-    description: "Real-time bidirectional live preview with visual editing and handshake protocol.",
+    version: "1.2.0",
+    description:
+      "Bidirectional live preview bridge: iframe sync, click-to-edit, and Svedit inline editing in the CMS. Site rendering stays free.",
     icon: "mdi:web",
-    enabled: true,
+    enabled: false,
     category: "editing",
   },
   ui: {
@@ -44,4 +54,4 @@ export const editableWebsitePlugin: Plugin = {
       ],
     },
   },
-};
+});

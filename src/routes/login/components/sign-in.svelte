@@ -1,5 +1,5 @@
 <!--
-@file src/routes/login/components/SignIn.svelte
+@file src/routes/login/components/sign-in.svelte
 @component
 **SignIn component with OAuth support**
 
@@ -30,6 +30,7 @@ import FloatingPaths from "@src/components/system/floating-paths.svelte";
 import SveltyCMSLogo from "@src/components/system/icons/svelty-cms-logo.svelte";
 import SveltyCMSLogoFull from "@src/components/system/icons/svelty-cms-logo-full.svelte";
 import FloatingInput from "@components/ui/floating-input.svelte";
+import Input from "@components/ui/input.svelte";
 import Button from "@components/ui/button.svelte";
 // ParaglideJS
 import {
@@ -58,6 +59,7 @@ import { globalLoadingStore, loadingOperations } from "@src/stores/loading-store
 import { screen } from "@src/stores/screen-size-store.svelte";
 import { toast } from "@src/stores/toast.svelte.ts";
 import { Form } from "@utils/form.svelte.ts";
+import { logger } from "@utils/logger";
 import { forgotFormSchema, loginFormSchema, resetFormSchema } from "@utils/schemas";
 import { browser } from "$app/environment";
 import { goto, preloadData } from "$app/navigation";
@@ -67,23 +69,26 @@ import type { PageData } from "../$types";
 import type { LoginBranding } from "@utils/theme-merge";
 import SigninIcon from "./icons/signin-icon.svelte";
 import OauthLogin from "./oauth-login.svelte";
+import { fade } from 'svelte/transition';
 
 // Props
 const {
-	active = $bindable(undefined),
-	onClick = () => {},
-	onPointerEnter: onPointerEnterProp = () => {},
-	onBack = () => {},
-	firstCollectionPath = "",
-	branding = undefined,
-}: {
-	active?: number;
-	onClick?: () => void;
-	onPointerEnter?: (e: PointerEvent) => void;
-	onBack?: () => void;
-	firstCollectionPath?: string;
-	branding?: LoginBranding;
-} = $props();
+		active = $bindable(undefined),
+		onClick = () => {},
+		onPointerEnter: onPointerEnterProp = () => {},
+		onBack = () => {},
+		firstCollectionPath = "",
+		redirectTo = "",
+		branding = undefined,
+	}: {
+		active?: number;
+		onClick?: () => void;
+		onPointerEnter?: (e: PointerEvent) => void;
+		onBack?: () => void;
+		firstCollectionPath?: string;
+		redirectTo?: string;
+		branding?: LoginBranding;
+	} = $props();
 
 const siteName = $derived(branding?.siteName || publicEnv.SITE_NAME || "SveltyCMS");
 const brandedLogin = $derived(branding?.brandedLogin ?? false);
@@ -92,6 +97,8 @@ const brandedVariant = $derived(branding?.variant ?? "bordered");
 // State management
 let P_WFORGOT = $state(false);
 let P_WRESET = $state(false);
+let P_WMAGIC = $state(false);
+let isPasskeyLoading = $state(false);
 
 // FIX: let not const — const prevents $state reassignment so the
 // password-visibility toggle silently broke.
@@ -101,6 +108,7 @@ let showPassword = $state(false);
 let loginFormElement: HTMLFormElement | null = $state(null);
 let forgotFormElement: HTMLFormElement | null = $state(null);
 let resetFormElement: HTMLFormElement | null = $state(null);
+let magicFormElement: HTMLFormElement | null = $state(null);
 
 const isInteractiveCard = $derived(active === undefined);
 const cardTabIndex = $derived(isInteractiveCard ? 0 : -1);
@@ -128,7 +136,7 @@ async function prefetchFirstCollection() {
 	try {
 		await preloadData(firstCollectionPath);
 	} catch (error) {
-		console.error("Prefetch failed:", error);
+		logger.warn("Prefetch failed:", error);
 	}
 }
 
@@ -143,13 +151,44 @@ function wiggle(el: HTMLFormElement | null) {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic Auth Methods Checking
+// ---------------------------------------------------------------------------
+let allowedMethods = $state({
+	hasPassword: true,
+	hasPasskey: false,
+	hasMagicLink: false,
+	hasOAuth: false,
+});
+let checkTimeout: ReturnType<typeof setTimeout> | undefined;
+
+function onEmailInput() {
+	if (checkTimeout) clearTimeout(checkTimeout);
+	checkTimeout = setTimeout(async () => {
+		const email = (loginForm.data.email || "").trim().toLowerCase();
+		if (!email || !email.includes('@')) {
+			allowedMethods = { hasPassword: true, hasPasskey: false, hasMagicLink: false, hasOAuth: false };
+			return;
+		}
+		try {
+			const { checkAuthMethods } = await import("../auth.remote");
+			const res = await checkAuthMethods(email);
+			if (res.success) {
+				allowedMethods = { ...allowedMethods, ...res };
+			}
+		} catch (e) {
+			logger.warn("Failed to check auth methods", e);
+		}
+	}, 400);
+}
+
+// ---------------------------------------------------------------------------
 // Login form
 // ---------------------------------------------------------------------------
 
 const loginForm = new Form({ email: "", password: "", isToken: false }, loginFormSchema);
 
-async function handleLoginSubmit(event: Event) {
-	event.preventDefault();
+	async function handleLoginSubmit(event: Event) {
+		event.preventDefault();
 	if (loginForm.data.email) {
 		loginForm.data.email = loginForm.data.email.toLowerCase();
 	}
@@ -168,11 +207,10 @@ async function handleLoginSubmit(event: Event) {
 		const result = (await remoteSignIn({
 			email: loginForm.data.email,
 			password: loginForm.data.password,
-			isToken: loginForm.data.isToken
+			isToken: loginForm.data.isToken,
+			redirect: redirectTo || undefined,
 		})) as any;
-
-		isSubmitting = false;
-
+		
 		if (result.requires2FA) {
 			requires2FA = true;
 			twoFAUserId = result.userId || "";
@@ -187,9 +225,8 @@ async function handleLoginSubmit(event: Event) {
 			});
 			return;
 		}
-
+		
 		if (result.success && result.redirectPath) {
-			isAuthenticating = true;
 			sessionStorage.setItem(
 				"flashMessage",
 				JSON.stringify({
@@ -199,21 +236,20 @@ async function handleLoginSubmit(event: Event) {
 					duration: 4000,
 				})
 			);
-			window.location.href = result.redirectPath;
+			await goto(result.redirectPath, { invalidateAll: true });
 			return;
 		}
-
-		isAuthenticating = false;
-		globalLoadingStore.stopLoading(loadingOperations.authentication);
+		
 		toast.error({ title: "Sign In Failed", description: result.message || "Invalid email or password" });
 		wiggle(loginFormElement);
 	} catch (error: any) {
-		isSubmitting = false;
-		isAuthenticating = false;
-		globalLoadingStore.stopLoading(loadingOperations.authentication);
 		const errorMessage = error?.message || "An unexpected error occurred";
 		toast.error({ title: "Sign In Failed", description: errorMessage });
 		wiggle(loginFormElement);
+	} finally {
+		isSubmitting = false;
+		isAuthenticating = false;
+		globalLoadingStore.stopLoading(loadingOperations.authentication);
 	}
 }
 
@@ -222,6 +258,123 @@ async function handleLoginSubmit(event: Event) {
 // ---------------------------------------------------------------------------
 
 const forgotForm = new Form({ email: "" }, forgotFormSchema);
+
+// ---------------------------------------------------------------------------
+// Magic Link form
+// ---------------------------------------------------------------------------
+
+const magicForm = new Form({ email: "" }, forgotFormSchema);
+
+function base64UrlToBuffer(base64url: string): Uint8Array {
+	const pad = "=".repeat((4 - (base64url.length % 4)) % 4);
+	const base64 = (base64url + pad).replace(/-/g, "+").replace(/_/g, "/");
+	const raw = atob(base64);
+	const buf = new Uint8Array(raw.length);
+	for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+	return buf;
+}
+
+function bufferToBase64Url(buffer: ArrayBuffer): string {
+	const bytes = new Uint8Array(buffer);
+	let binary = "";
+	for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function handlePasskeySignIn() {
+	if (!browser) return;
+	const email = (loginForm.data.email || "").trim().toLowerCase();
+	if (!email) {
+		toast.error({ title: "Email required", description: "Enter your email above, then use Passkey sign-in." });
+		return;
+	}
+	if (!window.PublicKeyCredential) {
+		toast.error({ title: "Unsupported", description: "Passkeys are not supported in this browser." });
+		return;
+	}
+
+	isPasskeyLoading = true;
+	try {
+		const { getPasskeyAuthOptions, verifyPasskeyAuth } = await import("../auth.remote");
+		const opts = await getPasskeyAuthOptions({ email });
+		if (!opts.success || !opts.options) {
+			toast.error({ title: "Passkey unavailable", description: opts.message || "No passkey found for this account." });
+			return;
+		}
+
+		const credential = (await navigator.credentials.get({
+				publicKey: {
+					...opts.options,
+					challenge: base64UrlToBuffer(opts.options.challenge) as BufferSource,
+					allowCredentials: opts.options.allowCredentials?.map((c) => ({
+												type: 'public-key' as const,
+												id: base64UrlToBuffer(c.id),
+												transports: c.transports as AuthenticatorTransport[] | undefined,
+											})) as PublicKeyCredentialDescriptor[],
+				},
+			})) as PublicKeyCredential | null;
+
+		if (!credential) {
+			toast.error({ title: "Cancelled", description: "Passkey sign-in was cancelled." });
+			return;
+		}
+
+		const response = credential.response as AuthenticatorAssertionResponse;
+		const result = await verifyPasskeyAuth({
+			email,
+			assertion: {
+				id: credential.id,
+				rawId: bufferToBase64Url(credential.rawId),
+				type: credential.type,
+				response: {
+					authenticatorData: bufferToBase64Url(response.authenticatorData),
+					clientDataJSON: bufferToBase64Url(response.clientDataJSON),
+					signature: bufferToBase64Url(response.signature),
+				},
+			},
+		});
+
+		if (result.success && result.redirectPath) {
+			await goto(result.redirectPath, { invalidateAll: true });
+		} else {
+			toast.error({ title: "Passkey failed", description: result.message || "Authentication failed." });
+		}
+	} catch (error: any) {
+		toast.error({ title: "Passkey error", description: error?.message || "Passkey authentication failed." });
+	} finally {
+		isPasskeyLoading = false;
+	}
+}
+
+async function handleMagicSubmit(event: Event) {
+	event.preventDefault();
+	if (magicForm.data.email) {
+		magicForm.data.email = magicForm.data.email.toLowerCase();
+	}
+	if (!magicForm.validate()) {
+		wiggle(magicFormElement);
+		return;
+	}
+	isSubmitting = true;
+
+	try {
+		const { requestMagicLink } = await import("../auth.remote");
+		const result = await requestMagicLink({ email: magicForm.data.email });
+		isSubmitting = false;
+		if (result.success) {
+			toast.success({ title: "Magic Link Sent", description: result.message || "Please check your inbox for the sign-in link." });
+			P_WMAGIC = false;
+		} else {
+			toast.error({ title: "Request Failed", description: result.message || "Failed to send magic link" });
+		}
+	} catch (error: any) {
+		isSubmitting = false;
+		const errorMessage = error?.message || "Failed to request magic link";
+		toast.error({ title: "Request Failed", description: errorMessage });
+		wiggle(magicFormElement);
+	}
+}
+
 
 async function handleForgotSubmit(event: Event) {
 	event.preventDefault();
@@ -236,10 +389,25 @@ async function handleForgotSubmit(event: Event) {
 
 	try {
 		const { forgotPW: remoteForgotPW } = await import("../auth.remote");
-		await remoteForgotPW({ email: forgotForm.data.email });
+		const result: any = await remoteForgotPW({ email: forgotForm.data.email });
 		isSubmitting = false;
-		P_WRESET = true;
-		toast.success({ description: signin_forgottontoast() });
+
+		if (result.smtpConfigured === false && result.resetLink) {
+			// No SMTP configured — pre-fill the reset form so user can reset immediately.
+			// The reset link is also printed in the server terminal for sharing.
+			const url = new URL(result.resetLink as string);
+			resetForm.data.token = url.searchParams.get("token") || "";
+			resetForm.data.email = url.searchParams.get("email") || "";
+			P_WRESET = true;
+			toast.info({
+				description:
+					"SMTP not configured. Enter a new password below to reset.",
+				duration: 10000,
+			});
+		} else {
+			P_WRESET = true;
+			toast.success({ description: signin_forgottontoast() });
+		}
 	} catch (error: any) {
 		isSubmitting = false;
 		const errorMessage = error?.message || "Password reset failed";
@@ -253,7 +421,7 @@ async function handleForgotSubmit(event: Event) {
 // ---------------------------------------------------------------------------
 
 const resetForm = new Form(
-	{ password: "", confirm_password: "", token: "", email: "" },
+	{ password: "", confirmPassword: "", token: "", email: "" },
 	resetFormSchema,
 );
 
@@ -269,22 +437,46 @@ async function handleResetSubmit(event: Event) {
 		const { resetPW: remoteResetPW } = await import("../auth.remote");
 		const result = (await remoteResetPW({
 			password: resetForm.data.password,
+			confirmPassword: resetForm.data.confirmPassword,
 			token: resetForm.data.token,
 			email: resetForm.data.email
 		})) as any;
 		isSubmitting = false;
+		globalLoadingStore.stopLoading(loadingOperations.authentication);
+
+		if (!result?.success) {
+			const code = result?.code as string | undefined;
+			const description =
+				code === "TOKEN_EXPIRED"
+					? "This reset link has expired. Request a new one from “Forgot password”."
+					: code === "TOKEN_ALREADY_CONSUMED"
+						? "This reset link was already used. Request a new one if you still need access."
+						: result?.message || "Failed to reset password.";
+			toast.error({
+				title:
+					code === "TOKEN_EXPIRED"
+						? "Link expired"
+						: code === "TOKEN_ALREADY_CONSUMED"
+							? "Link already used"
+							: "Reset Failed",
+				description,
+			});
+			wiggle(resetFormElement);
+			return;
+		}
+
 		P_WRESET = false;
 		P_WFORGOT = false;
-
 		toast.success({
 			title: "Password Reset Successful",
 			description: "You can now sign in with your new password",
 		});
-		if (result.success && result.redirectPath) {
+		if (result.redirectPath) {
 			goto(result.redirectPath);
 		}
 	} catch (error: any) {
 		isSubmitting = false;
+		globalLoadingStore.stopLoading(loadingOperations.authentication);
 		toast.error({
 			title: "Reset Failed",
 			description: error?.message || "Failed to reset password."
@@ -311,9 +503,9 @@ async function submitTwoFA() {
 		const result = (await verify2FA({ userId: twoFAUserId, code: twoFACode })) as any;
 		isVerifying2FA = false;
 		if (result.success && result.redirectPath) {
-			toast.success({ title: "Verification Successful", description: "Redirecting…" });
-			window.location.href = result.redirectPath;
-			return;
+				toast.success({ title: "Verification Successful", description: "Redirecting…" });
+				await goto(result.redirectPath, { invalidateAll: true });
+				return;
 		}
 		toast.error({ description: result.message || twofa_error_invalid_code() });
 		twoFACode = "";
@@ -375,6 +567,8 @@ function handleBack(event: Event) {
 		P_WRESET = false;
 	} else if (P_WFORGOT) {
 		P_WFORGOT = false;
+	} else if (P_WMAGIC) {
+		P_WMAGIC = false;
 	} else {
 		onBack();
 	}
@@ -416,7 +610,7 @@ $effect(() => {
 	class:hover={isHover}
 >
 	{#if active === 0}
-		<div class="relative flex min-h-screen w-full items-center justify-center overflow-hidden">
+		<div transition:fade={{ duration: 250 }} class="relative flex min-h-screen w-full items-center justify-center overflow-hidden">
 			{#if screen.isDesktop}
 				<div class="absolute inset-0 z-0">
 					<FloatingPaths position={1} background="white" />
@@ -439,8 +633,10 @@ $effect(() => {
 						<div class="text-xs text-surface-300">
 							<SiteName {siteName} highlight="CMS" textClass="text-black" />
 						</div>
-						{#if !P_WFORGOT && !P_WRESET}
+						{#if !P_WFORGOT && !P_WRESET && !P_WMAGIC}
 							<div class="lg:-mt-1">{form_signin()}</div>
+						{:else if P_WMAGIC}
+							<div class="text-2xl lg:-mt-1 lg:text-4xl">Sign in via Magic Link</div>
 						{:else if P_WFORGOT && !P_WRESET}
 							<div class="text-2xl lg:-mt-1 lg:text-4xl">{signin_forgottenpassword()}</div>
 						{:else if P_WFORGOT && P_WRESET}
@@ -471,12 +667,13 @@ $effect(() => {
 				<!-- Sign In form                                               -->
 				<!-- FIX: Hidden (not just absent) when 2FA panel is active    -->
 				<!-- --------------------------------------------------------- -->
-				{#if !P_WFORGOT && !P_WRESET}
+				{#if !P_WFORGOT && !P_WRESET && !P_WMAGIC}
 					<div class:hidden={requires2FA}>
 						<form
-							id="signin-form"
 							method="POST"
+							action="?/signIn"
 							onsubmit={handleLoginSubmit}
+							id="signin-form"
 							bind:this={loginFormElement}
 							class="flex w-full flex-col gap-3"
 							class:hide={active !== 0}
@@ -492,6 +689,7 @@ $effect(() => {
 								autocapitalize="none"
 								spellcheck={false}
 								bind:value={loginForm.data.email}
+								oninput={onEmailInput}
 								label={email()}
 								required
 								icon="mdi:email"
@@ -520,26 +718,54 @@ $effect(() => {
 								invalid={!!loginForm.errors.password}
 								errorMessage={loginForm.errors.password?.[0] || ''}
 							/>
+							<button type="submit" class="hidden" aria-hidden="true">Sign in</button>
 						</form>
 
 						<div class="mt-4 flex flex-col items-center gap-2 sm:flex-row sm:justify-between">
-							<div class="flex w-full flex-col sm:flex-row justify-between gap-2 sm:w-auto">
+							<div class="flex w-full flex-col sm:flex-row justify-between gap-2 sm:w-auto transition-all">
 								<Button
-									type="submit"
-									form="signin-form"
+									type="button"
 									variant="surface"
 									class="w-full sm:w-auto"
 									aria-label={form_signin()}
 									data-testid="signin-submit"
 									loading={isSubmitting || isAuthenticating}
+									onclick={handleLoginSubmit}
 								>
 									{form_signin()}
 								</Button>
 
-								<OauthLogin showGoogleOAuth={pageData.showGoogleOAuth} showGithubOAuth={pageData.showGithubOAuth} {firstCollectionPath} />
+								{#if allowedMethods.hasOAuth}
+								<div class="animate-fade-in w-full sm:w-auto">
+									<OauthLogin showGoogleOAuth={pageData.showGoogleOAuth} showGithubOAuth={pageData.showGithubOAuth} {firstCollectionPath} />
+								</div>
+								{/if}
 							</div>
 
-							<div class="mt-4 flex w-full justify-between sm:mt-0 sm:w-auto">
+							<div class="mt-4 flex w-full justify-between sm:mt-0 sm:w-auto gap-2">
+								{#if pageData.showPasskey}
+								<Button
+									type="button"
+									variant="outline"
+									class="w-full sm:w-auto text-black!"
+									aria-label="Sign in with Passkey"
+									onclick={handlePasskeySignIn}
+									loading={isPasskeyLoading}
+								>
+									Passkey
+								</Button>
+								{/if}
+								{#if pageData.showMagicLink}
+								<Button
+									type="button"
+									variant="outline"
+									class="w-full sm:w-auto text-black!"
+									aria-label="Sign in via Magic Link"
+									onclick={() => { P_WMAGIC = true; }}
+								>
+									Magic Link
+								</Button>
+								{/if}
 								<Button
 									type="button"
 									variant="outline"
@@ -572,7 +798,7 @@ $effect(() => {
 							<div class="flex flex-col gap-3">
 								<div class="relative">
 									<!-- FIX: aria-label added to 2FA input -->
-									<input
+									<Input
 										type="text"
 										id="twofa-code"
 										bind:value={twoFACode}
@@ -580,9 +806,7 @@ $effect(() => {
 										onkeydown={(e) => e.key === "Enter" && submitTwoFA()}
 										placeholder={useBackupCode ? "Enter backup code" : twofa_code_placeholder()}
 										aria-label={useBackupCode ? "Backup recovery code" : "Authenticator code"}
-										class="input text-center font-mono tracking-wider"
-										class:text-2xl={!useBackupCode}
-										class:text-lg={useBackupCode}
+										class="text-center font-mono tracking-wider {!useBackupCode ? 'text-2xl' : 'text-lg'}"
 										maxlength={useBackupCode ? 10 : 6}
 										autocomplete="one-time-code"
 										inputmode={useBackupCode ? "text" : "numeric"}
@@ -595,14 +819,15 @@ $effect(() => {
 								</div>
 
 								<div class="text-center">
-									<button
+									<Button
+										variant="ghost"
 										type="button"
 										onclick={toggle2FACodeType}
-										class="text-sm text-tertiary-500  underline hover:text-tertiary-600 dark:text-primary-600"
+										class="text-sm underline"
 										aria-label={useBackupCode ? twofa_use_authenticator() : twofa_use_backup_code()}
 									>
 										{useBackupCode ? twofa_use_authenticator() : twofa_use_backup_code()}
-									</button>
+										</Button>
 								</div>
 
 								<div class="flex gap-3">
@@ -616,17 +841,16 @@ $effect(() => {
 									</Button>
 
 									<Button variant="tertiary"
-										type="button"
-										onclick={submitTwoFA}
-										disabled={!twoFACode.trim() ||
-											isVerifying2FA ||
-											(!useBackupCode && twoFACode.length !== 6) ||
-											(useBackupCode && twoFACode.length < 8)}
-										aria-label={twofa_verify_button()}
-									 class="dark: flex-1">
+																				type="button"
+																				onclick={submitTwoFA}
+																				disabled={!twoFACode.trim() ||
+																					isVerifying2FA ||
+																					(!useBackupCode && twoFACode.length !== 6) ||
+																					(useBackupCode && twoFACode.length < 8)}
+																				aria-label={twofa_verify_button()}
+																			 class="flex-1">
 										{#if isVerifying2FA}
-											<!-- FIX: alt="" + aria-hidden on spinner image -->
-											<img src="/Spinner.svg" alt="" aria-hidden="true" class="me-2 h-5 invert filter" />
+											<div class="me-2 h-5 w-5 animate-spin rounded-full border-2 border-current border-t-transparent"></div>
 											{twofa_verifying()}
 										{:else}
 											<iconify-icon icon="mdi:check" width={20} class="me-2" aria-hidden="true"></iconify-icon>
@@ -681,7 +905,7 @@ $effect(() => {
 							 class="text-white w-full sm:w-auto">
 								{form_resetpassword()}
 								{#if isSubmitting}
-									<img src="/Spinner.svg" alt="" aria-hidden="true" decoding="async" class="ms-4 h-6 invert filter" />
+									<div class="ms-4 h-6 w-6 animate-spin rounded-full border-2 border-current border-t-transparent"></div>
 								{/if}
 							</Button>
 
@@ -689,7 +913,56 @@ $effect(() => {
 								type="button"
 								aria-label="Back to sign in"
 								onclick={() => { P_WFORGOT = false; P_WRESET = false; }}
-							 class="p-0! min-w-0 rounded-full">
+								class="p-0! min-w-0 rounded-full">
+								<iconify-icon icon="mdi:arrow-left-circle" width={24} aria-hidden="true"></iconify-icon>
+							</Button>
+						</div>
+					</form>
+				{/if}
+
+				<!-- --------------------------------------------------------- -->
+				<!-- Magic Link request form                                   -->
+				<!-- --------------------------------------------------------- -->
+				{#if P_WMAGIC}
+					<form
+						onsubmit={handleMagicSubmit}
+						bind:this={magicFormElement}
+						class="flex w-full flex-col gap-3"
+						class:hide={active !== 0}
+						inert={active !== 0}
+						aria-label="Request magic link"
+					>
+						<FloatingInput
+							id="emailmagic"
+							name="email"
+							type="email"
+							autocomplete="email"
+							autocapitalize="none"
+							spellcheck={false}
+							bind:value={magicForm.data.email}
+							label={email()}
+							required
+							icon="mdi:email"
+							invalid={!!magicForm.errors.email}
+							errorMessage={magicForm.errors.email?.[0] || ''}
+						/>
+
+						<div class="mt-4 flex flex-col items-center gap-2 sm:flex-row sm:justify-start">
+							<Button variant="surface"
+								type="submit"
+								aria-label="Send Magic Link"
+								class="text-white w-full sm:w-auto">
+								Send Magic Link
+								{#if isSubmitting}
+									<div class="ms-4 h-6 w-6 animate-spin rounded-full border-2 border-current border-t-transparent"></div>
+								{/if}
+							</Button>
+
+							<Button variant="surface"
+								type="button"
+								aria-label="Back to sign in"
+								onclick={() => { P_WMAGIC = false; }}
+								class="p-0! min-w-0 rounded-full">
 								<iconify-icon icon="mdi:arrow-left-circle" width={24} aria-hidden="true"></iconify-icon>
 							</Button>
 						</div>
@@ -736,9 +1009,9 @@ $effect(() => {
 						<!-- Confirm password -->
 						<FloatingInput
 							id="confirm_passwordreset"
-							name="confirm_password"
+							name="confirmPassword"
 							type="security"
-							bind:value={resetForm.data.confirm_password}
+							bind:value={resetForm.data.confirmPassword}
 							bind:showPassword
 							autocomplete="new-password"
 							label={confirm_password?.() || form_confirmpassword?.()}
@@ -746,14 +1019,14 @@ $effect(() => {
 							iconColor="black"
 							textColor="black"
 							passwordIconColor="black"
-							invalid={!!resetForm.errors.confirm_password}
-							errorMessage={resetForm.errors.confirm_password?.[0] || ''}
+							invalid={!!resetForm.errors.confirmPassword}
+							errorMessage={resetForm.errors.confirmPassword?.[0] || ''}
 						/>
 
 						<!-- Password Strength Indicator -->
 						<PasswordStrength
 							password={resetForm.data.password}
-							confirmPassword={resetForm.data.confirm_password}
+							confirmPassword={resetForm.data.confirmPassword}
 						/>
 
 						<div class="mt-4 flex flex-col items-center gap-2 sm:flex-row sm:justify-start">
@@ -763,7 +1036,7 @@ $effect(() => {
 							 class="mt-6 text-white w-full sm:w-auto">
 								{signin_savenewpassword()}
 								{#if isSubmitting}
-									<img src="/Spinner.svg" alt="" aria-hidden="true" decoding="async" class="ms-4 h-6" />
+									<div class="ms-4 h-6 w-6 animate-spin rounded-full border-2 border-current border-t-transparent"></div>
 								{/if}
 							</Button>
 
@@ -787,14 +1060,14 @@ $effect(() => {
 <style>
 	.hide {
 		opacity: 0;
-		transition: 0s;
+		transition: opacity 0.25s ease-out;
 	}
 	section {
 		--width: 0%;
 		flex-grow: 1;
 		width: var(--width);
 		background: white;
-		transition: 0.4s;
+		transition: width 0.15s ease-out, border-radius 0.15s ease-out;
 	}
 	.active {
 		--width: 90%;

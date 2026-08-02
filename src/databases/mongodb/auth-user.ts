@@ -19,8 +19,10 @@ import {
   convertMongoUserToISO,
 } from "@src/databases/mongodb/mongodb-utils";
 import { safeQuery } from "@src/utils/security/safe-query";
+import { normalizeEmail } from "@src/utils/normalize-email";
 import type { Model } from "mongoose";
 import mongoose, { Schema } from "mongoose";
+import { SessionSchema } from "./auth-session";
 
 // Define the User schema
 export const UserSchema = new Schema(
@@ -29,7 +31,9 @@ export const UserSchema = new Schema(
     email: { type: String, required: true, unique: true }, // User's email, required field
     tenantId: { type: String }, // Tenant identifier for multi-tenancy
     password: { type: String }, // User's password
-    role: { type: String, required: true }, // User's role
+    // Default "user" mirrors Auth.createUser's `role || "user"` and the relational
+    // schema — callers (SCIM, oauth) that bypass the Auth class must not hard-fail.
+    role: { type: String, default: "user" }, // User's role
     permissions: [{ type: String }], // User-specific permissions
     username: String,
     firstName: String,
@@ -51,6 +55,7 @@ export const UserSchema = new Schema(
     totpSecret: String,
     backupCodes: [String],
     last2FAVerification: { type: Date },
+    authenticators: [{ type: Schema.Types.Mixed }],
   },
   {
     timestamps: true,
@@ -107,12 +112,12 @@ export class UserAdapter {
     try {
       const normalizedData = {
         ...userData,
-        email: userData.email?.toLowerCase(),
+        email: userData.email ? normalizeEmail(userData.email) : userData.email,
       };
 
       // Ensure password is hashed if provided and not already hashed
       if (normalizedData.password && !normalizedData.password.startsWith("$argon2")) {
-        const { hashPassword } = await import("@src/utils/security");
+        const { hashPassword } = await import("@src/utils/security/crypto");
         normalizedData.password = await hashPassword(normalizedData.password);
       }
 
@@ -124,6 +129,29 @@ export class UserAdapter {
 
       const userId = generateId();
       const Model = this.UserModel;
+
+      // Fail closed on duplicate email (parity with relational createUser). Email is
+      // the primary login identifier; the unique index is the backstop, this check
+      // keeps the error deterministic for callers (e.g. test seeding).
+      if (normalizedData.email) {
+        const dup = await Model.findOne({
+          email: normalizedData.email,
+          ...(options.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+        })
+          .select("_id")
+          .lean();
+        if (dup) {
+          return {
+            success: false,
+            message: `User with email ${normalizedData.email} already exists`,
+            error: {
+              code: "USER_ALREADY_EXISTS",
+              message: "User already exists",
+            },
+          };
+        }
+      }
+
       const user = new Model({ ...normalizedData, _id: userId });
       await user.save();
 
@@ -146,12 +174,12 @@ export class UserAdapter {
     try {
       const normalizedData = { ...userData };
       if (normalizedData.email) {
-        normalizedData.email = normalizedData.email.toLowerCase();
+        normalizedData.email = normalizeEmail(normalizedData.email);
       }
 
       // Ensure password is hashed if provided and not already hashed
       if (normalizedData.password && !normalizedData.password.startsWith("$argon2")) {
-        const { hashPassword } = await import("@src/utils/security");
+        const { hashPassword } = await import("@src/utils/security/crypto");
         normalizedData.password = await hashPassword(normalizedData.password);
       }
 
@@ -251,12 +279,30 @@ export class UserAdapter {
     }
   }
 
+  /** Accept raw tenantId or BaseQueryOptions (SDK passes the latter). */
+  private resolveTenantId(
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
+  ): string | null | undefined {
+    if (optionsOrTenant == null) return optionsOrTenant as null | undefined;
+    if (typeof optionsOrTenant === "string") return optionsOrTenant;
+    if (typeof optionsOrTenant === "object" && "tenantId" in (optionsOrTenant as object)) {
+      const t = (optionsOrTenant as BaseQueryOptions).tenantId;
+      return t == null ? (t as null | undefined) : String(t);
+    }
+    return undefined;
+  }
+
   async blockUsers(
     userIds: DatabaseId[],
-    tenantId?: DatabaseId | null,
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
   ): Promise<DatabaseResult<{ modifiedCount: number }>> {
     try {
-      const filter = safeQuery({ _id: { $in: userIds } } as any, tenantId as string, {
+      const ids = (userIds || []).filter(Boolean);
+      if (ids.length === 0) {
+        return { success: true, data: { modifiedCount: 0 } };
+      }
+      const tenantId = this.resolveTenantId(optionsOrTenant);
+      const filter = safeQuery({ _id: { $in: ids } } as any, tenantId as string, {
         includeDeleted: true,
       });
 
@@ -277,10 +323,15 @@ export class UserAdapter {
 
   async unblockUsers(
     userIds: DatabaseId[],
-    tenantId?: DatabaseId | null,
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
   ): Promise<DatabaseResult<{ modifiedCount: number }>> {
     try {
-      const filter = safeQuery({ _id: { $in: userIds } } as any, tenantId as string, {
+      const ids = (userIds || []).filter(Boolean);
+      if (ids.length === 0) {
+        return { success: true, data: { modifiedCount: 0 } };
+      }
+      const tenantId = this.resolveTenantId(optionsOrTenant);
+      const filter = safeQuery({ _id: { $in: ids } } as any, tenantId as string, {
         includeDeleted: true,
       });
 
@@ -331,10 +382,15 @@ export class UserAdapter {
 
   async deleteUsers(
     userIds: DatabaseId[],
-    tenantId?: DatabaseId | null,
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
   ): Promise<DatabaseResult<{ deletedCount: number }>> {
     try {
-      const filter = safeQuery({ _id: { $in: userIds } } as any, tenantId as string, {
+      const ids = (userIds || []).filter(Boolean);
+      if (ids.length === 0) {
+        return { success: true, data: { deletedCount: 0 } };
+      }
+      const tenantId = this.resolveTenantId(optionsOrTenant);
+      const filter = safeQuery({ _id: { $in: ids } } as any, tenantId as string, {
         includeDeleted: true,
       });
       const result = await this.UserModel.deleteMany(filter);
@@ -378,7 +434,7 @@ export class UserAdapter {
   ): Promise<DatabaseResult<User | null>> {
     try {
       const filter = safeQuery(
-        { email: criteria.email.toLowerCase() } as any,
+        { email: normalizeEmail(criteria.email) } as any,
         criteria.tenantId as string,
         {
           bypassTenantCheck: options.bypassTenantCheck,
@@ -434,7 +490,6 @@ export class UserAdapter {
       // If model isn't available on mongoose.models, explicitly register the schema.
       // This handles the HMR case where module re-evaluation clears model registrations.
       if (!SessionModel) {
-        const { SessionSchema } = await import("./auth-session");
         SessionModel = mongoose.model("auth_sessions", SessionSchema);
       }
 

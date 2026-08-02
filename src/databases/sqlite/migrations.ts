@@ -48,6 +48,10 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
         "totpSecret" TEXT,
         "backupCodes" TEXT,
         "last2FAVerification" INTEGER,
+        "authenticators" TEXT,
+        "preferences" TEXT,
+        "failedAttempts" INTEGER DEFAULT 0,
+        "lockoutUntil" INTEGER,
         "tenantId" TEXT,
         "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
         "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
@@ -74,6 +78,24 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
         "isRegistered" INTEGER DEFAULT 0,
         "role" TEXT,
         "username" TEXT,
+        "tenantId" TEXT,
+        "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+        "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+      );
+
+      CREATE TABLE IF NOT EXISTS "auth_api_keys" (
+        "_id" TEXT PRIMARY KEY,
+        "name" TEXT NOT NULL,
+        "hash" TEXT NOT NULL,
+        "prefix" TEXT NOT NULL,
+        "userId" TEXT NOT NULL,
+        "scopes" TEXT DEFAULT '[]',
+        "permissions" TEXT DEFAULT '[]',
+        "revoked" INTEGER DEFAULT 0,
+        "usageCount" INTEGER DEFAULT 0,
+        "lastUsedAt" INTEGER,
+        "lastUsedIp" TEXT,
+        "expiresAt" INTEGER,
         "tenantId" TEXT,
         "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
         "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
@@ -251,6 +273,21 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
         "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
       );
 
+      CREATE TABLE IF NOT EXISTS "plugin_storage" (
+        "_id" TEXT PRIMARY KEY,
+        "plugin" TEXT NOT NULL,
+        "collection" TEXT NOT NULL,
+        "tenantId" TEXT,
+        "data" TEXT NOT NULL DEFAULT '{}',
+        "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+        "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+      );
+
+      CREATE INDEX IF NOT EXISTS "idx_plugin_storage_plugin" ON "plugin_storage" ("plugin");
+      CREATE INDEX IF NOT EXISTS "idx_plugin_storage_collection" ON "plugin_storage" ("collection");
+      CREATE INDEX IF NOT EXISTS "idx_plugin_storage_tenant" ON "plugin_storage" ("tenantId");
+      CREATE INDEX IF NOT EXISTS "idx_plugin_storage_plugin_collection" ON "plugin_storage" ("plugin", "collection");
+
       CREATE TABLE IF NOT EXISTS "plugin_migrations" (
         "_id" TEXT PRIMARY KEY,
         "pluginId" TEXT NOT NULL,
@@ -275,6 +312,25 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
         "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
         "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
       );
+
+      CREATE TABLE IF NOT EXISTS "svelty_outbox" (
+        "_id" TEXT PRIMARY KEY,
+        "tenantId" TEXT,
+        "eventType" TEXT NOT NULL,
+        "aggregateType" TEXT NOT NULL,
+        "aggregateId" TEXT NOT NULL,
+        "payload" TEXT NOT NULL DEFAULT '{}',
+        "status" TEXT NOT NULL DEFAULT 'pending',
+        "deliveredAt" INTEGER,
+        "attempts" INTEGER NOT NULL DEFAULT 0,
+        "lastError" TEXT,
+        "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+        "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+      );
+      CREATE INDEX IF NOT EXISTS "idx_outbox_status" ON "svelty_outbox" ("status");
+      CREATE INDEX IF NOT EXISTS "idx_outbox_tenant" ON "svelty_outbox" ("tenantId");
+      CREATE INDEX IF NOT EXISTS "idx_outbox_event_type" ON "svelty_outbox" ("eventType");
+      CREATE INDEX IF NOT EXISTS "idx_outbox_created_at" ON "svelty_outbox" ("createdAt");
 
       CREATE TABLE IF NOT EXISTS "tenants" (
         "_id" TEXT PRIMARY KEY,
@@ -360,6 +416,7 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
         "createdAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000),
         "updatedAt" INTEGER DEFAULT (strftime('%s', 'now') * 1000)
       );
+      CREATE INDEX IF NOT EXISTS "idx_redirects_mv_lookup" ON "redirects_mv" ("tenantId", "source", "active");
 
       CREATE TABLE IF NOT EXISTS "collection_redirects" (
         "_id" TEXT PRIMARY KEY,
@@ -386,6 +443,21 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
       CREATE UNIQUE INDEX IF NOT EXISTS "idx_system_themes_name_tenant" ON "themes" ("name", "tenantId");
       CREATE UNIQUE INDEX IF NOT EXISTS "idx_plugin_states_unique" ON "plugin_states" ("pluginId", "tenantId");
       CREATE UNIQUE INDEX IF NOT EXISTS "idx_plugin_migrations_unique" ON "plugin_migrations" ("pluginId", "migrationId", "tenantId");
+      CREATE UNIQUE INDEX IF NOT EXISTS "idx_404_logs_path_tenant" ON "404_logs" ("path", "tenantId");
+
+      -- auth_users email uniqueness: SQLite treats NULL tenantId as distinct in a
+      -- plain unique index, so we need two partial indexes (single-tenant vs
+      -- multi-tenant). Legacy DBs may already carry duplicate emails from the era
+      -- before this constraint existed — dedupe first (keep the oldest account),
+      -- then enforce. The relational createUser() additionally fails closed on
+      -- duplicates so the error is deterministic across adapters.
+      DELETE FROM "auth_users" WHERE "_id" NOT IN (
+        SELECT MIN("_id") FROM "auth_users" GROUP BY "email", COALESCE("tenantId", '')
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS "idx_auth_users_email"
+        ON "auth_users" ("email") WHERE "tenantId" IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS "idx_auth_users_email_tenant"
+        ON "auth_users" ("email", "tenantId") WHERE "tenantId" IS NOT NULL;
 
       -- Full-text search virtual table (not auto-created by Drizzle ORM)
       -- Keep an internal mirror keyed by _id so we don't depend on nonexistent title/content columns
@@ -417,6 +489,12 @@ export async function runMigrations(db: any): Promise<DatabaseResult<void>> {
       SELECT "_id", COALESCE("name", ''), COALESCE("description", ''), COALESCE("data", '')
       FROM "content_nodes";
     `);
+
+    // 🚀 MIGRATION: Add missing auth columns for upgraded databases (idempotent)
+    execute(`ALTER TABLE "auth_users" ADD COLUMN "authenticators" TEXT`);
+    execute(`ALTER TABLE "auth_users" ADD COLUMN "failedAttempts" INTEGER DEFAULT 0`);
+    execute(`ALTER TABLE "auth_users" ADD COLUMN "lockoutUntil" INTEGER`);
+    execute(`ALTER TABLE "auth_users" ADD COLUMN "preferences" TEXT`);
 
     // 🚀 MIGRATION: Rename 'security' to 'password' if needed
     try {

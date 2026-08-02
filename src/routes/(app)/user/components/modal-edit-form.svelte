@@ -15,8 +15,8 @@ Efficiently manages user data updates with validation, role selection, and delet
 -->
 
 <script lang="ts">
+import { logger } from "@utils/logger";
 	import Button from '@components/ui/button.svelte';
-	import PermissionGuard from '@src/components/permission-guard.svelte';
 	import FloatingInput from '@components/ui/floating-input.svelte';
 	// Paraglide Messages
 	import { button_cancel, button_delete, button_save, form_confirmpassword, modaleditform_newpassword } from '@src/paraglide/messages';
@@ -32,24 +32,6 @@ Efficiently manages user data updates with validation, role selection, and delet
 
 	import { Form } from '@root/src/utils/form.svelte.ts';
 	import { updateProfile, verifyPassword as verifyPw, deleteUser as deleteUserRemote } from '../user.remote';
-
-	// Config for the general edit form permissions
-	const modaleEditFormConfig = {
-		name: 'Admin User Edit Form',
-		description: 'Allows admins to manage user accounts, including editing and assigning roles.',
-		contextId: 'user:manage',
-		action: 'manage',
-		contextType: 'user'
-	};
-
-	// Config for delete permission guard
-	const deleteUserPermissionConfig = {
-		name: 'Delete User',
-		description: 'Allows deleting a user account.',
-		contextId: 'user:delete',
-		action: 'delete',
-		contextType: 'user'
-	};
 
 	// Props
 	interface Props {
@@ -145,21 +127,34 @@ Efficiently manages user data updates with validation, role selection, and delet
 		}
 
 		try {
-			const result = await updateProfile(submitData);
+			// Own profile: send "self" so the API always resolves to session user
+			// (avoids stale page.data.user._id after re-seed / multi-tab races).
+			const resolvedUserId =
+				isOwnProfile || !editForm.data.user_id
+					? 'self'
+					: String(editForm.data.user_id);
+
+			const result = await updateProfile({
+				user_id: resolvedUserId,
+				...submitData
+			});
 
 			if (!result.success) {
 				throw new Error(result.error || result.message || 'Failed to update user.');
 			}
 
+			// Plain text title/description — E2E asserts role=alert / data-testid=app-toast
+			// without depending on HTML icon markup or CSS classes.
 			toast.success({
-				description: '<iconify-icon icon="mdi:check-outline" width={24} ></iconify-icon> User Data Updated'
+				title: 'User Data Updated',
+				description: 'Your profile changes were saved.'
 			});
 			await invalidateAll();
-			// modalStore.close();
 			modalState.close();
 		} catch (err) {
 			const message = err instanceof Error ? err.message : 'An unknown error occurred.';
-			toast.error(`<CircleAlert size={24}/> ${message}`);
+			// Plain text — matches expectToast / role=alert (no HTML icon markup)
+			toast.error({ title: 'Update failed', description: message });
 		} finally {
 			editForm.submitting = false;
 		}
@@ -197,7 +192,7 @@ Efficiently manages user data updates with validation, role selection, and delet
 				editForm.errors.currentPassword = ['Incorrect password'];
 			}
 		} catch (e) {
-			console.error(e);
+			logger.error(e instanceof Error ? e.message : String(e));
 			editForm.errors.currentPassword = ['Error verifying password'];
 		}
 	}
@@ -352,12 +347,11 @@ Efficiently manages user data updates with validation, role selection, and delet
 			{/if}
 		{/if}
 		<!-- Role Select -->
-		<PermissionGuard config={modaleEditFormConfig} silent={true}>
-			{#if !isOwnProfile}
+		{#if !isOwnProfile}
 				<div class="flex flex-col gap-2 sm:flex-row">
 					<div class="border-b text-center sm:w-1/4 sm:border-0 sm:text-start">Role</div>
 					<div class="flex-auto">
-						<div class="flex flex-wrap justify-center gap-2 space-x-2 sm:justify-start" role="radiogroup" aria-label="Select Role">
+						<div class="flex flex-wrap justify-center gap-2 sm:justify-start" role="radiogroup" aria-label="Select Role">
 							{#if roles && roles.length > 0}
 								{#each roles as r (r._id)}
 									<Button
@@ -410,8 +404,7 @@ Efficiently manages user data updates with validation, role selection, and delet
 					</div>
 				</div>
 			{/if}
-		</PermissionGuard>
-	</form>
+		</form>
 
 	<footer class="modal-footer flex flex-wrap items-center justify-between gap-4 border-t border-surface-500/20 pt-4">
 		<div class="flex items-center gap-4">
@@ -420,12 +413,10 @@ Efficiently manages user data updates with validation, role selection, and delet
 
 			<!-- Delete User Button (only if perm allows) -->
 			{#if showDeleteButton}
-				<PermissionGuard config={deleteUserPermissionConfig} silent={true}>
-					<Button variant="error" type="button" onclick={deleteUser}>
-						<iconify-icon icon="icomoon-free:bin" width={24}></iconify-icon>
-						<span class="hidden sm:block">{button_delete()}</span>
-					</Button>
-				</PermissionGuard>
+				<Button variant="error" type="button" onclick={deleteUser}>
+					<iconify-icon icon="icomoon-free:bin" width={24}></iconify-icon>
+					<span class="hidden sm:block">{button_delete()}</span>
+				</Button>
 			{/if}
 		</div>
 

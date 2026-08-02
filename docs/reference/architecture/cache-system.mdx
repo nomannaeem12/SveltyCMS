@@ -1,0 +1,226 @@
+---
+path: "docs/reference/architecture/cache-system.mdx"
+title: "Cache System"
+description: "SveltyCMS dual-layer cache (L1: In-Memory LRU, L2: Redis) with stampede protection, single-flight coalescing, negative Bloom filter, predictive warming, and stale-while-revalidate."
+order: 5
+icon: "mdi:database-clock"
+author: "SveltyCMS Team"
+created: "2025-10-03"
+updated: "2026-07-15"
+tags:
+  - "cache"
+  - "redis"
+  - "performance"
+  - "metrics"
+  - "optimization"
+  - "architecture"
+---
+
+# Cache System
+
+## Overview
+
+SveltyCMS implements a **dual-layer caching system**: L1 is an in-memory LRU cache (500K entries, sub-µs access), L2 is optional Redis for distributed deployments. The system includes stampede protection, single-flight coalescing, negative caching, predictive warming, and stale-while-revalidate.
+
+## Architecture
+
+### Dual-Layer Strategy
+
+```
+Layer 1: In-Memory LRU Cache → <0.001ms (L1 hit, zero allocation)
+Layer 2: Redis (Optional)     → <1ms (distributed, cross-node)
+Layer 3: Database (Persistent) → Sub-ms CRUD (0.042-3.261ms)
+```
+
+### Key: L1 is In-Memory, L2 is Redis
+
+The L1 cache is a local `LRUCache` instance (not Redis). Redis is the optional L2 layer for distributed deployments. This means even without Redis, the cache system is fully operational with sub-µs L1 hits.
+
+### Content System: L0 + L1 + L2 (Three Tiers)
+
+The content scanner adds a **process-local L0** on top of the dual-layer cache:
+
+```
+L0: Mtime Tree + _schemaCache (engine.server.ts) → skip fs/import when unchanged
+L1: cacheService LRU (schema:*, navigation:tree:*)       → sub-µs metadata hits
+L2: Redis MGET/MSET (optional)                            → cross-node schema + nav snapshots
+```
+
+| Key prefix                           | Category  | TTL    | Tags                              | Invalidation                                                   |
+| ------------------------------------ | --------- | ------ | --------------------------------- | -------------------------------------------------------------- |
+| `schema:{filePath}`                  | `SCHEMA`  | 1 hour | `schema`, `schema:{collectionId}` | `clearByPattern("schema:")` on full reload                     |
+| `navigation:tree:{tenant}:{version}` | `CONTENT` | 5 min  | `navigation`, `navigation:tree`   | `clearByPattern("navigation:tree:")` on every `content:update` |
+
+**Helpers**: `src/content/engine.server.ts` (`setSchemaCacheEntry`, `invalidateSchemaCache`, `invalidateNavigationCache`, `notifyContentUpdate`).
+
+### Bearer credential auth (website tokens + API keys)
+
+Hash-keyed entries — **never store plaintext bearer tokens in L1/L2**:
+
+| Key prefix               | Category  | TTL | Tags                                          | Invalidation                                    |
+| ------------------------ | --------- | --- | --------------------------------------------- | ----------------------------------------------- |
+| `apitoken:{sha256-hex}`  | `SESSION` | 60s | `auth`, `website-token`, `website-token:{id}` | `clearByTags(['website-token:{id}'])` on delete |
+| `apikey:{sha256-b64url}` | `SESSION` | 60s | `auth`, `api-key`, `api-key:{id}`             | `clearByTags(['api-key:{id}'])` on revoke       |
+
+**Helpers**: `src/databases/auth/credential-auth-cache.ts` (`setWebsiteTokenAuthCache`, `getWebsiteTokenAuthCacheSync`, `invalidateWebsiteTokenAuth`, `recordWebsiteTokenAuthMiss`).
+
+**Negative misses**: `cacheService.isNegativeHit()` / `recordMiss()` — Bloom filter per cache-system (not plaintext module bloom).
+
+**Auth middleware**: `handle-authentication.ts` hashes once (`hashCredentialSha256HexSync` / `hashApiKey`), looks up by hash via `getByTokenHash`, caches with `CacheCategory.SESSION`.
+
+### Permission Cache (RBAC)
+
+| Key prefix                                | TTL  | Invalidation                                            |
+| ----------------------------------------- | ---- | ------------------------------------------------------- |
+| `{userId}:{permissionId}:{sortedRoleIds}` | 5min | `invalidatePermissionCache(userId)` on user update      |
+|                                           |      | `invalidatePermissionCache()` (global) on role mutation |
+
+**Helpers**: `src/databases/auth/permissions.ts` (`invalidatePermissionCache`), `src/utils/security/permission-cache.ts` (`PermissionCache`).
+
+**Invalidation policy**:
+
+- **Per-user**: Called after `Auth.updateUser()` — clears cached permission checks for the modified user so RBAC changes take effect immediately.
+- **Global**: Called after `AuthNamespace.updateRoles()` — clears all entries since any role change can affect many users' cached checks.
+- **Turbo auth**: `invalidateTurboAuthForUser(userId)` in `hooks.server.ts` clears the turbo auth cache entry so the next GET request re-validates the session with fresh permissions.
+
+> [!IMPORTANT]
+> Before July 2026, `invalidatePermissionCache` was defined but **never called**. Stale DENY results survived up to 5 minutes after privilege changes. The hardening ensures immediate propagation.
+
+> [!NOTE]
+> Use `clearByPattern("schema:")` — not `invalidateByCategory(SCHEMA)` — because schema keys are prefixed with `schema:`, not `*:schema:`.
+
+## Smart Features (All Production-Ready)
+
+### Scheduled Publish Cache Invalidation
+
+The background job scheduler (`scheduled-jobs.ts`) now invalidates the collection cache after every successful scheduled publish. This prevents stale relation data from being served after entries transition from `draft` to `publish` status.
+
+```typescript
+// After scheduled publish, in scheduled-jobs.ts:
+await cacheService.invalidateCollection(collectionName);
+```
+
+Without this invalidation, GraphQL queries using `publicationFilter` would continue serving cached results that don't reflect the newly published state.
+
+**Related**: [Schedule Modal Component](/docs/reference/components/schedule-modal.mdx)
+
+### Cache Stampede Protection (Single-Flight + Distributed Locks)
+
+When a popular cache key expires, only ONE request rebuilds it. All other concurrent requests wait for the result. This prevents the "thundering herd" problem where 100 simultaneous requests all hit the database for the same missing key.
+
+```typescript
+// Internal: pendingRequests Map coalesces concurrent misses
+if (this.pendingRequests.has(fullKey)) {
+  return this.pendingRequests.get(fullKey); // Wait for the winner
+}
+
+// Internal: lockedKeys Map for distributed coordination (Redis-backed)
+lockOwner = await this.acquireLock(fullKey, 500);
+if (!lockOwner) {
+  await this.waitForCache(fullKey, 1000); // Another node is fetching
+}
+```
+
+### Negative Caching (Bloom Filter)
+
+A Bloom filter prevents "cache miss storms" — repeated requests for non-existent keys (404s, broken links) bypass the database entirely. Verified **2392x speedup** for repeated misses.
+
+```typescript
+// Before hitting DB, check Bloom filter
+if (!this.negativeInvalidated.has(fullKey) && this.negativeBloom.has(fullKey)) {
+  return null; // Known non-existent — skip DB entirely
+}
+```
+
+### Prefix-Bucketed Invalidation (O(1) Clearing)
+
+Instead of scanning all cache keys, the system maintains a `prefixMap` that groups keys by namespace. Clearing `collection:posts:*` only iterates over keys in that bucket.
+
+### Predictive Cache Warming
+
+On startup, the `cacheWarmingService` pre-loads frequently-accessed paths based on historical patterns.
+
+### Stale-While-Revalidate (SWR)
+
+When a cached entry is stale (TTL expired but within stale window), the stale value is returned immediately while a background refresh updates the cache. Eliminates cache-miss latency entirely for frequently-accessed content.
+
+```typescript
+const result = await cacheService.getOrSetSWR(
+  "collection:posts:published",
+  async () => await db.findMany("posts", { status: "published" }),
+  60_000, // TTL: 1 minute
+  300_000, // Stale: 5 minutes (serve stale + refresh)
+);
+```
+
+### Collection List Queries (entry-list / CollectionService)
+
+Editorial list views are cached through `CollectionService.getCollectionData()` using **getOrSetSWR**, not raw `get`/`set`.
+
+| Concern                 | Implementation                                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| **Key shape**           | `collection:{id}:query:{hash}:page:{n}:size:{s}:lang:{l}:tenant:{t}:user:{u}:edit:{e}`                                          |
+| **Query hash**          | `hashQueryPayload({ filter, search, sort })` — stable key order via `stableSerialize` (`src/utils/collection-query-filters.ts`) |
+| **Fresh / stale**       | TTL **60s** / stale window **300s** (SWR)                                                                                       |
+| **Category**            | `CacheCategory.COLLECTION`                                                                                                      |
+| **Tags**                | `collection`, `collection:{id}`                                                                                                 |
+| **Prefix invalidation** | `cacheService.invalidateCollection(id)` → `clearByPattern("collection:{id}:")` (O(1) prefix bucket)                             |
+| **Negative Bloom**      | **Not** applied to empty list pages — empty result sets are valid editorial states                                              |
+| **URL filters**         | `filter_{field}` + `search` parsed by `parseCollectionListQuery` (schema whitelist before DB)                                   |
+
+```typescript
+// CollectionService (simplified)
+const queryHash = hashQueryPayload({ filter, search, sort });
+const cacheKey = buildCollectionQueryCacheKey({ collectionId, page, pageSize, queryHash, language, tenantId, userId });
+
+return cacheService.getOrSetSWR(
+  cacheKey,
+  () => loadFromDb(...),
+  60_000,   // fresh
+  300_000,  // stale-while-revalidate
+  tenantId,
+  CacheCategory.COLLECTION,
+  ["collection", `collection:${collectionId}`],
+);
+```
+
+> [!IMPORTANT]
+> After content mutations (create/update/delete/status/import/sync), always invalidate with the **collection id prefix** so every filtered page, sort, and search variant is cleared:
+> `await cacheService.invalidateCollection(collectionId)`.
+
+**Related**: [Collection Filtering Platform](./collection-filtering.mdx) · [entry-list](../components/entry-list.mdx) · [Content API filters](../api/content.mdx) · [Data Operations](./data-operations.mdx)
+
+## Cache Categories
+
+| Category | TTL        | Use Case                                        |
+| -------- | ---------- | ----------------------------------------------- |
+| Static   | 7 days     | Page templates, layouts                         |
+| Dynamic  | 1 hour     | Blog posts, articles                            |
+| API      | 15 minutes | External API responses                          |
+| Query    | 30 minutes | Database query results                          |
+| Session  | 24 hours   | User sessions, auth tokens                      |
+| Widget   | 2 hours    | Dashboard widgets                               |
+| Computed | 6 hours    | Expensive calculations                          |
+| Media    | 30 days    | Uploaded files, thumbnails                      |
+| Schema   | 1 hour     | Collection schema metadata (`schema:*` keys)    |
+| Content  | 5 minutes  | Navigation tree snapshots (`navigation:tree:*`) |
+
+## Performance Metrics
+
+| Operation         | Without Cache | With Cache  | Improvement |
+| ----------------- | ------------- | ----------- | ----------- |
+| Get User          | 45ms          | 0.8ms       | **56x**     |
+| List Posts        | 120ms         | 1.2ms       | **100x**    |
+| Dashboard         | 800ms         | 5ms         | **160x**    |
+| **Negative Miss** | 2.45ms        | **0.001ms** | **2392x**   |
+
+## Cache Hit Rates
+
+- User Sessions: 92%
+- Static Content: 95%
+- API Responses: 88%
+- Database Queries: 85%
+
+---
+
+**Last Updated**: 2026-07-15 (collection list SWR keys with filter hash; entry-list / createSmartFilter alignment)

@@ -6,7 +6,7 @@ order: 0
 icon: "mdi:rocket-launch"
 author: "SveltyCMS Team"
 created: "2025-10-05"
-updated: "2026-06-14"
+updated: "2026-07-10"
 tags:
   - "getting-started"
   - "quickstart"
@@ -26,7 +26,7 @@ Get up and running in minutes — whether you're a **Developer** installing the 
 ## 👥 Choose Your Path
 
 - 🛠️ **[Installation](#1-installation-for-developers)** — For developers and DevOps
-- 🎨 **[First Steps](#2-first-steps-for-admins--editors)** — For administrators and content editors
+- 🎨 **[First Steps](#2-first-steps-for-admins-editors)** — For administrators and content editors
 - 📚 **[Workflow Templates](#3-common-workflow-templates)** — Blog, e-commerce, multi-language
 
 ---
@@ -37,16 +37,22 @@ SveltyCMS features a **Self-Healing Setup Wizard** that automates database confi
 
 ### Quick Install
 
+#### Option A: Scaffolding CLI (recommended)
+
 ```bash
-# 1. Clone the repository
+npx create-sveltycms@latest my-cms
+cd my-cms
+bun run dev
+```
+
+Templates: `website`, `blog`, `agency`, `saas`, `corporate`, `ecommerce` · Databases: `sqlite` (default), `postgresql`, `mariadb`, `mongodb`
+
+#### Option B: Clone from GitHub
+
+```bash
 git clone https://github.com/SveltyCMS/SveltyCMS.git
 cd SveltyCMS
-
-# 2. Install dependencies (Bun recommended, 3-4× faster than Node.js)
 bun install
-# Windows: if bun install fails, use `npm install` instead (upstream Bun bug)
-
-# 3. Start — auto-launches Setup Wizard on first run
 bun run dev
 ```
 
@@ -94,12 +100,24 @@ The CMS is designed for clarity and speed.
 ### First Tasks
 
 1.  **Configure Settings**: Go to **⚙️ Config** to set your Site Name, Default Language, and Theme.
-2.  **Create a Collection**: Go to **📚 Collections** → **+ New Collection**. Choose from 5 pre-built templates (Blog, Agency, SaaS, Corporate, E-commerce) or build from scratch.
-3.  **Add Your First Entry**: Open your new collection and click **+ New Entry**. Fill in the fields and click **Save**.
+2.  **View your homepage**: With the default **Website Starter** preset, visit `http://localhost:5173/` — guests see a published homepage designed with [Svedit](/docs/development/site-starter.mdx).
+3.  **Design the frontpage**: Edit **Pages → Home** in the form (free), or use **Live Preview** for inline Svedit editing ([Editable Website plugin](/src/plugins/editable-website/editable-website.mdx) — 14-day trial, auto-enabled on Website Starter).
+4.  **Add more content**: Create additional `pages` entries (`about`, `contact`, …) or add collections from templates (Blog, Agency, SaaS, Corporate, E-commerce).
 
 ---
 
 ## 3. Common Workflow Templates
+
+### Website Starter (recommended — SvelteKit + Svedit)
+
+**Website Starter** is pre-selected in the Setup Wizard. After setup you get:
+
+1. In-repo **SvelteKit** public routes at `routes/(site)`
+2. A **Pages** collection with a published `home` entry (Svedit layout in `content`)
+3. **Svedit** inline block editing when Live Preview is enabled
+4. **Live Preview bridge** (trial included): [Editable Website](/src/plugins/editable-website/editable-website.mdx) (€14.99 after trial) — iframe sync and inline Svedit editing; CMS form editing stays free
+
+See the [Site Starter guide](/docs/development/site-starter.mdx). For Astro/Next.js/Vue, disable the site starter and consume the headless API instead.
 
 ### Blog
 
@@ -135,7 +153,8 @@ Granular **RBAC** with field-level access control:
 
 ## Next Steps
 
-- [API Reference](./api/index.mdx) — REST, GraphQL, Local SDK
-- [Widget Development](./guides/development/widgets/index.mdx) — Build custom field types
-- [Security Overview](./architecture/security/index.mdx) — 4-layer defense-in-depth
+- [Site Starter](/docs/development/site-starter.mdx) — Optional SvelteKit public frontend + live preview
+- [API Reference](./reference/api/index.mdx) — REST, GraphQL, Local SDK
+- [Widget Development](./development/widgets/index.mdx) — Build custom field types
+- [Security Overview](./reference/security/index.mdx) — 4-layer defense-in-depth
 - [Performance Benchmarks](./project/benchmarks/index.mdx) — 48 tests across 4 databases

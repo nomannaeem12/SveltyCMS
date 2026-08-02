@@ -18,7 +18,9 @@ import type {
   PaginatedResult,
   PaginationOptions,
 } from "../db-interface";
+import { hasTenantBypass } from "../system-tenant-scope";
 import { eq, isNull } from "drizzle-orm";
+import { assertTenantContext } from "@src/utils/security/safe-query";
 
 export { isoDateStringToDate, nowISODateString };
 
@@ -53,6 +55,7 @@ const JSON_FIELDS = new Set([
   "usage",
   "roleIds",
   "permissions",
+  "preferences",
   "details",
   "errorDetails",
   "instances",
@@ -138,6 +141,43 @@ export const safeDate = (input: any): Date => {
   return new Date(input);
 };
 
+function isJsonString(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 1 &&
+    (value[0] === "{" || value[0] === "[" || value[0] === '"')
+  );
+}
+
+/** Parse string JSON columns; native jsonb objects (PostgreSQL) pass through unchanged. */
+function normalizeJsonFieldValue(
+  value: unknown,
+  options?: { mariaDoubleParseJson?: boolean },
+): unknown {
+  let v = value;
+  // Parse through every JSON-string layer — legacy rows may be double-encoded
+  // ("stringified string") from older write paths; a single pass leaves them
+  // as strings and permission bitsets silently degrade to empty.
+  const maxLayers = options?.mariaDoubleParseJson ? 3 : 3;
+  for (let i = 0; i < maxLayers; i++) {
+    if (!isJsonString(v)) break;
+    try {
+      const next = JSON.parse(v as string);
+      if (next === v) break;
+      v = next;
+    } catch {
+      break;
+    }
+  }
+  return v;
+}
+
+function flattenDataColumn(result: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === "data" && value && typeof value === "object" && !Array.isArray(value)) {
+    Object.assign(result, value);
+  }
+}
+
 /**
  * Schema-aware row converter — only touches known date/JSON columns.
  * For unregistered tables, falls back to full-key iteration (backward compatible).
@@ -176,27 +216,8 @@ export function convertDatesToISO(
   if (jsonCols && jsonCols.length > 0) {
     for (let i = 0; i < jsonCols.length; i++) {
       const k = jsonCols[i];
-      let v = row[k];
-      if (typeof v === "string" && v.length > 1 && (v[0] === "{" || v[0] === "[" || v[0] === '"')) {
-        try {
-          v = JSON.parse(v);
-        } catch {}
-        if (k === "data" && v && typeof v === "object" && !Array.isArray(v)) {
-          Object.assign(result, v);
-        }
-        if (
-          options?.mariaDoubleParseJson &&
-          typeof v === "string" &&
-          v.length > 1 &&
-          (v[0] === "{" || v[0] === "[" || v[0] === '"')
-        ) {
-          try {
-            v = JSON.parse(v);
-            if (k === "data" && v && typeof v === "object" && !Array.isArray(v))
-              Object.assign(result, v);
-          } catch {}
-        }
-      }
+      const v = normalizeJsonFieldValue(row[k], options);
+      flattenDataColumn(result, k, v);
       result[k] = v;
     }
   }
@@ -221,24 +242,9 @@ export function convertDatesToISO(
         (v && typeof v === "object" && typeof (v as any).getTime === "function")
       ) {
         v = (v instanceof Date ? v : new Date((v as any).getTime())).toISOString();
-      } else if (
-        JSON_FIELDS.has(k) &&
-        typeof v === "string" &&
-        v.length > 1 &&
-        (v[0] === "{" || v[0] === "[" || v[0] === '"')
-      ) {
-        try {
-          v = JSON.parse(v);
-        } catch {}
-        if (k === "data" && v && typeof v === "object" && !Array.isArray(v))
-          Object.assign(result, v);
-        if (options?.mariaDoubleParseJson && typeof v === "string") {
-          try {
-            v = JSON.parse(v);
-            if (k === "data" && v && typeof v === "object" && !Array.isArray(v))
-              Object.assign(result, v);
-          } catch {}
-        }
+      } else if (JSON_FIELDS.has(k)) {
+        v = normalizeJsonFieldValue(v, options);
+        flattenDataColumn(result, k, v);
       }
       result[k] = v;
     }
@@ -334,9 +340,16 @@ export const convertUserToISO = convertDatesToISO;
 export const convertSessionToISO = convertDatesToISO;
 
 export const parseJsonField = <T = any>(v: any, fallback?: T): T => {
-  if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+  if (typeof v === "string" && (v.startsWith("{") || v.startsWith("[") || v.startsWith('"'))) {
     try {
-      return JSON.parse(v) as T;
+      let parsed: unknown = v;
+      for (let i = 0; i < 3; i++) {
+        const next = JSON.parse(parsed as string);
+        if (next === parsed) break;
+        parsed = next;
+        if (typeof parsed !== "string") break;
+      }
+      return parsed as T;
     } catch {
       return (fallback !== undefined ? fallback : v) as T;
     }
@@ -349,7 +362,7 @@ export const parseJsonField = <T = any>(v: any, fallback?: T): T => {
 // ============================================================================
 
 export function shouldBypassTenantCheck(options?: BaseQueryOptions): boolean {
-  return !!(options as any)?.bypassTenantCheck;
+  return hasTenantBypass(options);
 }
 
 export function getEffectiveTenantId(options?: BaseQueryOptions): DatabaseId | null | undefined {
@@ -366,11 +379,17 @@ export function getTenantCondition(tenantCol: any, options?: BaseQueryOptions): 
   return eq(tenantCol, tenantId);
 }
 
+/**
+ * Apply tenant predicate + fail-closed MULTI_TENANT check (SQL/Mongo parity).
+ * Single-tenant / bypass paths: near-zero cost.
+ */
 export function applyTenantFilter(
   conditions: any[],
   tenantCol: any,
   options?: BaseQueryOptions,
 ): any[] {
+  assertTenantContext(options, "sql.applyTenantFilter");
+  if (!tenantCol) return conditions;
   const cond = getTenantCondition(tenantCol, options);
   if (cond) conditions.push(cond);
   return conditions;
@@ -380,6 +399,7 @@ export function applyTenantFilterToObject<T extends Record<string, unknown>>(
   conditions: T,
   options?: BaseQueryOptions,
 ): T {
+  assertTenantContext(options, "sql.applyTenantFilterToObject");
   if (shouldBypassTenantCheck(options)) return conditions;
   const tenantId = getEffectiveTenantId(options);
   if (tenantId === undefined) return conditions;
@@ -390,6 +410,7 @@ export function applyTenantFilterToMongoQuery<T extends Record<string, unknown>>
   query: T,
   options?: BaseQueryOptions,
 ): T {
+  assertTenantContext(options, "mongo.applyTenantFilter");
   if (shouldBypassTenantCheck(options)) return query;
   const tenantId = getEffectiveTenantId(options);
   if (tenantId === undefined) return query;
@@ -397,20 +418,66 @@ export function applyTenantFilterToMongoQuery<T extends Record<string, unknown>>
   return { ...query, tenantId } as T;
 }
 
+/**
+ * Validate a SQL identifier before embedding in raw SQL (column/JSON key names).
+ * Never use for values — bind those as parameters instead.
+ */
+export function assertSafeSqlIdentifier(name: string, label = "field"): string {
+  if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`Invalid SQL identifier for ${label}: ${String(name)}`);
+  }
+  return name;
+}
+
+/** Coerce + validate numeric amount for atomicIncrement-style SQL. */
+export function assertFiniteAmount(amount: number | string): number {
+  const n = typeof amount === "number" ? amount : Number(amount);
+  if (!Number.isFinite(n)) {
+    throw new Error(`atomicIncrement amount must be a finite number, got: ${String(amount)}`);
+  }
+  return n;
+}
+
+/**
+ * @deprecated Prefer {@link buildRawTenantClause} with bound parameters.
+ * Kept for call sites that still embed filters as literals (quote-escaped only).
+ */
 export function buildRawTenantFilter(
   options?: BaseQueryOptions,
   dialect: "mysql" | "postgres" | "sqlite" = "sqlite",
 ): string {
-  if (options?.bypassTenantCheck || !options?.tenantId || options?.tenantId === "global") return "";
-  const id = String(options.tenantId).replace(/'/g, "''");
-  if (dialect === "mysql") return ` AND \`tenantId\` = '${id}'`;
-  return ` AND "tenantId" = '${id}'`;
+  const { sql } = buildRawTenantClause(options, dialect, { parameterized: false });
+  return sql;
 }
 
-// Pre-register all system table schemas for optimal row conversion.
-// Uses dynamic import to avoid circular dependency with drizzle-sql-helpers.
-import("./drizzle-sql-helpers").then(({ SYSTEM_LITERAL_COLUMNS }) => {
-  for (const [tableName, columns] of Object.entries(SYSTEM_LITERAL_COLUMNS)) {
-    registerTableSchema(tableName, columns as string[]);
+/**
+ * Tenant WHERE fragment for raw SQL paths.
+ *
+ * Prefer `parameterized: true` (default) and pass `params` to the driver —
+ * never interpolate untrusted tenant IDs into SQL strings.
+ *
+ * Placeholders:
+ * - mysql / sqlite → `?`
+ * - postgres → `$N` starting at `paramIndex` (default 1)
+ */
+export function buildRawTenantClause(
+  options?: BaseQueryOptions,
+  dialect: "mysql" | "postgres" | "sqlite" = "sqlite",
+  opts: { parameterized?: boolean; paramIndex?: number } = {},
+): { sql: string; params: string[] } {
+  if (options?.bypassTenantCheck || !options?.tenantId || options?.tenantId === "global") {
+    return { sql: "", params: [] };
   }
-});
+  const parameterized = opts.parameterized !== false;
+  const col = dialect === "mysql" ? "`tenantId`" : `"tenantId"`;
+  if (parameterized) {
+    if (dialect === "postgres") {
+      const idx = opts.paramIndex ?? 1;
+      return { sql: ` AND ${col} = $${idx}`, params: [String(options.tenantId)] };
+    }
+    return { sql: ` AND ${col} = ?`, params: [String(options.tenantId)] };
+  }
+  // Legacy literal path — quote-escape only (avoid for new code)
+  const id = String(options.tenantId).replace(/'/g, "''");
+  return { sql: ` AND ${col} = '${id}'`, params: [] };
+}

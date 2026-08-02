@@ -5,7 +5,7 @@
  * #Features:
  * - Handles 'new' and 'edit' actions based on URL parameters.
  * - Checks for authenticated user in locals (set by hooks.server.ts).
- * - Verifies user permissions: Must be admin or have 'config:collection:manage' permission.
+ * - Verifies user permissions: Must be admin or have 'config:collectionbuilder' permission.
  * - Fetches all permissions and roles to pass to the client (for UI selectors).
  * - For 'edit' mode, fetches the specific collection data from contentSystem.
  * - For 'new' mode, returns a null collection object.
@@ -19,21 +19,19 @@ import path from "node:path";
 import { contentSystem } from "@src/content/index.server";
 import type { Schema } from "@src/content/types";
 // Auth
-// Use hasPermissionWithRoles and roles from locals, like the example pattern
 import {
-  hasPermissionWithRoles,
+  hasCollectionBuilderPermission,
   permissionConfigs,
   permissions,
 } from "@src/databases/auth/permissions";
 import { MigrationEngine } from "@src/services/core/migration-engine";
 // Widgets
 import { widgets } from "@src/stores/widget-store.svelte.ts";
-import { compile } from "@src/utils/compilation/compile";
-import { type Actions, error, redirect } from "@sveltejs/kit";
+import { type Actions, error } from "@sveltejs/kit";
+import { getAuthenticatedUser } from "@utils/page-guards.server";
 // System Logger
 import { logger } from "@utils/logger";
 import { getCollectionDisplayPath, getCollectionFilePath } from "@utils/tenant.server";
-import prettier from "prettier";
 import * as ts from "typescript";
 import type { PageServerLoad } from "./$types";
 
@@ -68,44 +66,35 @@ const userCollectionsPath = path.resolve(
   process.env.COLLECTIONS_DIR || "config/collections",
 );
 
-// Load Prettier config
-async function getPrettierConfig() {
+// Format generated TypeScript with oxfmt (replaces prettier)
+async function formatTypeScript(code: string): Promise<string> {
   try {
-    const config = await prettier.resolveConfig(process.cwd());
-    return { ...config, parser: "typescript" };
+    const { spawnSync } = await import("node:child_process");
+    const result = spawnSync("bun", ["x", "oxfmt", "--stdin"], {
+      input: code,
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    if (result.status === 0 && result.stdout) return result.stdout;
   } catch (err) {
-    logger.warn("Failed to load Prettier config, using defaults:", err);
-    return { parser: "typescript" };
+    logger.warn("oxfmt not available for formatting, writing unformatted code.", err);
   }
+  return code;
 }
 
 // Define load function as async function that takes an event parameter
 export const load: PageServerLoad = async ({ locals, params }) => {
   try {
-    // 1. Get user, roles, and admin status from locals (set by hook)
-    const { user, roles: tenantRoles, isAdmin } = locals;
+    const user = getAuthenticatedUser(locals);
+    const { roles: tenantRoles, isAdmin } = locals;
     const { action } = params;
-
-    // 2. User authentication (already done by hook, this is a fallback)
-    if (!user) {
-      logger.warn("User not authenticated, redirecting to login");
-      throw redirect(302, "/login");
-    }
 
     logger.trace(`User authenticated successfully for user: ${user._id}`);
 
-    // 3. Authorization check
-    // Use the 'config:collection:manage' permission string (adjust if needed)
-    const hasManagePermission = hasPermissionWithRoles(
-      user,
-      "config:collection:manage",
-      tenantRoles,
-    );
-
-    // Replicate original logic: User must be an Admin OR have the specific permission.
-    if (!(isAdmin || hasManagePermission)) {
-      const message = `User ${user._id} lacks 'config:collection:manage' permission and is not admin.`;
-      logger.warn(message, { userId: user._id, isAdmin, hasManagePermission });
+    // 3. Authorization check — admin or config:collectionbuilder (see core-permissions.ts)
+    if (!hasCollectionBuilderPermission(user, tenantRoles, isAdmin)) {
+      const message = `User ${user._id} lacks config:collectionbuilder permission and is not admin.`;
+      logger.warn(message, { userId: user._id, isAdmin });
       throw error(403, "Insufficient permissions");
     }
 
@@ -202,18 +191,10 @@ export const load: PageServerLoad = async ({ locals, params }) => {
 export const actions: Actions = {
   // Save Collection
   saveCollection: async ({ request, locals }) => {
+    const user = getAuthenticatedUser(locals);
+    const { roles: tenantRoles, isAdmin } = locals;
     try {
-      const { user, roles: tenantRoles, isAdmin } = locals;
-      if (!user) {
-        return { status: 401, error: "Unauthorized" };
-      }
-      const hasManagePermission = hasPermissionWithRoles(
-        user,
-        "config:collection:manage",
-        tenantRoles,
-      );
-
-      if (!(isAdmin || hasManagePermission)) {
+      if (!hasCollectionBuilderPermission(user, tenantRoles, isAdmin)) {
         return { status: 403, error: "Insufficient permissions" };
       }
 
@@ -226,6 +207,22 @@ export const actions: Actions = {
       const collectionDescription = formData.get("description");
       const collectionStatus = formData.get("status") as string;
       const confirmDeletions = formData.get("confirmDeletions") === "true";
+
+      // Permissions & Settings tab data
+      const entriesPerPage = parseInt((formData.get("entriesPerPage") as string) || "20", 10);
+      const defaultSortField = (formData.get("defaultSortField") as string) || "createdAt";
+      const defaultSortDir = (formData.get("defaultSortDir") as string) || "desc";
+      const apiVisible = formData.get("apiVisible") !== "false";
+
+      const federationEnrichmentsRaw = formData.get("federationEnrichments") as string | null;
+      let federationEnrichments: Schema["federationEnrichments"];
+      if (federationEnrichmentsRaw) {
+        try {
+          federationEnrichments = JSON.parse(federationEnrichmentsRaw);
+        } catch {
+          return { status: 400, error: "Invalid federationEnrichments JSON" };
+        }
+      }
 
       // Widgets Fields
       const fields = JSON.parse(fieldsData) as FieldsData;
@@ -268,6 +265,11 @@ export const actions: Actions = {
         fields,
         imports,
         tenantId,
+        entriesPerPage,
+        defaultSortField,
+        defaultSortDir,
+        apiVisible,
+        federationEnrichments,
       });
 
       // Use tenant-aware path resolution
@@ -277,14 +279,30 @@ export const actions: Actions = {
       if (originalName && originalName !== contentName && oldCollectionPath) {
         fs.renameSync(oldCollectionPath, collectionPath);
       }
+      // Ensure parent directory exists (Node.js writeFileSync does NOT auto-create parents)
+      fs.mkdirSync(path.dirname(collectionPath), { recursive: true });
       fs.writeFileSync(collectionPath, content);
 
-      // Compile with tenant ID
-      await compile({ logger, tenantId });
-      //await contentSystem.generateContentTypes();
-      //await contentSystem.generateCollectionFieldTypes();
-      await contentSystem.refresh(tenantId);
-      return { status: 200 };
+      // Unified coordinator: compile (target file) + refresh + models + GUI lock
+      // so the Vite watcher does not double-compile the same write.
+      const { syncContentState } = await import("@src/content/sync-content-state.server");
+      const relativeSource = path.basename(collectionPath);
+      const syncResult = await syncContentState({
+        reason: "collection-save",
+        tenantId,
+        targetFile: relativeSource,
+        changedFile: collectionPath,
+        fullBuild: Boolean(originalName && originalName !== contentName),
+      });
+
+      logger.info(
+        `[SaveCollection] synced ${contentName} in ${syncResult.metrics.totalMs}ms (processed=${syncResult.metrics.processed})`,
+      );
+      return {
+        status: 200,
+        contentVersion: syncResult.contentVersion,
+        changedIds: syncResult.changedIds,
+      };
     } catch (err) {
       const message = `Error in saveCollection action: ${err instanceof Error ? err.message : String(err)}`;
       logger.error(message);
@@ -294,18 +312,10 @@ export const actions: Actions = {
 
   // Save config
   saveConfig: async ({ request, locals }) => {
+    const user = getAuthenticatedUser(locals);
+    const { roles: tenantRoles, isAdmin } = locals;
     try {
-      const { user, roles: tenantRoles, isAdmin } = locals;
-      if (!user) {
-        return { status: 401, error: "Unauthorized" };
-      }
-      const hasManagePermission = hasPermissionWithRoles(
-        user,
-        "config:collection:manage",
-        tenantRoles,
-      );
-
-      if (!(isAdmin || hasManagePermission)) {
+      if (!hasCollectionBuilderPermission(user, tenantRoles, isAdmin)) {
         return { status: 403, error: "Insufficient permissions" };
       }
 
@@ -348,18 +358,10 @@ export const actions: Actions = {
 
   // Delete collection
   deleteCollections: async ({ request, locals }) => {
+    const user = getAuthenticatedUser(locals);
+    const { roles: tenantRoles, isAdmin } = locals;
     try {
-      const { user, roles: tenantRoles, isAdmin } = locals;
-      if (!user) {
-        return { status: 401, error: "Unauthorized" };
-      }
-      const hasManagePermission = hasPermissionWithRoles(
-        user,
-        "config:collection:manage",
-        tenantRoles,
-      );
-
-      if (!(isAdmin || hasManagePermission)) {
+      if (!hasCollectionBuilderPermission(user, tenantRoles, isAdmin)) {
         return { status: 403, error: "Insufficient permissions" };
       }
 
@@ -376,8 +378,12 @@ export const actions: Actions = {
       }
 
       fs.unlinkSync(targetFile);
-      await compile({ logger });
-      await contentSystem.refresh();
+      const { syncContentState } = await import("@src/content/sync-content-state.server");
+      await syncContentState({
+        reason: "collection-save",
+        fullBuild: true,
+        changedFile: targetFile,
+      });
       return { status: 200 };
     } catch (err) {
       const message = `Error in deleteCollections action: ${err instanceof Error ? err.message : String(err)}`;
@@ -515,6 +521,11 @@ interface CollectionData {
   fields: FieldsData;
   imports: string;
   tenantId?: string | null | null;
+  entriesPerPage?: number;
+  defaultSortField?: string;
+  defaultSortDir?: string;
+  apiVisible?: boolean;
+  federationEnrichments?: Schema["federationEnrichments"];
 }
 
 async function generateCollectionFileWithAST(data: CollectionData): Promise<string> {
@@ -563,14 +574,13 @@ export const schema: Schema = {
     const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
     let result = printer.printFile(transformedSourceFile);
 
-    // Clean up the 🗑️ markers, unescape JSON quotes, and format with prettier
+    // Clean up the 🗑️ markers, unescape JSON quotes, and format with oxfmt
     result = result
       .replace(/["']🗑️|🗑️["']/g, "")
       .replace(/🗑️/g, "")
       .replace(/\\"/g, '"');
 
-    const prettierConfig = await getPrettierConfig();
-    result = await prettier.format(result, prettierConfig);
+    result = await formatTypeScript(result);
 
     return result;
   } catch (error) {
@@ -624,6 +634,23 @@ function createCollectionTransformer(data: CollectionData): ts.TransformerFactor
 function createSchemaObjectLiteral(data: CollectionData): ts.ObjectLiteralExpression {
   const properties: ts.ObjectLiteralElementLike[] = [];
 
+  // _id — derived from content name for consistent collection identification
+  const collectionId = data.contentName.toLowerCase().replace(/\s+/g, "_");
+  properties.push(
+    ts.factory.createPropertyAssignment(
+      ts.factory.createIdentifier("_id"),
+      ts.factory.createStringLiteral(collectionId),
+    ),
+  );
+
+  // name — display name for the collection
+  properties.push(
+    ts.factory.createPropertyAssignment(
+      ts.factory.createIdentifier("name"),
+      ts.factory.createStringLiteral(data.contentName),
+    ),
+  );
+
   // Add icon property
   properties.push(
     ts.factory.createPropertyAssignment(
@@ -664,6 +691,50 @@ function createSchemaObjectLiteral(data: CollectionData): ts.ObjectLiteralExpres
   properties.push(
     ts.factory.createPropertyAssignment(ts.factory.createIdentifier("fields"), fieldsExpression),
   );
+
+  // Permissions & Settings tab — persisted to TypeScript for code↔GUI parity
+  if (data.entriesPerPage && data.entriesPerPage !== 20) {
+    properties.push(
+      ts.factory.createPropertyAssignment(
+        ts.factory.createIdentifier("entriesPerPage"),
+        ts.factory.createNumericLiteral(data.entriesPerPage),
+      ),
+    );
+  }
+  if (data.defaultSortField && data.defaultSortField !== "createdAt") {
+    properties.push(
+      ts.factory.createPropertyAssignment(
+        ts.factory.createIdentifier("defaultSortField"),
+        ts.factory.createStringLiteral(data.defaultSortField),
+      ),
+    );
+  }
+  if (data.defaultSortDir && data.defaultSortDir !== "desc") {
+    properties.push(
+      ts.factory.createPropertyAssignment(
+        ts.factory.createIdentifier("defaultSortDir"),
+        ts.factory.createStringLiteral(data.defaultSortDir),
+      ),
+    );
+  }
+  if (data.apiVisible === false) {
+    properties.push(
+      ts.factory.createPropertyAssignment(
+        ts.factory.createIdentifier("apiVisible"),
+        ts.factory.createFalse(),
+      ),
+    );
+  }
+
+  if (data.federationEnrichments?.length) {
+    const enrichmentsJson = JSON.stringify(data.federationEnrichments);
+    properties.push(
+      ts.factory.createPropertyAssignment(
+        ts.factory.createIdentifier("federationEnrichments"),
+        ts.factory.createIdentifier(`🗑️${enrichmentsJson}🗑️`),
+      ),
+    );
+  }
 
   return ts.factory.createObjectLiteralExpression(properties, true);
 }

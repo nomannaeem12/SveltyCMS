@@ -19,11 +19,14 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
 -->
 
 <script lang="ts">
+import { logger } from "@utils/logger";
     import { imageEditorStore } from '@src/stores/image-editor-store.svelte';
     import type { MediaImage, WatermarkOptions } from '@src/utils/media/media-models';
     import { onMount, setContext } from 'svelte';
     import Editor from './editor.svelte';
     import EditorToolbar from './editor-toolbar.svelte';
+    import EditorMobileToolbar from './editor-mobile-toolbar.svelte';
+    import EditorMobileQuickActions from './editor-mobile-quick-actions.svelte';
 
     let {
         image = null,
@@ -78,7 +81,29 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
 
     let lastResetSessionKey = $state('');
 
-    // Reset store only when the editor session changes — not on every reactive read of `image`
+    const MOBILE_BREAKPOINT = imageEditorStore.mobileBreakpoint;
+    const isMobileEditor = $derived(imageEditorStore.state.viewportWidth < MOBILE_BREAKPOINT);
+
+    function syncViewportWidthFromElement(el: HTMLElement | undefined) {
+        if (!el || typeof window === 'undefined') return;
+        const width = Math.round(el.getBoundingClientRect().width);
+        if (width > 0) {
+            imageEditorStore.setViewportWidth(width);
+        }
+    }
+
+    $effect(() => {
+        const el = modalContainer;
+        if (!el || typeof window === 'undefined') return;
+
+        syncViewportWidthFromElement(el);
+        const ro = new ResizeObserver(() => syncViewportWidthFromElement(el));
+        ro.observe(el);
+        return () => ro.disconnect();
+    });
+
+    // Session boundary — Editor (#key) owns store reset on load; avoid reset here
+    // so a synchronous cached decode cannot be cleared after onload (mobile freeze).
     $effect(() => {
         if (!image) {
             lastResetSessionKey = '';
@@ -89,12 +114,11 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
         lastResetSessionKey = sessionKey;
         isInitializing = true;
         error = null;
-        imageEditorStore.reset();
         imageEditorStore.setError(null);
     });
 
     $effect(() => {
-        const ready = !!imageEditorStore.imageElement;
+        const ready = !!imageEditorStore.state.imageElement;
         const loadError = imageEditorStore.state.error;
         if (ready || loadError) {
             isInitializing = false;
@@ -106,7 +130,7 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
 
     function handleSaveError(err: Error) {
         error = `Failed to save: ${err.message}`;
-        console.error('[ImageEditorModal] Save error:', err);
+        logger.error('[ImageEditorModal] Save error:', err);
         isSaving = false;
     }
 
@@ -185,7 +209,9 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
         triggerElement = document.activeElement as HTMLElement;
 
         window.addEventListener('keydown', handleKeyDown);
-        return () => window.removeEventListener('keydown', handleKeyDown);
+        return () => {
+            window.removeEventListener('keydown', handleKeyDown);
+        };
     });
 
     // Cleanup blob URLs on destroy
@@ -207,10 +233,11 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
 {#if image}
     <div
         bind:this={modalContainer}
-        class="relative flex h-[calc(100dvh-0.75rem)] min-h-160 w-full flex-col overflow-hidden rounded border border-white/10 bg-[linear-gradient(180deg,rgba(31,31,31,0.98),rgba(12,12,12,0.98))] shadow-[0_28px_90px_rgba(0,0,0,0.45)] md:h-[calc(100dvh-1.5rem)] md:min-h-180"
+        class="image-editor-panel relative flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden"
+        class:image-editor-panel--mobile={isMobileEditor}
         role="dialog"
-        aria-modal="true"
         aria-label="Image Editor — edit and transform your image"
+        aria-modal="true"
         tabindex="-1"
         onkeydown={trapFocus}
     >
@@ -226,7 +253,7 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
 
         <!-- Error Banner with ARIA live announcement -->
         {#if error}
-            <div class="absolute top-16 inset-s-1/2 -translate-x-1/2 z-50 max-w-md w-full px-4" role="alert" aria-live="assertive">
+            <div class="absolute top-20 inset-s-1/2 -translate-x-1/2 z-50 max-w-md w-full px-4" role="alert" aria-live="assertive">
                 <div class="bg-error-900/90 border border-error-700/50 rounded p-4 shadow-lg backdrop-blur-sm">
                     <div class="flex items-start gap-3">
                         <iconify-icon icon="mdi:alert-circle" width="24" class="text-error-500 shrink-0" aria-hidden="true"></iconify-icon>
@@ -245,7 +272,21 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
             </div>
         {/if}
 
-        <main class="relative flex min-h-0 flex-1 overflow-hidden bg-surface-900">
+        {#if isMobileEditor}
+            <div class="flex shrink-0 flex-col gap-1.5 px-4 pt-[calc(env(safe-area-inset-top,0px)+0.75rem)] pb-1.5 bg-[--editor-chrome-bg]">
+                <EditorMobileToolbar onclose={handleCancelClick} onsave={handleSaveClick} {isSaving} />
+                <EditorMobileQuickActions />
+            </div>
+        {:else}
+            <EditorToolbar
+                onsave={handleSaveClick}
+                {isSaving}
+                onZoomIn={() => handleZoomAction('in')}
+                onZoomOut={() => handleZoomAction('out')}
+                onZoomReset={() => handleZoomAction('reset')}
+            />
+        {/if}
+        <main class="relative z-10 flex min-h-0 flex-1 flex-col overflow-hidden bg-transparent">
             {#key editorSessionKey}
                 <Editor
                     bind:this={editorComponent}
@@ -254,16 +295,54 @@ and proper ARIA dialog semantics. Opens on-demand from Media Gallery or MediaUpl
                     {mediaId}
                     focalPoint={initialFocalPoint}
                     oncancel={handleCancelClick}
-                    onsave={(detail) => onsave(detail)}
+                    onsave={async (detail) => { await onsave(detail); closeModal(); }}
                 />
             {/key}
         </main>
-        <EditorToolbar
-            onsave={handleSaveClick}
-            {isSaving}
-            onZoomIn={() => handleZoomAction('in')}
-            onZoomOut={() => handleZoomAction('out')}
-            onZoomReset={() => handleZoomAction('reset')}
-        />
     </div>
 {/if}
+
+<style>
+	/* Shared design tokens for the image editor chrome */
+	.image-editor-panel {
+		--editor-chrome-bg: #0a0a0a;
+		--editor-chrome-surface: #0f0f0f;
+		--editor-chrome-elevated: rgba(255, 255, 255, 0.06);
+		--editor-chrome-border: rgba(255, 255, 255, 0.07);
+		--editor-chrome-border-subtle: rgba(255, 255, 255, 0.05);
+		--editor-chrome-text: rgba(255, 255, 255, 0.68);
+		--editor-chrome-text-hover: rgba(255, 255, 255, 0.92);
+		--editor-chrome-text-active: #fff;
+		--editor-accent: #22c55e;
+		--editor-accent-hover: #16a34a;
+		--editor-canvas-bg: var(--editor-chrome-bg);
+		--editor-control-h: 2.25rem;
+		--editor-control-h-compact: 1.875rem;
+		--editor-radius-pill: 9999px;
+		--editor-radius-control: 0.5rem;
+		background: var(--editor-chrome-bg);
+	}
+
+	.image-editor-panel--mobile {
+		--editor-chrome-bg: #1a1a1a;
+		--editor-chrome-surface: #1a1a1a;
+		--editor-canvas-bg: #1a1a1a;
+		--editor-chrome-elevated: rgba(255, 255, 255, 0.08);
+		--editor-chrome-border: rgba(255, 255, 255, 0.1);
+		--editor-chrome-border-subtle: transparent;
+		--editor-control-h: 2.25rem;
+		--editor-pill-pad: 0.1875rem;
+		--editor-accent: #22c55e;
+		--editor-accent-hover: #16a34a;
+		height: 100dvh;
+		min-height: 100dvh;
+		max-height: 100dvh;
+		background: var(--editor-chrome-bg);
+	}
+
+	.image-editor-panel--mobile main {
+		flex: 1 1 auto;
+		min-height: 0;
+		background: var(--editor-chrome-bg);
+	}
+</style>

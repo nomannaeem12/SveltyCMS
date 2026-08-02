@@ -27,10 +27,13 @@
 	import Portal from "@components/ui/portal.svelte";
 	import Badge from '@components/ui/badge.svelte';
 	import { flip } from 'svelte/animate';
-	import { dndzone } from 'svelte-dnd-action';
+	import { untrack } from 'svelte';
+	import { draggable, droppable } from '@thisux/sveltednd';
+	import type { DragDropState } from '@thisux/sveltednd';
 	import { page } from '$app/state';
 	import type { FieldType } from './';
 	import type { MediaFile } from './types';
+	import AspectPreviewModal from '@components/media/aspect-preview-modal.svelte';
 	import 'iconify-icon';
 
 	const tenantId = $derived(page.data?.tenantId);
@@ -88,12 +91,8 @@
 
 	let selectedFiles = $state<MediaFile[]>([]);
 	let showMediaLibrary = $state(false);
-	const dndItems = $derived(
-		selectedFiles.map((file) => ({
-			...file,
-			id: file._id
-		}))
-	);
+	let aspectPreviewFile = $state<MediaFile | null>(null);
+	const focalPointPluginEnabled = $derived(page.data?.pluginStates?.['focal-point'] === true);
 	const fieldKey = $derived(getFieldName(field, false));
 
 	function syncCollectionValue(nextValue: string | string[] | null) {
@@ -223,9 +222,9 @@
 
 		const mappedFiles: MediaFile[] = files.map((f) => ({
 			_id: f._id as string,
-			name: f.filename,
-			type: f.mimeType,
-			size: f.size,
+			name: (f as any).filename,
+			type: (f as any).mimeType,
+			size: (f as any).size,
 			url: (f as any).url,
 			thumbnailUrl: (f as any).thumbnails?.md?.url || (f as any).url
 		}));
@@ -252,19 +251,56 @@
 		selectedFiles = selectedFiles.filter((file) => file._id !== fileId);
 	}
 
-	function syncDndItems(items: Array<MediaFile & { id: string }>) {
-		selectedFiles = items.map(({ id, ...rest }) => ({
-			...rest,
-			_id: id
-		}));
+	function handleMediaDrop(state: DragDropState<MediaFile>) {
+		const dragged = state.draggedItem;
+		if (!dragged) return;
+		const fromIndex = selectedFiles.indexOf(dragged);
+		if (fromIndex < 0) return;
+
+		const targetEl = state.targetElement?.closest('[data-file-id]') as HTMLElement | null;
+		const targetFileId = targetEl?.dataset?.fileId;
+
+		let targetIndex: number;
+		if (targetFileId) {
+			targetIndex = selectedFiles.findIndex(f => f._id === targetFileId);
+			if (state.dropPosition === 'after') targetIndex++;
+		} else {
+			targetIndex = selectedFiles.length;
+		}
+		targetIndex = Math.max(0, Math.min(targetIndex, selectedFiles.length));
+
+		if (fromIndex === targetIndex) return;
+		selectedFiles = untrack(() => {
+			const newFiles = [...selectedFiles];
+			newFiles.splice(fromIndex, 1);
+			const adjusted = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
+			newFiles.splice(adjusted, 0, dragged);
+			return newFiles;
+		});
 	}
 </script>
 
 <div class="min-h-30 rounded border-2 border-dashed border-surface-300 p-4 dark:border-surface-600" class:!border-error-500={error}>
 	{#if selectedFiles.length > 0}
-		<div class="mb-4 grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-4" use:dndzone={{ items: dndItems }} onconsider={(e) => syncDndItems(e.detail.items)}>
+		<div class="mb-4 grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-4"
+			use:droppable={{
+				container: 'media-grid',
+				callbacks: { onDrop: handleMediaDrop },
+				direction: 'grid',
+				attributes: { dragOverClass: 'bg-secondary-200' }
+			}}
+			role="list"
+			aria-label="Media files"
+		>
 			{#each selectedFiles as file (file._id)}
-				<div class="relative overflow-hidden rounded border border-surface-200 dark:text-surface-50" animate:flip>
+				<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+				<div
+					class="relative overflow-hidden rounded border border-surface-200 dark:text-surface-50"
+					animate:flip
+					use:draggable={{ container: 'media-grid', dragData: file, keyboard: true }}
+					role="listitem"
+					tabindex="0"
+				>
 					<button
 						type="button"
 						class="block w-full cursor-pointer text-start"
@@ -292,6 +328,17 @@
 							</div>
 						{/if}
 					</div>
+					{#if focalPointPluginEnabled && file.type?.startsWith('image/')}
+						<button
+							type="button"
+							onclick={(e) => { e.stopPropagation(); aspectPreviewFile = file; }}
+							class="absolute inset-e-1 top-7 flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border-none bg-surface-900/50 text-white transition-colors hover:bg-surface-900/75"
+							aria-label={`Preview aspect ratios for ${file.name}`}
+							title="Aspect Ratio Preview"
+						>
+							<iconify-icon icon="mdi:aspect-ratio" width="12"></iconify-icon>
+						</button>
+					{/if}
 					<button
 						type="button"
 						onclick={() => removeFile(file._id)}
@@ -321,18 +368,31 @@
 	{/if}
 </div>
 
-{#if showMediaLibrary}
-	<Portal>
-		<div class="fixed inset-0 z-99999 bg-black/70 p-4 backdrop-blur-sm">
-			<div class="flex h-full w-full overflow-hidden rounded-2xl border border-surface-500 bg-surface-100 shadow-2xl dark:bg-surface-900">
-				<MediaLibraryModal
-					standalone={true}
-					allowedTypes={(field.allowedTypes as string[] | undefined) ?? []}
-					folder={((field as { folder?: string }).folder ?? (collectionName ? `collections/${collectionName.toLowerCase()}` : tenantId || 'global')) as string}
-					onConfirm={handleMediaSelection}
-					onClose={closeMediaLibrary}
-				/>
+	{#if showMediaLibrary}
+		<Portal>
+			<div class="fixed inset-0 z-99999 bg-black/70 p-4 backdrop-blur-sm">
+				<div class="flex h-full w-full overflow-hidden rounded-2xl border border-surface-500 bg-surface-100 shadow-2xl dark:bg-surface-900">
+					<MediaLibraryModal
+						standalone={true}
+						allowedTypes={(field.allowedTypes as string[] | undefined) ?? []}
+						folder={((field as { folder?: string }).folder ?? (collectionName ? `collections/${collectionName.toLowerCase()}` : tenantId || 'global')) as string}
+						onConfirm={handleMediaSelection}
+						onClose={closeMediaLibrary}
+					/>
+				</div>
 			</div>
-		</div>
-	</Portal>
-{/if}
+		</Portal>
+	{/if}
+
+	{#if focalPointPluginEnabled && aspectPreviewFile}
+		<AspectPreviewModal
+			media={{
+				_id: aspectPreviewFile._id,
+				url: aspectPreviewFile.url,
+				thumbnails: { md: { url: aspectPreviewFile.thumbnailUrl } },
+				filename: aspectPreviewFile.name,
+			}}
+			show={aspectPreviewFile !== null}
+			onClose={() => { aspectPreviewFile = null; }}
+		/>
+	{/if}

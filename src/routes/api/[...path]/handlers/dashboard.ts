@@ -3,14 +3,15 @@
  * @description Unified dashboard API handler for metrics, system info, and content insights.
  */
 
-import { AppError } from "@utils/error-handling";
+import { logger } from "@utils/logger";
+import { AppError, isAppError } from "@utils/error-handling";
 import type { RequestEvent } from "@sveltejs/kit";
 import type { LocalCMS } from "@src/services/sdk";
 import { metricsService } from "@src/services/observability/metrics-service";
 import { auditLogService } from "@src/services/security/audit-service";
 import { getSystemInfo } from "@utils/system-info.server";
 import { cacheService } from "@src/databases/cache/cache-service";
-import { parseSessionDuration } from "@utils/auth-utils";
+import { parseSessionDuration } from "@utils/security/auth-utils";
 import type { Session } from "@src/databases/auth/types";
 import { rawResponse } from "./base";
 import type { DatabaseId } from "@src/content/types";
@@ -47,10 +48,6 @@ export async function handleDashboardRoutes(
   const { url } = event;
   const method = (segments[1] || segments[0] || "").toLowerCase();
 
-  if (typeof process !== "undefined" && process.env.NODE_ENV === "production") {
-    console.log(`[DashboardRoute] method=${method}, segments=${segments.join(",")}`);
-  }
-
   try {
     const query: DashboardQuery = {
       method,
@@ -71,7 +68,7 @@ export async function handleDashboardRoutes(
 
         return rawResponse(event, {
           contentCount: collectionsRes.success ? collectionsRes.data.length : 0,
-          userCount: usersRes && usersRes.pagination ? (usersRes.pagination.totalItems ?? 0) : 0,
+          userCount: usersRes?.success ? (usersRes.data?.pagination?.totalItems ?? 0) : 0,
           mediaCount: mediaRes.success ? (mediaRes.data?.total ?? 0) : 0,
           storageUsed: "0 MB", // Calculated on-demand via media collection
           healthStatus: "healthy",
@@ -80,12 +77,145 @@ export async function handleDashboardRoutes(
         });
       }
 
+      case "tenant-analytics": {
+        const [collectionsRes, usersRes, mediaCountRes] = await Promise.all([
+          (cms.db.crud as any).listCollections(tenantId),
+          cms.auth.listUsers({ tenantId, limit: 1 }),
+          cms.db.crud.count("media", {}, { tenantId }),
+        ]);
+
+        const collections = collectionsRes.success ? collectionsRes.data || [] : [];
+        const collectionCount = collections.length;
+        const userCount = usersRes?.success ? (usersRes.data?.pagination?.totalItems ?? 0) : 0;
+        const mediaCount = mediaCountRes.success ? (mediaCountRes.data ?? 0) : 0;
+
+        // Sample media items to calculate total storage used
+        let totalStorageBytes = 0;
+        try {
+          const mediaListRes = await cms.media.find({ tenantId, limit: 2000 });
+          const mediaItems =
+            mediaListRes.success && mediaListRes.data?.items ? mediaListRes.data.items : [];
+          totalStorageBytes = mediaItems.reduce(
+            (sum: number, item: any) => sum + (item.size || 0),
+            0,
+          );
+
+          // If we got all items (less than limit), the sum is exact;
+          // otherwise estimate by extrapolating from the sample.
+          if (mediaCount > 2000 && mediaItems.length > 0) {
+            const avgSize = totalStorageBytes / mediaItems.length;
+            totalStorageBytes = Math.round(avgSize * mediaCount);
+          }
+        } catch {
+          // Best-effort storage calculation
+        }
+
+        // Count content entries across all collection tables
+        let contentEntryCount = 0;
+        if (collections.length > 0) {
+          const countResults = await Promise.allSettled(
+            collections.map((col: any) => cms.db.crud.count(col._id || col.name, {}, { tenantId })),
+          );
+          for (const r of countResults) {
+            if (r.status === "fulfilled" && r.value.success) {
+              contentEntryCount += r.value.data ?? 0;
+            }
+          }
+        }
+
+        // Query recent audit activity (last 24h) for request count
+        let recentRequestCount = 0;
+        try {
+          const auditResult = await auditLogService.queryLogs({
+            limit: 1000,
+            tenantId: tenantId || undefined,
+          });
+          if (auditResult.success && Array.isArray(auditResult.data)) {
+            const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            recentRequestCount = auditResult.data.filter(
+              (log: any) => log.timestamp >= oneDayAgo,
+            ).length;
+          }
+        } catch {
+          // Best-effort request count
+        }
+
+        // Format storage for display
+        const units = ["B", "KB", "MB", "GB", "TB"];
+        const unitIdx =
+          totalStorageBytes === 0
+            ? 0
+            : Math.min(Math.floor(Math.log(totalStorageBytes) / Math.log(1024)), units.length - 1);
+        const formattedStorage =
+          totalStorageBytes === 0
+            ? "0 B"
+            : `${(totalStorageBytes / 1024 ** unitIdx).toFixed(1)} ${units[unitIdx]}`;
+
+        return rawResponse(event, {
+          storage: {
+            bytes: totalStorageBytes,
+            formatted: formattedStorage,
+          },
+          users: {
+            total: userCount,
+          },
+          media: {
+            total: mediaCount,
+          },
+          collections: collectionCount,
+          contentEntries: contentEntryCount,
+          recentRequests: {
+            last24h: recentRequestCount,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       case "health":
-        return rawResponse(event, (await cms.system.getHealth()) || { status: "healthy" });
+        // Delegate to the public /health endpoint (handled by hooks.server.ts fast-return)
+        const healthUrl = new URL("/health", event.url.origin);
+        const healthRes = await event.fetch(healthUrl.toString());
+        return rawResponse(event, await healthRes.json());
 
       case "metrics":
       case "unified": {
-        const report = metricsService.getReport(tenantId);
+        // Coerce tenant key — branded DatabaseId objects break Map keys in metricsService
+        const tid =
+          tenantId == null || tenantId === ""
+            ? null
+            : typeof tenantId === "string"
+              ? tenantId
+              : String(tenantId);
+        let report: ReturnType<typeof metricsService.getReport>;
+        try {
+          report = metricsService.getReport(tid);
+        } catch (err) {
+          logger.error("[DashboardRoute] metrics getReport failed:", err);
+          report = {
+            timestamp: Date.now(),
+            uptime: 0,
+            requests: { total: 0, errors: 0, errorRate: 0, avgResponseTime: 0 },
+            authentication: {
+              validations: 0,
+              failures: 0,
+              successRate: 0,
+              cacheHits: 0,
+              cacheMisses: 0,
+              cacheHitRate: 0,
+            },
+            api: {
+              requests: 0,
+              errors: 0,
+              cacheHits: 0,
+              l1Hits: 0,
+              l2Hits: 0,
+              cacheMisses: 0,
+              cacheHitRate: 0,
+            },
+            performance: { slowRequests: 0, avgHookExecutionTime: 0, bottlenecks: [] },
+            security: { rateLimitViolations: 0, cspViolations: 0, authFailures: 0 },
+          };
+        }
 
         if (query.detailed) {
           const sysInfo = await getSystemInfo().catch(() => ({}));
@@ -96,7 +226,7 @@ export async function handleDashboardRoutes(
                 used: (sysInfo as any).memory?.usedBytes || 0,
                 total: (sysInfo as any).memory?.totalBytes || 0,
               },
-              uptime: (sysInfo as any).os?.uptime,
+              uptime: (sysInfo as any).os?.uptime ?? process.uptime(),
               nodeVersion: process.version,
             },
           });
@@ -142,8 +272,8 @@ export async function handleDashboardRoutes(
             limit: 100,
           });
 
-          if (usersRes && Array.isArray(usersRes.data)) {
-            const users = usersRes.data;
+          if (usersRes?.success && Array.isArray(usersRes.data?.data)) {
+            const users = usersRes.data!.data;
             activeUsers = users.length;
 
             const today = new Date();
@@ -288,7 +418,8 @@ export async function handleDashboardRoutes(
         const userLookups = await Promise.all(
           userIds.map(async (userId) => {
             try {
-              return await cms.auth.getUserById(userId, { tenantId });
+              const userResult = await cms.auth.getUserById(userId, { tenantId });
+              return userResult?.success ? userResult.data : null;
             } catch {
               return null;
             }
@@ -357,7 +488,13 @@ export async function handleDashboardRoutes(
       }
 
       case "cache-metrics": {
-        const stats = await cacheService.getStats();
+        // Never let cache backend errors take down the process mid-integration suite
+        let stats: Awaited<ReturnType<typeof cacheService.getStats>> | null = null;
+        try {
+          stats = await cacheService.getStats();
+        } catch (err) {
+          logger.error("[DashboardRoute] cache-metrics getStats failed:", err);
+        }
 
         const total = (Number(stats?.hits) || 0) + (Number(stats?.misses) || 0);
         const hitRate = total > 0 ? ((Number(stats?.hits) || 0) / total) * 100 : 0;
@@ -416,8 +553,11 @@ export async function handleDashboardRoutes(
         throw new AppError(`Dashboard action '${query.method}' not implemented`, 404);
     }
   } catch (err: any) {
-    console.error(`[DashboardRoute Error] ${segments.join("/")}:`, err);
-    if (err instanceof AppError) throw err;
+    // Expected AppErrors (validation, not found) should not log noisy traces
+    if (!isAppError(err)) {
+      logger.error(`[DashboardRoute Error] ${segments.join("/")}:`, err);
+    }
+    if (isAppError(err)) throw err;
     throw new AppError(err.message || "Dashboard operation failed", 500);
   }
 }

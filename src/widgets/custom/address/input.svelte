@@ -23,6 +23,7 @@ Part of the Three Pillars Architecture for the widget system.
 -->
 
 <script lang="ts">
+import { logger } from "@utils/logger";
 	import { browser } from '$app/environment';
 		import { importLibrary, setOptions } from '@googlemaps/js-api-loader';
 		import Badge from '@components/ui/badge.svelte';
@@ -208,7 +209,7 @@ Part of the Three Pillars Architecture for the widget system.
 							fillInGoogleAddress(response.results[0]);
 						}
 					} catch (err) {
-						console.error('Google reverse geocoding failed', err);
+						logger.error('Google reverse geocoding failed', err);
 					}
 				}
 			});
@@ -233,7 +234,7 @@ Part of the Three Pillars Architecture for the widget system.
 				}
 			}
 		} catch (e) {
-			console.error('Google Map init failed', e);
+			logger.error('Google Map init failed', e);
 		}
 	}
 
@@ -271,14 +272,14 @@ Part of the Three Pillars Architecture for the widget system.
 		try {
 			if (!mapElement) return;
 
-			const maplibregl = (await import('maplibre-gl')).default;
+			const maplibregl = await import('maplibre-gl');
 
 			// Add MapLibre styles dynamically to head if not present
 			if (!document.getElementById('maplibre-style')) {
 				const link = document.createElement('link');
 				link.id = 'maplibre-style';
 				link.rel = 'stylesheet';
-				link.href = 'https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css';
+				link.href = 'https://unpkg.com/maplibre-gl@6.0.0/dist/maplibre-gl.css';
 				document.head.appendChild(link);
 			}
 
@@ -307,7 +308,7 @@ Part of the Three Pillars Architecture for the widget system.
 				await reverseGeocodePhoton(lngLat.lat, lngLat.lng);
 			});
 		} catch (e) {
-			console.error('MapLibre init failed', e);
+			logger.error('MapLibre init failed', e);
 		}
 	}
 
@@ -350,7 +351,7 @@ Part of the Three Pillars Architecture for the widget system.
 					showSuggestions = true;
 				}
 			} catch (err) {
-				console.error('Photon autocomplete failed', err);
+				logger.error('Photon autocomplete failed', err);
 			} finally {
 				isLoadingSearch = false;
 			}
@@ -424,7 +425,7 @@ Part of the Three Pillars Architecture for the widget system.
 				searchQuery = parts.join(', ');
 			}
 		} catch (err) {
-			console.error('Photon reverse geocoding failed', err);
+			logger.error('Photon reverse geocoding failed', err);
 		}
 	}
 
@@ -487,7 +488,7 @@ Part of the Three Pillars Architecture for the widget system.
 					{#if !googleMapsApiKey && showSuggestions && suggestions.length > 0}
 						<div class="absolute z-50 inset-s-0 inset-e-0 mt-1 max-h-60 overflow-y-auto rounded border border-surface-300 dark:border-surface-600 bg-surface-50 dark:bg-surface-800 shadow-xl">
 							<ul class="list-none p-0 m-0">
-								{#each suggestions as sug}
+								{#each suggestions as sug (sug.label)}
 									<li>
 										<button
 											type="button"

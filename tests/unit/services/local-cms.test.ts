@@ -1,3 +1,8 @@
+/**
+ * @file tests/unit/services/local-cms.test.ts
+ * @description Tests for LocalCMS — the zero-latency internal SDK bridge.
+ */
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { LocalCMS } from "@src/services/sdk";
 
@@ -34,13 +39,17 @@ describe("LocalCMS - Server-Side SDK Bridge", () => {
     };
 
     const sdk = new LocalCMS(mockAdapter, contentMock);
-    const result = await sdk.collections.find("posts", { tenantId: "tenant-1", bypassCache: true });
+    const result = await sdk.collections.find("posts", {
+      tenantId: "tenant-1",
+      bypassCache: true,
+    });
 
-    // SDK prepends 'collection_' to the ID
+    // SDK prepends 'collection_' to the ID.
+    // tenantId is merged into the query (2nd arg), not the options (3rd arg).
     expect(mockAdapter.crud.findMany).toHaveBeenCalledWith(
       "collection_posts",
-      expect.anything(),
       expect.objectContaining({ tenantId: "tenant-1" }),
+      expect.objectContaining({ limit: 50, offset: 0 }),
     );
     expect(result.data[0].title).toBe("SDK Test");
   });
@@ -64,10 +73,11 @@ describe("LocalCMS - Server-Side SDK Bridge", () => {
     const locals = LocalCMS.getLocals(mockAdapter, eventLocals, contentMock);
     await locals.find("pages", { bypassCache: true });
 
+    // tenantId is merged into the query (2nd arg), not the options (3rd arg).
     expect(mockAdapter.crud.findMany).toHaveBeenCalledWith(
       "collection_pages",
-      expect.anything(),
       expect.objectContaining({ tenantId: "tenant-ABC" }),
+      expect.objectContaining({ limit: 50, offset: 0 }),
     );
   });
 });

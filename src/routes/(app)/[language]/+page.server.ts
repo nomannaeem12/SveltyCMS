@@ -9,13 +9,15 @@ import { contentSystem } from "@src/content/index.server";
 import { isSystemReady } from "@src/stores/system/state.svelte";
 import { error, isHttpError, isRedirect, redirect } from "@sveltejs/kit";
 import { logger } from "@utils/logger";
+import { getAuthenticatedUser } from "@utils/page-guards.server";
 import type { PageServerLoad } from "./$types";
 
 // Cache the first collection URL per language (TTL: 5 minutes in production)
 const _redirectCache = new Map<string, { url: string; ts: number }>();
 const REDIRECT_CACHE_TTL = 5 * 60_000;
 
-export const load: PageServerLoad = async ({ params, locals }) => {
+export const load: PageServerLoad = async ({ params, locals, url }) => {
+  getAuthenticatedUser(locals, url.pathname + url.search);
   const { language } = params;
   const { tenantId } = locals;
 

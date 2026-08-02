@@ -23,7 +23,7 @@ Manages actions (edit, delete, block, unblock) with debounced submissions.
 		usermodaluser_edittitle
 	} from '@src/paraglide/messages';
 	// Stores
-	import { storeListboxValue } from '@src/stores/store.svelte.ts';
+	import { app } from '@src/stores/store.svelte.ts';
 	import { toast } from '@src/stores/toast.svelte.ts';
 	import { modalState } from '@utils/modal.svelte';
 	import { showConfirm } from '@utils/modal.svelte';
@@ -56,7 +56,7 @@ Manages actions (edit, delete, block, unblock) with debounced submissions.
 
 	// Sync local listboxValue with global store for TableIcons
 	$effect(() => {
-		storeListboxValue.set(listboxValue);
+		app.listboxValueState = listboxValue;
 	});
 
 	// Helper to get identifier for display
@@ -256,7 +256,8 @@ Manages actions (edit, delete, block, unblock) with debounced submissions.
 			const body =
 				type === 'user'
 					? { userIds: safeSelectedRows.map((r) => (r as User)._id), action }
-					: { tokenIds: safeSelectedRows.map((r) => (r as Token).token), action };
+					// Use _id (the list exposes the hashed token value, not the raw credential).
+					: { tokenIds: safeSelectedRows.map((r) => (r as Token)._id), action };
 
 			const res = await fetch(config.endpoint(), {
 				method: config.method(),
@@ -328,13 +329,13 @@ Manages actions (edit, delete, block, unblock) with debounced submissions.
 		isDropdownOpen = false;
 
 		// Sync with store for other components (like TableIcons)
-		storeListboxValue.set(action);
+		app.listboxValueState = action;
 
 		// 2. Await tick to ensure UI state reflects the change
 		await tick();
 
 		// 3. Trigger action
-		console.log('Multibutton - triggering handleAction for:', action);
+
 		handleAction(action);
 	}
 
@@ -375,6 +376,7 @@ Manages actions (edit, delete, block, unblock) with debounced submissions.
 		<!-- Dropdown Toggle -->
 		<button
 			type="button"
+			data-testid="user-bulk-actions-menu"
 			onclick={(e) => {
 				e.stopPropagation();
 				if (!isDisabled) isDropdownOpen = !isDropdownOpen;

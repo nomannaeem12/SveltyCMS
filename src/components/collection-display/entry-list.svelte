@@ -9,7 +9,11 @@ bulk actions, and predictive preloading.
 **EntryList component to display collections data in a tabular format.**
 
 ### Features:
-- **Search & Filter**: Real-time server-side search and field-level filtering.
+- **Search & Filter**: Server-side search plus schema-aware `createSmartFilter` (text/select/date/number/boolean).
+- **Status facets**: Server `getStatusFacets` chips for quick status filtering.
+- **Saved views**: Named filter/sort/layout presets via Smart Table views menu.
+- **Column resize**: Drag headers; widths persist per collection `layoutKey`.
+- **List metrics**: `?debug=table` shows p50/p95/hit% from SSR `listMetrics`.
 - **Pagination**: Configurable rows per page and page navigation.
 - **Selection**: Multi-select entries for bulk actions.
 - **Sorting**: Clickable headers for server-side sorting.
@@ -22,6 +26,8 @@ bulk actions, and predictive preloading.
 - `contentLanguage` (String): The language for displaying translatable field data.
 - `breadcrumb` (Array, optional): Breadcrumb navigation paths.
 - `collectionStats` (Object, optional): Stats like count and last modified.
+- `statusFacets` (Record, optional): Status counts for facet chips.
+- `listMetrics` (Object, optional): SSR list-query metrics for `?debug=table`.
 
 ### Keyboard Shortcuts
 - `Alt + N`: Create new entry
@@ -46,13 +52,10 @@ bulk actions, and predictive preloading.
 
 <script lang="ts">
 	// Components
-	import FloatingInput from '@components/ui/floating-input.svelte';
 	import SystemTooltip from '@components/system/system-tooltip.svelte';
 	import Status from '@components/system/table/status.svelte';
-	// import SystemTooltip from '@components/system/system-tooltip.svelte';
 	import TableFilter from '@components/system/table/table-filter.svelte';
 	import TableIcons from '@components/system/table/table-icons.svelte';
-	import TablePagination from '@components/system/table/table-pagination.svelte';
 	import PluginComponent from '@src/components/plugins/plugin-component.svelte';
 	// Types
 	// =================================================================
@@ -68,10 +71,10 @@ bulk actions, and predictive preloading.
 		collectionValue,
 		mode,
 		setCollectionValue,
-		setMode,
 		setModifyEntry,
 		type statusMap
 	} from '@src/stores/collection-store.svelte.ts';
+	import { modeTransitionGuard } from '@src/stores/mode-transition-guard.svelte';
 	// Config
 	import { publicEnv } from '@src/stores/global-settings.svelte';
 	import { screen } from '@src/stores/screen-size-store.svelte.ts';
@@ -84,23 +87,39 @@ bulk actions, and predictive preloading.
 	import { cloneEntries, setEntriesStatus } from '@utils/entry-actions';
 	// Using iconify-icon web component
 	import { logger } from '@utils/logger';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	// Native UI Components
 	import { showDeleteConfirm, showStatusChangeConfirm } from '@utils/modal.svelte';
 	import { preloadEntry, reflectModeInURL } from '@utils/navigation';
 	import { toast } from '@src/stores/toast.svelte.ts';
-	import { debounce, getFieldName, meta_data } from '@utils/utils';
+	import { getFieldName, meta_data } from '@utils/utils';
 	import { untrack } from 'svelte';
 	import { flip } from 'svelte/animate';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-	// Svelte-dnd-action
-	// @ts-ignore - IDE module resolution issue
-	import { dndzone } from 'svelte-dnd-action';
+	import { draggable, droppable } from '@thisux/sveltednd';
+	import type { DragDropState } from '@thisux/sveltednd';
+	import Checkbox from '@components/ui/checkbox.svelte';
 	import { browser } from '$app/environment';
 	import { goto, invalidateAll } from '$app/navigation';
 	import { page } from '$app/state';
+	import {
+		createSmartTable,
+		pinCellClass,
+		SMART_TABLE,
+		SMART_TABLE_SCROLL,
+		SMART_TABLE_THEAD
+	} from '@components/ui/smart-table';
+	import SmartTableShell from '@components/ui/smart-table/smart-table-shell.svelte';
+	import SmartTableSavedViewsMenu from '@components/ui/smart-table/smart-table-saved-views-menu.svelte';
+	import SmartTableStatusFacets from '@components/ui/smart-table/smart-table-status-facets.svelte';
+	import SmartTableMetricsBadge from '@components/ui/smart-table/smart-table-metrics-badge.svelte';
+	import ColumnResizeHandle from '@components/ui/smart-table/column-resize-handle.svelte';
+	import type { SmartTableSavedView } from '@utils/smart-table-saved-views';
 	import EntryListMultiButton from './entry-list-multi-button.svelte';
 	import TranslationStatus from './translation-status.svelte';
 	import EntryListCell from './entry-list-cell.svelte';
+	import { createSmartFilter } from './create-smart-filter.svelte';
+	import SmartFilterRow from './smart-filter-row.svelte';
 
 	// =================================================================
 	// 1. RECEIVE DATA AS PROPS (From +page.server.ts)
@@ -110,10 +129,20 @@ bulk actions, and predictive preloading.
 		pagination: serverPagination = { currentPage: 1, pageSize: 10, totalItems: 0, pagesCount: 1 },
 		contentLanguage: propContentLanguage,
 		breadcrumb = [],
-		collectionStats = null
+		collectionStats = null,
+		statusFacets = {},
+		listMetrics = null
 	}: EntryListProps & {
 		breadcrumb?: Array<{ name: string; path: string }>;
 		collectionStats?: { _id: string; name: string; count: number; lastModified: string } | null;
+		statusFacets?: Record<string, number>;
+		listMetrics?: {
+			count: number;
+			hitRate: number;
+			p50Ms: number;
+			p95Ms: number;
+			avgMs: number;
+		} | null;
 	} = $props();
 
 	// =================================================================
@@ -135,100 +164,216 @@ bulk actions, and predictive preloading.
 				newUrl.searchParams.set(key, String(value));
 			}
 		});
+		// Guard: skip goto if URL hasn't changed to prevent effect_update_depth_exceeded
+		if (newUrl.href === page.url.href) return;
 		goto(newUrl, { keepFocus: true, noScroll: true });
 	}
 
+	// Unified Smart Table (server mode) — selection, virtualization, density, sort/page callbacks
+	// layoutKey is per-collection (EntryList remounts via {#key collectionSchema?._id})
+	const smartTable = createSmartTable<CollectionEntry>({
+		mode: 'server',
+		layoutKey: collection.value?._id ? `entry-list:${collection.value._id}` : 'entry-list',
+		onQueryChange: (updates) => updateURL(updates),
+		getRowId: (row) => String(row._id ?? '')
+	});
+
+	// Keep controller in sync with SSR props
+	// Wrap in untrack to prevent reactive feedback loops when setRows
+	// triggers smart table internal state that re-triggers URL effects
+	$effect(() => {
+		const rows = tableData;
+		const meta = serverPagination;
+		untrack(() => {
+			smartTable.setRows(rows as CollectionEntry[]);
+			smartTable.setPaginationMeta({
+				currentPage: meta.currentPage,
+				pageSize: meta.pageSize,
+				totalItems: meta.totalItems,
+				pagesCount: meta.pagesCount
+			});
+		});
+	});
+
 	function onUpdatePage(newPage: number) {
 		entryListPaginationSettings.currentPage = newPage;
-		updateURL({ page: newPage });
+		smartTable.setPage(newPage);
 	}
 
 	function onUpdateRowsPerPage(rows: number) {
 		entryListPaginationSettings.rowsPerPage = rows;
 		entryListPaginationSettings.currentPage = 1;
-		updateURL({ page: 1, pageSize: rows });
+		smartTable.setPageSize(rows);
 	}
 
 	function onSortChange(fieldName: string) {
-		const newSorted = { ...entryListPaginationSettings.sorting };
-		if (newSorted.sortedBy === fieldName) {
-			newSorted.isSorted = newSorted.isSorted === 1 ? -1 : ((newSorted.isSorted === -1 ? 0 : 1) as SortOrder);
-			if (newSorted.isSorted === 0) {
-				newSorted.sortedBy = '';
-			}
-		} else {
-			newSorted.sortedBy = fieldName;
-			newSorted.isSorted = 1;
-		}
-		entryListPaginationSettings.sorting = newSorted;
-		let order: 'asc' | 'desc' | null = null;
-		if (newSorted.isSorted === 1) {
-			order = 'asc';
-		} else if (newSorted.isSorted === -1) {
-			order = 'desc';
-		}
-
-		updateURL({
-			sort: newSorted.sortedBy || null,
-			order
-		});
+		smartTable.setSort(fieldName);
+		entryListPaginationSettings.sorting = {
+			sortedBy: smartTable.sort.sortedBy,
+			isSorted: smartTable.sort.isSorted as SortOrder
+		};
 	}
 
-	const filterDebounce = debounce(500);
-	const searchDebounce = debounce(400);
-	const useRowVirtualization = $derived(serverPagination.pageSize > 25);
+	let filterTimeoutId: ReturnType<typeof setTimeout>;
+	const filterDebounce = (fn: () => void) => {
+		clearTimeout(filterTimeoutId);
+		filterTimeoutId = setTimeout(fn, 500);
+	};
+	let searchTimeoutId: ReturnType<typeof setTimeout>;
+	const searchDebounce = (fn: () => void) => {
+		clearTimeout(searchTimeoutId);
+		searchTimeoutId = setTimeout(fn, 400);
+	};
+
+	// Schema-aware filter controller (platform pure defs + URL; server enforces FLAC)
+	const smartFilter = createSmartFilter(() => collection.value);
+
+	// Virtual scroll shell (math owned by smartTable)
+	let scrollContainerEl = $state<HTMLDivElement | null>(null);
+	const useRowVirtualization = $derived(smartTable.virtual.enabled);
+	const visibleRows = $derived(smartTable.virtual.visibleRows);
+	const spacerTop = $derived(smartTable.virtual.spacerTop);
+	const spacerBottom = $derived(smartTable.virtual.spacerBottom);
+
+	function onVirtualScroll() {
+		if (scrollContainerEl) {
+			smartTable.virtual.onScroll(scrollContainerEl.scrollTop, scrollContainerEl.clientHeight || 600);
+		}
+	}
+
+	/** Push smart-filter state into pagination settings (localStorage) + URL. */
+	function commitFiltersToURL(resetPage = true) {
+		const plain = smartFilter.toPlainObject();
+		entryListPaginationSettings.filters = { ...plain };
+
+		const filterUpdates: Record<string, string | null> = {
+			...smartFilter.toURLParams()
+		};
+		if (resetPage) {
+			filterUpdates.page = '1';
+		}
+		updateURL(filterUpdates);
+	}
 
 	function onFilterChange(filterName: string, value: string) {
 		filterDebounce(() => {
-			const newFilters = { ...entryListPaginationSettings.filters };
-			if (value) {
-				newFilters[filterName] = value;
-			} else {
-				delete newFilters[filterName];
-			}
-			entryListPaginationSettings.filters = newFilters;
+			smartFilter.setFilter(filterName, value);
+			commitFiltersToURL(true);
+		});
+	}
 
-			// Build filter URL params
-			const filterUpdates: Record<string, string | null> = {};
-			Object.entries(newFilters).forEach(([key, val]) => {
-				filterUpdates[`filter_${key}`] = val || null;
-			});
-			filterUpdates.page = '1'; // Reset to page 1 on filter change
-			updateURL(filterUpdates);
+	function onClearFilter(filterId: string) {
+		smartFilter.clearFilter(filterId);
+		commitFiltersToURL(true);
+	}
+
+	function onClearAllFilters() {
+		smartFilter.clearAll();
+		commitFiltersToURL(true);
+	}
+
+	const viewsScope = $derived(
+		collection.value?._id ? `entry-list:${collection.value._id}` : 'entry-list:unknown'
+	);
+
+	const activeStatusFacet = $derived(smartFilter.filters['status'] ?? '');
+
+	function onStatusFacetSelect(status: string) {
+		if (!status) {
+			smartFilter.clearFilter('status');
+		} else {
+			smartFilter.setFilter('status', status);
+		}
+		// Open filter row so status control is visible
+		filterShow = true;
+		commitFiltersToURL(true);
+	}
+
+	function getSavedViewSnapshot() {
+		return {
+			filters: smartFilter.toFilterQuery() as Record<string, string>,
+			search: globalSearchValue,
+			sort: {
+				sortedBy: smartTable.sort.sortedBy,
+				isSorted: smartTable.sort.isSorted
+			},
+			pageSize: smartTable.pagination.pageSize || serverPagination.pageSize,
+			layout: {
+				density: entryListPaginationSettings.density,
+				columnOrder: displayTableHeaders.map((h) => h.name || ''),
+				visibility: Object.fromEntries(displayTableHeaders.map((h) => [h.name || '', !!h.visible])),
+				columnWidths: { ...smartTable.columnWidths }
+			}
+		};
+	}
+
+	function applySavedView(view: SmartTableSavedView) {
+		// Filters
+		smartFilter.clearAll();
+		const filters = view.filters || {};
+		for (const [k, v] of Object.entries(filters)) {
+			if (typeof v === 'string') {
+				smartFilter.setFilter(k, v);
+			} else if (v && typeof v === 'object' && 'contains' in v) {
+				smartFilter.setFilter(k, String((v as { contains: string }).contains));
+			} else if (v && typeof v === 'object' && 'eq' in v) {
+				smartFilter.setFilter(k, String((v as { eq: unknown }).eq));
+			}
+		}
+		// Search
+		globalSearchValue = view.search || '';
+		// Sort / page size → URL
+		const sortField = view.sort?.sortedBy || null;
+		let order: 'asc' | 'desc' | null = null;
+		if (view.sort?.isSorted === 1) order = 'asc';
+		else if (view.sort?.isSorted === -1) order = 'desc';
+		if (view.layout?.density) {
+			entryListPaginationSettings.density = view.layout.density;
+			smartTable.setDensity(view.layout.density);
+		}
+		// Column visibility
+		if (view.layout?.visibility && displayTableHeaders.length) {
+			displayTableHeaders = displayTableHeaders.map((h) => ({
+				...h,
+				visible: view.layout!.visibility![h.name || ''] ?? h.visible
+			}));
+		}
+		// Widths
+		if (view.layout?.columnWidths) {
+			for (const [k, w] of Object.entries(view.layout.columnWidths)) {
+				smartTable.setColumnWidth(k, w);
+			}
+		}
+		filterShow = smartFilter.activeCount > 0;
+		updateURL({
+			...smartFilter.toURLParams(),
+			search: globalSearchValue || null,
+			sort: sortField,
+			order,
+			page: '1',
+			pageSize: view.pageSize ?? null
 		});
 	}
 
 	async function onActionSuccess() {
-		// Clear selections
-		Object.keys(selectedMap).forEach((key) => {
-			delete selectedMap[key];
-		});
-		SelectAll.value = false;
-		// Tell SvelteKit to re-run the server load function
+		smartTable.clearSelection();
 		await invalidateAll();
 	}
 
 	// =================================================================
-	// 4. KEEP REMAINING UI STATE & LOGIC (Selection, Display, etc.)
+	// 4. SELECTION (via unified Smart Table — id-based, virtualization-safe)
 	// =================================================================
 
-	const selectedMap: Record<string, boolean> = $state({});
 	const SelectAll = {
 		get value() {
-			return tableData.length > 0 && tableData.every((_, i) => !!selectedMap[i.toString()]);
+			return smartTable.allSelected;
 		},
 		set value(v: boolean) {
-			if (v) {
-				tableData.forEach((_, i) => {
-					selectedMap[i.toString()] = true;
-				});
-			} else {
-				Object.keys(selectedMap).forEach((key) => {
-					delete selectedMap[key];
-				});
-			}
+			smartTable.setSelectAll(v);
 		}
 	};
+
+	const hasSelections = $derived(smartTable.hasSelections);
 
 	// =================================================================
 	// 5. HOVER PRELOADING FOR EDIT MODE (Enterprise UX Optimization)
@@ -313,7 +458,7 @@ bulk actions, and predictive preloading.
 			try {
 				await fetch('/api/collections/warm-cache', {
 					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
+					headers: clientJsonHeaders(),
 					body: JSON.stringify({
 						collectionId: currentCollection._id,
 						entryIds
@@ -359,15 +504,39 @@ bulk actions, and predictive preloading.
 		return () => clearInterval(cleanupInterval);
 	});
 
-	// DND Logic for Headers
-	function handleDndConsider(event: CustomEvent) {
-		displayTableHeaders = event.detail.items;
-	}
+	// DND Logic for Headers — uses @thisux/sveltednd v0.7.0 dropPosition API
+	function handleColumnDrop(state: DragDropState<TableHeader>) {
+		const dragged = state.draggedItem;
+		if (!dragged) return;
 
-	function handleDndFinalize(event: CustomEvent) {
-		displayTableHeaders = event.detail.items;
+		const fromIndex = displayTableHeaders.indexOf(dragged);
+		if (fromIndex < 0) return;
+
+		const targetEl = state.targetElement?.closest('[data-header-id]') as HTMLElement | null;
+		const targetHeaderId = targetEl?.dataset?.headerId;
+
+		let targetIndex: number;
+		if (targetHeaderId) {
+			targetIndex = displayTableHeaders.findIndex(h => h.id === targetHeaderId);
+			if (state.dropPosition === 'after') targetIndex++;
+		} else {
+			targetIndex = displayTableHeaders.length;
+		}
+		targetIndex = Math.max(0, Math.min(targetIndex, displayTableHeaders.length));
+
+		if (fromIndex === targetIndex) return;
+
+		displayTableHeaders = untrack(() => {
+			const newItems = [...displayTableHeaders];
+			newItems.splice(fromIndex, 1);
+			const adjusted = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
+			newItems.splice(adjusted, 0, dragged);
+			return newItems;
+		});
 		entryListPaginationSettings.displayTableHeaders = displayTableHeaders;
 	}
+
+
 
 	// Pagination
 	const defaultPaginationSettings = (collectionId: string | null): PaginationSettings => ({
@@ -400,7 +569,7 @@ bulk actions, and predictive preloading.
 						};
 					}
 				} catch (e) {
-					console.error('Failed to load entry list settings', e);
+					logger.error('Failed to load entry list settings', e);
 				}
 			}
 		}
@@ -458,31 +627,16 @@ bulk actions, and predictive preloading.
 		});
 	});
 
-	// Sync filters from URL parameters
+	// Sync filters from URL → smartFilter (whitelist-aware) + pagination settings
 	$effect(() => {
 		const searchParams = page.url.searchParams;
 		untrack(() => {
-			const newFilters = { ...entryListPaginationSettings.filters };
-			let hasChanges = false;
-			let hasActiveUrlFilters = false;
+			const changed = smartFilter.syncFromURL(searchParams);
+			const plain = smartFilter.toPlainObject();
+			const hasActiveUrlFilters = smartFilter.activeCount > 0;
 
-			// Check all filter_ params in URL
-			for (const [key, value] of searchParams.entries()) {
-				if (key.startsWith('filter_')) {
-					const filterName = key.replace('filter_', '');
-					if (newFilters[filterName] !== value) {
-						newFilters[filterName] = value;
-						hasChanges = true;
-					}
-					if (value) {
-						hasActiveUrlFilters = true;
-					}
-				}
-			}
-
-			// Apply changes if any
-			if (hasChanges) {
-				entryListPaginationSettings.filters = newFilters;
+			if (changed) {
+				entryListPaginationSettings.filters = { ...plain };
 			}
 
 			// Auto-open filter row if filters are present in URL
@@ -496,6 +650,8 @@ bulk actions, and predictive preloading.
 	const currentLanguage = $derived(propContentLanguage || currentStates.language);
 	const currentMode = $derived(currentStates.mode);
 	const currentCollection = $derived(currentStates.collection);
+	// Collection header icon (widget default if the collection has no custom icon)
+	const collectionIcon = $derived(currentCollection?.icon || 'bi:collection');
 
 	import { availablePlugins } from '@src/plugins/index';
 
@@ -574,29 +730,6 @@ bulk actions, and predictive preloading.
 		return [...schemaHeaders, ...filteredSystemHeaders];
 	});
 
-	// Effect to initialize/update the filters object in paginationSettings when tableHeaders change
-	$effect(() => {
-		if (tableHeaders.length > 0) {
-			untrack(() => {
-				const newFilters: Record<string, string> = { ...entryListPaginationSettings.filters };
-				let filtersChanged = false;
-				for (const th of tableHeaders) {
-					if (!newFilters[th.name as string]) {
-						newFilters[th.name as string] = '';
-						filtersChanged = true;
-					}
-				}
-				if (filtersChanged) {
-					entryListPaginationSettings.filters = newFilters;
-				}
-			});
-		} else if (Object.keys(untrack(() => entryListPaginationSettings.filters)).length > 0) {
-			untrack(() => {
-				entryListPaginationSettings.filters = {};
-			});
-		}
-	});
-
 	// displayTableHeaders are the actual headers shown, considering user's order/visibility preferences from localStorage
 	let displayTableHeaders: TableHeader[] = $state([]);
 
@@ -647,14 +780,14 @@ bulk actions, and predictive preloading.
 		}
 	};
 
-	const cellPaddingClass = $derived.by(() => {
-		if (entryListPaginationSettings.density === 'compact') {
-			return '!p-1';
+	const cellPaddingClass = $derived(smartTable.cellPaddingClass);
+
+	// Sync density from pagination settings ↔ smart table
+	$effect(() => {
+		const d = entryListPaginationSettings.density;
+		if (d && d !== smartTable.density) {
+			smartTable.setDensity(d);
 		}
-		if (entryListPaginationSettings.density === 'comfortable') {
-			return '!p-3';
-		}
-		return '!p-2';
 	});
 
 	$effect(() => {
@@ -673,18 +806,12 @@ bulk actions, and predictive preloading.
 		}
 		if (currentMode === 'edit') {
 			untrack(() => {
-				Object.keys(selectedMap).forEach((key) => {
-					delete selectedMap[key];
-				});
+				smartTable.clearSelection();
 			});
 		}
 	});
 
-	const hasSelections = $derived.by(() => {
-		return Object.values(selectedMap).some((isSelected) => isSelected);
-	});
-
-	const hasActiveFilters = $derived(Object.values(entryListPaginationSettings.filters).some((f) => !!f) || !!globalSearchValue);
+	const hasActiveFilters = $derived(smartFilter.activeCount > 0 || !!globalSearchValue);
 
 	setModifyEntry(async (status: keyof typeof statusMap | undefined = undefined): Promise<void> => {
 		const selectedIds = getSelectedIds();
@@ -714,20 +841,9 @@ bulk actions, and predictive preloading.
 		return segments.slice(0, -1).join('>') || '';
 	});
 
-	const getSelectedIds = () =>
-		Object.entries(selectedMap)
-			.filter(([, isSelected]) => isSelected)
-			.map(([index]) => {
-				const entry = tableData[Number(index)];
-				return entry ? (entry._id as string) : null;
-			})
-			.filter((id): id is string => id !== null);
+	const getSelectedIds = () => smartTable.getSelectedIds();
 
-	const getSelectedRawEntries = () =>
-		Object.entries(selectedMap)
-			.filter(([, isSelected]) => isSelected)
-			.map(([index]) => tableData[Number(index)])
-			.filter((e): e is CollectionEntry => e !== undefined);
+	const getSelectedRawEntries = () => smartTable.getSelectedRows() as CollectionEntry[];
 
 	const onCreate = async () => {
 		const newEntry: Record<string, any> = {};
@@ -745,7 +861,7 @@ bulk actions, and predictive preloading.
 
 		// ✅ GUI-FIRST PATTERN: Instant mode switch (no data loading needed for create)
 		// 1. Update stores INSTANTLY (no navigation wait)
-		setMode('create');
+		modeTransitionGuard.setMode('create');
 		setCollectionValue(newEntry);
 
 		// 2. Reflect in URL (passive, no reload)
@@ -850,7 +966,7 @@ bulk actions, and predictive preloading.
 	</div>
 {:else}
 	<!-- Header -->
-	<div class="mb-2 flex justify-between dark:text-white">
+	<div class="ms-2 mb-2 flex justify-between dark:text-white">
 		<!-- Row 1 for Mobile -->
 		<div class="flex items-center justify-between">
 			<!-- Hamburger -->
@@ -871,9 +987,14 @@ bulk actions, and predictive preloading.
 					<div class="mb-2 text-xs capitalize text-surface-500 dark:text-surface-50 rtl:text-left">{categoryName}</div>
 				{/if}
 				<h1 class="-mt-2 flex justify-start text-sm font-bold capitalize dark:text-white md:text-2xl lg:text-xl">
-					{#if currentCollection?.icon}
-						<span> <iconify-icon icon={currentCollection.icon} width="24" class="me-1 text-error-500 sm:mr-2"></iconify-icon> </span>
-					{/if}
+					<span>
+						<iconify-icon
+							icon={collectionIcon}
+							width="24"
+							class="me-1 text-error-500 sm:me-2"
+							aria-hidden="true"
+						></iconify-icon>
+					</span>
 					{#if currentCollection?.name}
 						<div class="flex max-w-21.25 whitespace-normal leading-3 sm:mr-2 sm:max-w-none md:mt-0 md:leading-none xs:mt-1">
 							{currentCollection.name}
@@ -885,7 +1006,7 @@ bulk actions, and predictive preloading.
 				</h1>
 			</div>
 		</div>
-		<div class="flex items-center justify-between gap-1">
+		<div class="flex items-center justify-between gap-1 overflow-x-auto shrink-0 max-w-full">
 			<!-- Expand/Collapse -->
 			<Button variant="outline"
 				type="button"
@@ -901,16 +1022,27 @@ bulk actions, and predictive preloading.
 
 			<!-- Table Filter with Translation Content Language - Desktop -->
 			<div class="relative mt-1 hidden items-center justify-center gap-2 sm:flex">
-				<TableFilter bind:globalSearchValue bind:filterShow bind:columnShow bind:density={entryListPaginationSettings.density} />
+				<TableFilter
+					bind:globalSearchValue
+					bind:filterShow
+					bind:columnShow
+					bind:density={entryListPaginationSettings.density}
+				/>
+				<SmartTableSavedViewsMenu
+					scope={viewsScope}
+					getSnapshot={getSavedViewSnapshot}
+					onApply={applySavedView}
+				/>
+				<SmartTableMetricsBadge summary={listMetrics} />
 				<TranslationStatus />
 			</div>
 
 			<!-- MultiButton -->
-			<div class=" flex w-full items-center justify-end sm:mt-0 sm:w-auto">
+			<div class="flex items-center justify-end sm:mt-0 sm:w-auto sshrink-0">
 				<EntryListMultiButton
 					isCollectionEmpty={tableData?.length === 0}
 					{hasSelections}
-					selectedCount={Object.values(selectedMap).filter(Boolean).length}
+					selectedCount={smartTable.selectedCount}
 					selectedItems={getSelectedRawEntries()}
 					bind:showDeleted
 					publish={onPublish}
@@ -927,10 +1059,25 @@ bulk actions, and predictive preloading.
 
 	<!-- Table  Start-->
 	{#if expand}
-		<div class="mb-2 flex items-center justify-center sm:hidden">
+		<div class="mb-2 flex flex-wrap items-center justify-center gap-2 sm:hidden">
 			<TableFilter bind:globalSearchValue bind:filterShow bind:columnShow bind:density={entryListPaginationSettings.density} />
+			<SmartTableSavedViewsMenu
+				scope={viewsScope}
+				getSnapshot={getSavedViewSnapshot}
+				onApply={applySavedView}
+			/>
+			<SmartTableMetricsBadge summary={listMetrics} />
 		</div>
 	{/if}
+
+	<!-- Status facet chips (server counts) -->
+	<div class="mb-1 shrink-0">
+		<SmartTableStatusFacets
+			facets={statusFacets}
+			active={activeStatusFacet}
+			onSelect={onStatusFacetSelect}
+		/>
+	</div>
 
 	{#if columnShow}
 		<!-- Column order -->
@@ -939,11 +1086,7 @@ bulk actions, and predictive preloading.
 			<!-- Select All Columns -->
 			<div class="my-2 flex w-full flex-col items-center justify-center gap-2 sm:flex-row sm:gap-4">
 				<div class="flex items-center gap-2">
-					<label class="flex items-center">
-						<input type="checkbox" bind:checked={selectAllColumns.value} class="me-1" aria-label="select-all-columns" />
-
-						{entrylist_all()}
-					</label>
+					<Checkbox bind:checked={selectAllColumns.value} label={entrylist_all()} />
 
 					<Button variant="outline" onclick={resetViewSettings} aria-label="reset-view" class="bg-surface-400 text-white">
 						<iconify-icon icon="material-symbols-light:device-reset" width={24}></iconify-icon>
@@ -951,13 +1094,29 @@ bulk actions, and predictive preloading.
 					</Button>
 				</div>
 				<section
-					use:dndzone={{ items: displayTableHeaders, flipDurationMs: 300, type: 'columns', dropTargetStyle: { outline: 'none' } }}
-					onconsider={handleDndConsider}
-					onfinalize={handleDndFinalize}
+					use:droppable={{
+						container: 'columns',
+						callbacks: { onDrop: handleColumnDrop },
+						direction: 'horizontal',
+						attributes: {
+							dragOverClass: 'bg-secondary-200'
+						}
+					}}
 					class="flex w-full flex-wrap justify-center gap-2 p-2 border-2 border-dashed border-secondary-500/50 rounded transition-all hover:border-secondary-500"
+					role="list"
+					aria-label="Drag columns to reorder"
 				>
 					{#each displayTableHeaders as header (header.id)}
-						<div animate:flip={{ duration: 300 }}>
+						<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+						<div
+							animate:flip={{ duration: 300 }}
+							use:draggable={{ container: 'columns', dragData: header, keyboard: true }}
+							use:droppable={{ container: 'columns', callbacks: { onDrop: handleColumnDrop }, direction: 'horizontal', attributes: { dragOverClass: 'bg-secondary-200' } }}
+							data-header-id={header.id}
+							role="listitem"
+							tabindex="0"
+							aria-label={`Column: ${header.label}. Press Space to grab, arrows to move.`}
+						>
 							<Button variant="tertiary"
 								type="button"
 								onclick={() => handleColumnVisibilityToggle(header)}
@@ -976,59 +1135,49 @@ bulk actions, and predictive preloading.
 	{/if}
 
 	{#if tableData.length > 0 || hasActiveFilters}
-		<div class="table-container max-h-[calc(100dvh)] overflow-auto">
-			<table class="table table-interactive table-hover">
+		<SmartTableShell
+			empty={tableData.length === 0 && hasActiveFilters}
+			emptyTitle="No entries match filters"
+			emptyDescription="Clear filters or adjust search to see collection entries."
+			emptyIcon="mdi:filter-off-outline"
+			showPagination={tableData.length > 0}
+			manageScroll={false}
+			currentPage={serverPagination.currentPage}
+			rowsPerPage={serverPagination.pageSize}
+			pagesCount={pagesCount}
+			totalItems={totalItems}
+			onUpdatePage={onUpdatePage}
+			onUpdateRowsPerPage={onUpdateRowsPerPage}
+			class="min-h-0 flex-1"
+		>
+			{#snippet emptyAction()}
+				<Button variant="outline" size="sm" onclick={onClearAllFilters} aria-label="Clear all filters">
+					Clear filters
+				</Button>
+			{/snippet}
+		<div
+			bind:this={scrollContainerEl}
+			onscroll={onVirtualScroll}
+			class="{SMART_TABLE_SCROLL} max-h-[calc(100dvh)]"
+		>
+			<table class={SMART_TABLE}>
 				<!-- Table Header -->
-				<thead class="sticky top-0 z-10 bg-secondary-100 text-tertiary-500 dark:bg-surface-900 dark:text-primary-500">
+				<thead class={SMART_TABLE_THEAD}>
 					{#if filterShow && visibleTableHeaders.length > 0}
-						<tr class="divide-x divide-surface-400 dark:divide-surface-600">
-							<th>
-								<!-- Clear All Filters Button -->
-								{#if Object.values(entryListPaginationSettings.filters).some((f) => f !== '')}
-									<Button variant="outline"
-										onclick={() => {
-											const clearedFilters: Record<string, string> = {};
-											const urlUpdates: Record<string, string | null> = {};
-
-											Object.keys(entryListPaginationSettings.filters).forEach((key) => {
-												clearedFilters[key] = '';
-												urlUpdates[`filter_${key}`] = null;
-											});
-
-											entryListPaginationSettings.filters = clearedFilters;
-											urlUpdates.page = '1';
-											updateURL(urlUpdates);
-										}}
-										aria-label="clear-all-filters"
-									 class="p-0! min-w-0">
-										<iconify-icon icon="material-symbols:close" width={24}></iconify-icon>
-									</Button>
-								{/if}
-							</th>
-							<!-- Filter -->
-							{#each visibleTableHeaders as header (header.id)}
-								<th>
-									<div class="flex items-center justify-between">
-										<FloatingInput
-											type="text"
-											icon="material-symbols:search-rounded"
-											label={`Filter ${(header as TableHeader).label}`}
-											name={(header as TableHeader).name || ''}
-											value={(entryListPaginationSettings.filters as any)[(header as TableHeader).name || ''] || ''}
-											onInput={(value: string) => onFilterChange((header as TableHeader).name || '', value)}
-											inputClass="text-xs dark:text-primary-500"
-											textColor=""
-											labelClass="dark:text-white"
-										/>
-									</div>
-								</th>
-							{/each}
-						</tr>
+						<SmartFilterRow
+							headers={visibleTableHeaders}
+							definitions={smartFilter.definitions}
+							filters={smartFilter.filters}
+							activeFilters={smartFilter.activeFilters}
+							onFilterChange={onFilterChange}
+							onClearAll={onClearAllFilters}
+							onClearFilter={onClearFilter}
+						/>
 					{/if}
 
-					<tr class="divide-x divide-surface-400 border-b border-black dark:border-white">
+					<tr class="border-b border-black dark:border-white">
 						<TableIcons
-							cellClass={`w-10 ${hasSelections ? 'bg-tertiary-500 dark:bg-primary-500/10 dark:bg-secondary-500/20' : ''}`}
+							cellClass={`w-10 ${pinCellClass('start')} ${hasSelections ? 'bg-tertiary-500 dark:bg-primary-500/10 dark:bg-secondary-500/20' : ''}`}
 							checked={SelectAll.value}
 							onCheck={(checked: boolean) => {
 								SelectAll.value = checked;
@@ -1036,55 +1185,65 @@ bulk actions, and predictive preloading.
 						/>
 
 						{#each visibleTableHeaders as header (header.id)}
+							{@const colKey = ((header as TableHeader).name || header.id) as string}
 							<th
-								class="text-center text-xs sm:text-sm {cellPaddingClass}"
+								class="relative text-center text-xs sm:text-sm {cellPaddingClass}"
+								style={smartTable.getColumnWidthStyle(colKey)}
 								aria-sort={(header as TableHeader).name === entryListPaginationSettings.sorting.sortedBy
 									? entryListPaginationSettings.sorting.isSorted === 1
 										? 'ascending'
 										: 'descending'
 									: 'none'}
 							>
-								<button
-									type="button"
+								<Button
+									variant="ghost"
 									class="flex w-full items-center justify-center font-bold uppercase focus:outline-none {(header as TableHeader).name ===
 									entryListPaginationSettings.sorting.sortedBy
 										? 'text-tertiary-500 dark:text-primary-500'
 										: 'text-tertiary-500 dark:text-primary-500'}"
 									onclick={() => onSortChange((header as TableHeader).name || '')}
-																		aria-label="sort-column"
-																	>
+									aria-label="sort-column"
+								>
 									{(header as TableHeader).label}
 									{#if (header as TableHeader).name === entryListPaginationSettings.sorting.sortedBy && entryListPaginationSettings.sorting.isSorted !== 0}
-										{const sortIcon = entryListPaginationSettings.sorting.isSorted === 1 ? 'mdi:arrow-up' : 'mdi:arrow-down'}
+										{@const sortIcon = entryListPaginationSettings.sorting.isSorted === 1 ? 'mdi:arrow-up' : 'mdi:arrow-down'}
 										<iconify-icon icon={sortIcon} width="16" class="ms-1 origin-center"></iconify-icon>
 									{/if}
-								</button>
+								</Button>
+								<ColumnResizeHandle columnKey={colKey} onResize={smartTable.setColumnWidth} />
 							</th>
 						{/each}
 					</tr>
 				</thead>
 				<tbody>
+					{#if useRowVirtualization && spacerTop > 0}
+						<tr style="height: {spacerTop}px" aria-hidden="true"></tr>
+					{/if}
 					{#if tableData.length > 0}
-						{#each tableData as entry, index (entry._id)}
+						{#each visibleRows as entry (entry._id)}
+							{@const rowId = String(entry._id ?? '')}
+							{@const rowSelected = smartTable.isSelected(rowId)}
 							<tr
-								class="divide-x divide-surface-400 dark:divide-surface-700 {selectedMap[index] ? 'bg-tertiary-500 dark:bg-primary-500' : ''}"
+								class="{rowSelected ? 'bg-tertiary-500 dark:bg-primary-500' : ''}"
 								style={useRowVirtualization ? 'content-visibility: auto; contain-intrinsic-size: 48px;' : undefined}
 								onmouseenter={() => entry._id && handleRowHoverStart(entry._id)}
 								onmouseleave={handleRowHoverEnd}
 							>
 								<TableIcons
-									cellClass={`w-10 text-center ${selectedMap[index] ? 'bg-tertiary-500 dark:bg-primary-500/10 dark:bg-secondary-500/20' : ''}`}
-									checked={selectedMap[index]}
-									onCheck={(isChecked: boolean) => {
-										selectedMap[index] = isChecked;
+									cellClass={`w-10 text-center ${rowSelected ? 'bg-tertiary-500 dark:bg-primary-500/10 dark:bg-secondary-500/20' : ''}`}
+									checked={rowSelected}
+									onCheck={() => {
+										if (rowId) smartTable.toggleSelect(rowId);
 									}}
 								/>
 								{#if visibleTableHeaders}
 									{#each visibleTableHeaders as header (header.id)}
+										{@const cellKey = ((header as TableHeader).name || header.id) as string}
 										<td
 											class="text-center {cellPaddingClass} text-xs font-bold sm:text-sm {(header as TableHeader).name !== 'status'
 												? 'cursor-pointer transition-colors duration-200 hover:bg-tertiary-500 dark:bg-primary-500/10 dark:hover:bg-secondary-500/20'
 												: 'hover:bg-warning-500/10 dark:hover:bg-warning-500/20'}"
+											style={smartTable.getColumnWidthStyle(cellKey)}
 											onclick={async () => {
 												if ((header as TableHeader).name === 'status') {
 													// Handle single entry status change with modal (same style as multibutton)
@@ -1141,7 +1300,7 @@ bulk actions, and predictive preloading.
 
 														// 2. Update stores INSTANTLY (no waiting)
 														// The URL pattern document mandates GUI-First: state first, URL second
-														setMode("edit");
+														modeTransitionGuard.setMode("edit");
 														setCollectionValue(originalEntry);
 
 														// 3. Reflect in URL (passive, no reload if we use replaceState, but we want history so we use reflectModeInURL)
@@ -1200,6 +1359,9 @@ bulk actions, and predictive preloading.
 								{/if}
 							</tr>
 						{/each}
+						{#if useRowVirtualization && spacerBottom > 0}
+							<tr style="height: {spacerBottom}px" aria-hidden="true"></tr>
+						{/if}
 					{:else}
 						<tr>
 							<td colspan={visibleTableHeaders.length + 1} class="p-4 text-center text-surface-500 dark:text-surface-50">No results found.</td>
@@ -1208,19 +1370,7 @@ bulk actions, and predictive preloading.
 				</tbody>
 			</table>
 		</div>
-		<!-- Pagination -->
-		<div
-			class="sticky bottom-0 inset-s-0 inset-e-0 z-10 mt-1 flex flex-col items-center justify-center border-t border-surface-300 bg-secondary-100 dark:text-surface-50 dark:bg-surface-800 md:flex-row md:justify-between md:p-4"
-		>
-			<TablePagination
-				currentPage={serverPagination.currentPage}
-				rowsPerPage={serverPagination.pageSize}
-				{pagesCount}
-				{totalItems}
-				{onUpdatePage}
-				{onUpdateRowsPerPage}
-			/>
-		</div>
+		</SmartTableShell>
 	{:else}
 		<div class="py-10 text-center text-tertiary-500 dark:text-primary-500">
 			<iconify-icon icon="bi:exclamation-circle-fill" width={24} class="mb-2"></iconify-icon>

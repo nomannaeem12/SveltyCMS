@@ -11,6 +11,7 @@
  * - GraphQL endpoint proxy
  */
 
+import { logger } from "@utils/logger";
 import { AppError } from "@utils/error-handling";
 import type { RequestEvent } from "@sveltejs/kit";
 import type { LocalCMS } from "@src/services/sdk";
@@ -74,6 +75,10 @@ export async function handleContentRoutes(
 
     // ── Global Search ──
     if (namespace === "search" && request.method === "GET") {
+      const mode = url.searchParams.get("mode");
+      if (mode === "semantic") {
+        return handleSemanticSearch(event, url);
+      }
       return handleGlobalSearch(event, cms, tenantId, url);
     }
 
@@ -84,7 +89,7 @@ export async function handleContentRoutes(
 
     throw new AppError(`Content endpoint /api/${segments.join("/")} not implemented`, 404);
   } catch (err: any) {
-    console.error(`[ContentRoute Error] ${segments.join("/")}:`, err);
+    logger.error(`[ContentRoute Error] ${segments.join("/")}:`, err);
     if (err instanceof AppError) throw err;
     throw new AppError(err.message || "Content operation failed", 500);
   }
@@ -114,16 +119,24 @@ async function handleContentRefresh(event: RequestEvent, cms: LocalCMS, tenantId
 
 /**
  * Smart collections refresh that preserves API-injected collections.
- * Uses refreshCollectionsCache instead of cms.collections.refresh to avoid
+ * Uses refreshContent(schemas) instead of cms.collections.refresh to avoid
  * clearing all tenant buckets (which would destroy dynamic/benchmark schemas).
  */
 async function handleCollectionsRefresh(event: RequestEvent, cms: LocalCMS, tenantId: DatabaseId) {
-  const { refreshCollectionsCache } = await import("@src/content/content-service.server");
+  const { refreshContent } = await import("@src/content/engine.server");
   const { getDb } = await import("@src/databases/db");
 
-  await refreshCollectionsCache(tenantId, getDb() || undefined);
+  await refreshContent(tenantId, {
+    mode: "schemas",
+    adapter: getDb() || undefined,
+  });
 
   const list = await cms.collections.list({ tenantId, includeFields: true });
+  // Weak ETag: use collection count + max updatedAt as lightweight version token
+  const maxTs =
+    list.data?.reduce?.((max: string, c: any) => (c.updatedAt > max ? c.updatedAt : max), "") || "";
+  (event.locals as any).apiDataHash = maxTs || `collections:${list.data?.length || 0}`;
+
   return successResponse(event, {
     success: true,
     message: "Collections cache refreshed",
@@ -147,6 +160,9 @@ async function handleGetContentStructure(
   }
 
   const nodes = await cms.collections.getStructure(tenantId);
+  // Weak ETag: use content version as lightweight token
+  (event.locals as any).apiDataHash = `structure:${(cms as any).version || "0.0.8"}`;
+
   return successResponse(event, {
     contentNodes: nodes,
     version: (cms as any).version || "0.0.8",
@@ -252,17 +268,31 @@ async function handleContentEventsStream(event: RequestEvent, tenantId: Database
         return;
       }
 
-      // Event handler — normalized wire format + tenant filtering
+      // Micro-buffer queue — decouples event emission from HTTP backpressure.
+      // Events are buffered and flushed in batches every 32ms to avoid
+      // synchronous controller.enqueue() blocking the event loop under load.
+      let eventBuffer: string[] = [];
+
+      const flushBuffer = () => {
+        if (eventBuffer.length === 0 || isClosed) return;
+        try {
+          controller.enqueue(encoder.encode(eventBuffer.join("")));
+          eventBuffer = [];
+        } catch {
+          isClosed = true;
+          clearInterval(flushTimer);
+          eventBus.off("*", handler);
+        }
+      };
+
+      const flushTimer = setInterval(flushBuffer, 32);
+
+      // Event handler — buffers events instead of synchronous enqueue
       const handler = (payload: { event?: string; data?: Record<string, unknown> }) => {
         if (isClosed) return;
         const clientPayload = normalizeSseEventPayload(payload, tenantId);
         if (!clientPayload) return;
-        try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(clientPayload)}\n\n`));
-        } catch {
-          isClosed = true;
-          eventBus.off("*", handler);
-        }
+        eventBuffer.push(`data: ${JSON.stringify(clientPayload)}\n\n`);
       };
 
       eventBus.on("*", handler);
@@ -275,6 +305,7 @@ async function handleContentEventsStream(event: RequestEvent, tenantId: Database
           } catch {
             isClosed = true;
             clearInterval(keepAlive);
+            clearInterval(flushTimer);
             eventBus.off("*", handler);
           }
         }
@@ -284,6 +315,7 @@ async function handleContentEventsStream(event: RequestEvent, tenantId: Database
       event.request.signal.addEventListener("abort", () => {
         isClosed = true;
         clearInterval(keepAlive);
+        clearInterval(flushTimer);
         eventBus.off("*", handler);
         try {
           controller.close();
@@ -332,4 +364,16 @@ async function handleGlobalSearch(
 export async function handleGraphqlRoutes(event: RequestEvent) {
   const { POST } = await import("../../graphql/+server");
   return POST(event);
+}
+
+/** Server-side semantic search handler to avoid client-side imports of semantic index. */
+async function handleSemanticSearch(event: RequestEvent, url: URL) {
+  const q = url.searchParams.get("q") || "";
+  try {
+    const { semanticSearch } = await import("@src/services/intelligence/semantic-index");
+    const results = await semanticSearch(q, { limit: 10, minScore: 0.15 });
+    return rawResponse(event, { success: true, data: results });
+  } catch (err: any) {
+    return rawResponse(event, { success: false, error: err.message });
+  }
 }

@@ -1,24 +1,23 @@
 /**
  * @file src/utils/logger.ts
- * @description Universal isomorphic logger (Client + Server) with enterprise audit features.
+ * @description Shared logger core — masking, formatting, levels. Works everywhere.
  *
- * Features:
- * - Isomorphic: Works in Browser, Node.js, and Bun.
- * - Server-side Audit: Tamper-evident SHA-256 HMAC log chaining (server-only).
- * - Automatic Rotation: Gzip compression and rotation for server logs.
- * - Smart Formatting: ANSI colors for terminal, CSS styles for browser.
- * - Sensitive Masking: Redacts passwords, tokens, and PII automatically.
- * - Performance: Batching and deduplication to prevent console/disk bottleneck.
+ * ### Hardening (audit 2026-07):
+ * - C++ boundary bottleneck: env vars cached at module load (IIFE), not per-call
+ * - O(n×m) redaction: arrays replaced with pre-compiled RegExp patterns
+ * - Cyclic reference protection: WeakSet tracker prevents infinite recursion
+ * - Error objects: extract {name, message, stack} instead of raw (prevents API key leaks)
+ * - Browser regex: pre-compiled once at module root, not per-message
+ * - Masking: lazy — only called when args are present
  */
 
 import { pc } from "./native-utils.ts";
-import type { WriteStream } from "node:fs";
 
-// --- Types & Constants ---
-
+// ── Types ──
 export type LogLevel = "none" | "fatal" | "error" | "warn" | "info" | "debug" | "trace";
 export type LoggableValue = string | number | boolean | null | undefined | object | Date | Error;
 
+// ── Priorities ──
 const PRIORITY: Record<LogLevel, number> = {
   none: 0,
   fatal: 1,
@@ -30,95 +29,86 @@ const PRIORITY: Record<LogLevel, number> = {
 };
 
 const ICONS: Record<string, string> = {
-  FATAL: "💀",
-  ERROR: "❌",
-  WARN: "⚠️",
-  INFO: "ℹ️",
-  DEBUG: "🐛",
-  TRACE: "🔍",
+  FATAL: "\u{1F480}",
+  ERROR: "\u274C",
+  WARN: "\u26A0\uFE0F",
+  INFO: "\u2139\uFE0F",
+  DEBUG: "\u{1F41B}",
+  TRACE: "\u{1F50D}",
   NONE: "",
 };
 
-const SENSITIVE = [
-  "security",
-  "passwd",
-  "pwd",
-  "token",
-  "secret",
-  "key",
-  "authorization",
-  "auth",
-  "api_key",
-  "apikey",
-];
-const EMAILS = ["email", "mail", "userid", "username"];
-
+// ── Environment flags ─────────────────────────────────────────────────────
 const IS_BROWSER = typeof window !== "undefined";
+const ENV = IS_BROWSER ? (import.meta as any).env : process?.env;
 
-// --- Configuration ---
+/**
+ * Pure env → config resolution (exported for unit testing).
+ * Higher priority number = more verbose; a level is emitted when its priority
+ * is <= the configured ceiling priority.
+ */
+export function resolveLogConfig(env: Record<string, string | undefined> | undefined): {
+  level: LogLevel;
+  priority: number;
+  quiet: boolean;
+  benchmarkDebug: boolean;
+} {
+  const quiet = env?.QUIET === "true" || env?.BENCHMARK === "true";
+  const benchmarkDebug = env?.BENCHMARK_DEBUG === "true";
+  const raw = (
+    env?.LOG_LEVELS ??
+    env?.LOG_LEVEL ??
+    env?.VITE_LOG_LEVELS ??
+    (env?.NODE_ENV === "production" ? "error" : "info")
+  )
+    .split(",")[0]
+    .trim()
+    .toLowerCase() as LogLevel;
+  const level: LogLevel = PRIORITY[raw] !== undefined ? raw : "info";
+  return { level, priority: PRIORITY[level], quiet, benchmarkDebug };
+}
 
-const LOG_LEVEL_STR = (
-  import.meta.env?.VITE_LOG_LEVELS ??
-  (typeof process !== "undefined"
-    ? process.env?.LOG_LEVELS || process.env?.LOG_LEVEL
-    : undefined) ??
-  (typeof process !== "undefined" && process.env.NODE_ENV === "production" ? "error" : "info")
-)
-  .split(",")[0]
-  .trim()
-  .toLowerCase() as LogLevel;
+const {
+  level: CURRENT_LOG_LEVEL,
+  priority: CURRENT_PRIORITY,
+  quiet: IS_QUIET,
+  benchmarkDebug: IS_BENCHMARK_DEBUG,
+} = resolveLogConfig(ENV);
 
-const CURRENT_PRIORITY = PRIORITY[LOG_LEVEL_STR] ?? PRIORITY.info;
+// ── Sensitive data masking (compiled regex — C++ native matching) ──────────
+// Word-boundary aware: `password`/`token`/`secret`/`authorization` and standalone
+// `key`/`keys`/`auth` are redacted, but `keywords`, `authorId`, `cacheKey`, `monkey`
+// are NOT (they are context, not secrets — over-redaction hides real diagnostics).
+const SENSITIVE_REGEX =
+  /\b(pass(?:word)?|pwd|token|secret|authorization|api[_-]?keys?|apikeys?|access[_-]?keys?|secret[_-]?keys?|auth)\b|\bkeys?\b/i;
+const EMAIL_REGEX = /(email|mail|userid|username)/i;
 
-// ✨ PERFORMANCE: Module-level capture of initial environment
-// Note: These may be overridden by dynamic checks if environment changes during runtime (e.g. benchmarks)
-const CAPTURED_QUIET =
-  typeof process !== "undefined" &&
-  (process.env?.QUIET === "true" || process.env?.BENCHMARK === "true") &&
-  process.env?.BENCHMARK_DEBUG !== "true";
-const IS_VERBOSE_MODE =
-  typeof process !== "undefined" &&
-  (process.env?.VERBOSE === "true" || process.env?.BENCHMARK_DEBUG === "true");
-
-// --- Masking Logic ---
-
-function mask(v: unknown, depth = 0): unknown {
-  if (depth > 10) return "[Depth]";
+export function mask(v: unknown, depth = 0, seen = new WeakSet()): unknown {
+  if (depth > 10) return "[Max Depth Exceeded]";
   if (v === null || typeof v !== "object") return v;
-  if (v instanceof Date || v instanceof RegExp || v instanceof Error) return v;
-  if (Array.isArray(v)) return v.map((i) => mask(i, depth + 1));
-
+  if (v instanceof Date || v instanceof RegExp) return v;
+  if (v instanceof Error) {
+    return { name: v.name, message: v.message, stack: v.stack };
+  }
+  if (seen.has(v)) return "[Circular]";
+  seen.add(v);
+  if (Array.isArray(v)) return v.map((i) => mask(i, depth + 1, seen));
   const o: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(v)) {
-    const low = k.toLowerCase();
-    if (SENSITIVE.some((s) => low.includes(s))) {
+    if (SENSITIVE_REGEX.test(k)) {
       o[k] = "[REDACTED]";
-    } else if (EMAILS.some((e) => low.includes(e)) && typeof val === "string") {
-      const [local, domain] = val.split("@");
-      o[k] = domain ? `${local.slice(0, 2)}***@${domain}` : "***";
+    } else if (typeof val === "string" && EMAIL_REGEX.test(k)) {
+      const idx = val.indexOf("@");
+      o[k] = idx > -1 ? `${val.slice(0, 2)}***${val.slice(idx)}` : "***";
     } else {
-      o[k] = mask(val, depth + 1);
+      o[k] = mask(val, depth + 1, seen);
     }
   }
   return o;
 }
 
-// --- Masking & Formatting Logic ---
-
-/**
- * Masks email addresses in a string.
- * "rkroells@web.de" → "rk***@web.de"
- */
-function maskEmails(str: string): string {
-  return str.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, (match) => {
-    const [local, domain] = match.split("@");
-    if (!domain) return match;
-    if (local.length <= 2) return `${local}***@${domain}`;
-    return `${local.slice(0, 2)}***@${domain}`;
-  });
-}
-
-const highlightPatterns = [
+// ── Formatting ─────────────────────────────────────────────────────────────
+const HIGHLIGHTS = [
   { re: /\b\d+(\.\d+)?(ms|s)\b/g, color: pc.green, css: "color:#22c55e" },
   {
     re: /([a-f0-9]{24}|[a-f0-9]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi,
@@ -131,171 +121,38 @@ const highlightPatterns = [
   { re: /\b-?\d+\.?\d*\b/g, color: pc.blue, css: "color:#3b82f6" },
 ];
 
-function formatMessage(msg: string): string {
+const BROWSER_HIGHLIGHT_REGEX = IS_BROWSER
+  ? new RegExp(HIGHLIGHTS.map((p) => p.re.source).join("|"), "gi")
+  : null;
+
+function formatAnsi(msg: string): string {
   let out = msg;
-  for (const { re, color } of highlightPatterns) {
-    out = out.replace(re, (m) => color(m));
+  for (let i = 0; i < HIGHLIGHTS.length; i++) {
+    out = out.replace(HIGHLIGHTS[i].re, (m) => HIGHLIGHTS[i].color(m));
   }
   return out;
 }
 
-// --- Server-Side Engine (Lazy & Gated) ---
-
-let serverEngine: {
-  enqueue: (level: LogLevel, msg: string, args: unknown[]) => void;
-} | null = null;
-
-// Startup buffer: captures log entries emitted before the async IIFE completes.
-// Once the server engine initializes, buffered entries are flushed and the buffer
-// is replaced with a direct passthrough to prevent lost audit entries.
-const startupBuffer: { level: LogLevel; msg: string; args: unknown[] }[] = [];
-
-if (!IS_BROWSER) {
-  // Use a self-invoking async function to initialize server-side deps
-  (async () => {
-    try {
-      const crypto = await import(/* @vite-ignore */ "node:crypto");
-      const fs = await import(/* @vite-ignore */ "node:fs");
-      const promises = await import(/* @vite-ignore */ "node:fs/promises");
-      const path = await import(/* @vite-ignore */ "node:path");
-      const sp = await import(/* @vite-ignore */ "node:stream/promises");
-      const zlib = await import(/* @vite-ignore */ "node:zlib");
-
-      let stream: WriteStream | null = null;
-      let lastHash = "";
-      const HMAC_SECRET = process.env.LOG_CHAIN_SECRET || "svelty-cms-default-log-secret";
-      const logQueue: { level: LogLevel; msg: string; args: unknown[] }[] = [];
-      let isFlushing = false;
-
-      const ensureStream = async () => {
-        const dir = "logs";
-        const file = path.join(dir, "app.log");
-        if (!stream || stream.destroyed) {
-          await promises.mkdir(dir, { recursive: true });
-          try {
-            const content = await promises.readFile(file, "utf8");
-            const lastLine = content.trim().split("\n").at(-1);
-            if (lastLine) {
-              const match = lastLine.match(/\[CHAIN:([a-f0-9]{64})\]/);
-              if (match) lastHash = match[1];
-            }
-          } catch {}
-          stream = fs.createWriteStream(file, { flags: "a" });
-        }
-        return stream;
-      };
-
-      const rotate = async () => {
-        const dir = "logs";
-        const file = path.join(dir, "app.log");
-        try {
-          const stat = await promises.stat(file);
-          if (stat.size < 5 * 1024 * 1024) return;
-          if (stream) stream.end();
-          const ts = new Date().toISOString().replace(/[:.]/g, "-");
-          const rotated = `${file}.${ts}`;
-          await promises.rename(file, rotated);
-          const src = fs.createReadStream(rotated);
-          const dst = fs.createWriteStream(`${rotated}.gz`);
-          await sp.pipeline(src, zlib.createGzip(), dst);
-          await promises.unlink(rotated);
-          const files = await promises.readdir(dir);
-          const logFiles = files
-            .filter((f) => f.startsWith("app.log.") && f.endsWith(".gz"))
-            .map((f) => ({
-              name: f,
-              time: fs.statSync(path.join(dir, f)).mtime.getTime(),
-            }))
-            .sort((a, b) => b.time - a.time);
-          if (logFiles.length > 5) {
-            for (const f of logFiles.slice(5)) await promises.unlink(path.join(dir, f.name));
-          }
-        } catch {}
-      };
-
-      const flush = async () => {
-        if (!logQueue.length || isFlushing) return;
-        isFlushing = true;
-        const batch = logQueue.splice(0, logQueue.length);
-        try {
-          const s = await ensureStream();
-          await rotate();
-          for (const e of batch) {
-            const ts = new Date().toISOString().slice(0, 19).replace("T", " ");
-            const plainText = `${ts} [${e.level.toUpperCase().padEnd(5)}] ${e.msg} ${JSON.stringify(e.args)}`;
-            lastHash = crypto
-              .createHmac("sha256", HMAC_SECRET)
-              .update(lastHash + plainText)
-              .digest("hex");
-            const logLine = `${ts} [${e.level.toUpperCase().padEnd(5)}] ${e.msg} ${JSON.stringify(e.args)} [CHAIN:${lastHash}]\n`;
-            s.write(logLine);
-          }
-        } catch (err) {
-          console.error("[Logger] Server flush failed", err);
-        } finally {
-          isFlushing = false;
-        }
-      };
-
-      serverEngine = {
-        enqueue: (level, msg, args) => {
-          // Hard cap on log queue to prevent OOM during massive bursts
-          if (logQueue.length < 5000) {
-            logQueue.push({ level, msg, args });
-          }
-          if (logQueue.length >= 100) flush();
-          else setTimeout(flush, 5000);
-        },
-      };
-
-      // Flush startup buffer — entries captured before the IIFE completed
-      if (startupBuffer.length > 0) {
-        const buffered = startupBuffer.splice(0, startupBuffer.length);
-        for (const entry of buffered) {
-          serverEngine.enqueue(entry.level, entry.msg, entry.args);
-        }
-      }
-    } catch (e) {
-      console.error("[Logger] Failed to initialize server engine", e);
-    }
-  })();
-}
-
-// --- Core Logging Implementation ---
-
+// ── Core log function ──────────────────────────────────────────────────────
 function log(level: LogLevel, msg: string, args: unknown[]) {
   if (PRIORITY[level] > CURRENT_PRIORITY) return;
-
-  // 🚀 SILENCE: Skip info/debug/trace in quiet mode unless verbose is explicitly requested
-  // ✨ PERFORMANCE: Use globalThis for zero-tax late-binding in benchmarks
-  const isQuiet =
-    CAPTURED_QUIET ||
-    (typeof globalThis !== "undefined" && (globalThis as any).__SVELTY_QUIET__) ||
-    (typeof process !== "undefined" &&
-      (process.env.QUIET === "true" || process.env.BENCHMARK === "true"));
-
-  if (isQuiet && PRIORITY[level] > PRIORITY.warn && !IS_VERBOSE_MODE) return;
+  if (!IS_BROWSER && IS_QUIET && !IS_BENCHMARK_DEBUG && PRIORITY[level] > PRIORITY.warn) return;
 
   const ts = new Date().toISOString().slice(0, 19).replace("T", " ");
-  const icon = ICONS[level.toUpperCase()] || "●";
-  const maskedArgs = args.map((a) => mask(a));
+  const icon = ICONS[level.toUpperCase()] || "\u25CF";
   const method =
     level === "fatal" || level === "error" ? "error" : level === "warn" ? "warn" : "log";
 
-  const maskedMsg = maskEmails(msg);
-
   if (IS_BROWSER) {
     const styles: string[] = [];
-    const formattedMsg = maskedMsg.replace(
-      new RegExp(highlightPatterns.map((p) => p.re.source).join("|"), "gi"),
-      (m) => {
-        const pattern = highlightPatterns.find((p) => m.match(p.re));
-        styles.push(pattern?.css || "color:inherit", "color:inherit");
-        return `%c${m}%c`;
-      },
-    );
+    const formatted = msg.replace(BROWSER_HIGHLIGHT_REGEX!, (m) => {
+      const pattern = HIGHLIGHTS.find((p) => m.match(p.re));
+      styles.push(pattern?.css || "color:inherit", "color:inherit");
+      return `%c${m}%c`;
+    });
+    const maskedArgs = args.length > 0 ? args.map((a) => mask(a)) : args;
     console[method](
-      `%c${ts}%c ${icon} [${level.toUpperCase()}] %c${formattedMsg}`,
+      `%c${ts}%c ${icon} [${level.toUpperCase()}] %c${formatted}`,
       "color:#9ca3af",
       "",
       "color:inherit",
@@ -303,31 +160,65 @@ function log(level: LogLevel, msg: string, args: unknown[]) {
       ...maskedArgs,
     );
   } else {
-    const coloredMsg = formatMessage(maskedMsg).replace(/\n/g, " ");
-    const argsStr = maskedArgs
-      .map((a) => {
-        if (a instanceof Error) return `\n${pc.red(a.stack || a.message)}`;
-        if (typeof a === "object") return JSON.stringify(a).replace(/\n/g, " ");
-        return String(a);
-      })
-      .join(" ");
-
-    console[method](
-      `${pc.dim(ts)} ${pc.bold(icon)} [${level.toUpperCase().padEnd(5)}] ${coloredMsg} ${argsStr}`,
-    );
-
-    // Send to server audit engine — use startup buffer if engine not ready yet
-    if (serverEngine) {
-      serverEngine.enqueue(level, maskedMsg, maskedArgs);
-    } else {
-      startupBuffer.push({ level, msg: maskedMsg, args: maskedArgs });
+    const maskedArgs = args.length > 0 ? args.map((a) => mask(a)) : args;
+    const colored = formatAnsi(msg).replace(/\n/g, " ");
+    let argsStr = "";
+    if (maskedArgs.length > 0) {
+      argsStr =
+        " " +
+        maskedArgs
+          .map((a) => {
+            if (a instanceof Error) return `\n${pc.red(a.stack || a.message)}`;
+            if (typeof a === "object" && a !== null) return JSON.stringify(a).replace(/\n/g, " ");
+            return String(a);
+          })
+          .join(" ");
     }
+    console[method](
+      `${pc.dim(ts)} ${pc.bold(icon)} [${level.toUpperCase().padEnd(5)}] ${colored}${argsStr}`,
+    );
   }
 }
 
-// --- Public API ---
+// ── Once-per-process keys (boot chatter, not per-request spam) ─────────────
+const ONCE_KEYS = new Set<string>();
 
+function isEnabled(level: LogLevel): boolean {
+  if (PRIORITY[level] > CURRENT_PRIORITY) return false;
+  if (!IS_BROWSER && IS_QUIET && !IS_BENCHMARK_DEBUG && PRIORITY[level] > PRIORITY.warn) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Log at most once per process for a stable key.
+ * Use for boot banners ("watcher started"), not for per-request diagnostics.
+ * Returns true when the message was actually emitted (fresh key + level enabled).
+ */
+function once(key: string, level: LogLevel, msg: string, ...args: unknown[]): boolean {
+  if (ONCE_KEYS.has(key) || !isEnabled(level)) return false;
+  ONCE_KEYS.add(key);
+  log(level, msg, args);
+  return true;
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────
 export const logger = {
+  /** Current max level name (env-resolved at module load). */
+  get level(): LogLevel {
+    return CURRENT_LOG_LEVEL;
+  },
+
+  /** Cheap gate — use before building expensive messages/args. */
+  isEnabled,
+
+  /** Alias for isEnabled — reads well as `if (logger.isLevel("debug"))`. */
+  isLevel: isEnabled,
+
+  /** Log once per process key (boot / singleton notices). */
+  once,
+
   fatal: (m: string, ...a: unknown[]) => log("fatal", m, a),
   error: (m: string, ...a: unknown[]) => log("error", m, a),
   warn: (m: string, ...a: unknown[]) => log("warn", m, a),
@@ -342,13 +233,16 @@ export const logger = {
     info: (m: string, ...a: unknown[]) => log("info", `[${name}] ${m}`, a),
     debug: (m: string, ...a: unknown[]) => log("debug", `[${name}] ${m}`, a),
     trace: (m: string, ...a: unknown[]) => log("trace", `[${name}] ${m}`, a),
+    once: (key: string, level: LogLevel, m: string, ...a: unknown[]) =>
+      once(`${name}:${key}`, level, `[${name}] ${m}`, ...a),
+    isEnabled,
   }),
 
   dump: (data: unknown, label?: string) => {
     if (PRIORITY.trace > CURRENT_PRIORITY) return;
     const prefix = label ? `DUMP[${label}]` : "DUMP";
     if (IS_BROWSER) {
-      console.group(`🔍 ${prefix}`);
+      console.group(`\u{1F50D} ${prefix}`);
       console.dir(mask(data), { depth: null });
       console.groupEnd();
     } else {

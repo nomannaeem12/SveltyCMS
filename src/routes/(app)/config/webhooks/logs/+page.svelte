@@ -6,7 +6,7 @@
 import { onMount } from "svelte";
 import { fetchApi } from "@utils/api";
 import { toast } from "@src/stores/toast.svelte";
-import { formatDate } from "@utils/date";
+import { formatDisplayDate } from "@utils/date";
 import Badge from '@components/ui/badge.svelte';
 import Button from '@components/ui/button.svelte';
 import Loader from '@components/ui/loader.svelte';
@@ -62,31 +62,34 @@ onMount(loadLogs);
 	>
 	{#snippet actions()}
 		<div class="flex items-center gap-3">
-			<Select
-				bind:value={filterStatus}
-				options={statusOptions}
-				size="sm"
-				class="min-w-44"
-				onchange={() => loadLogs()}
-			/>
-			<Button variant="ghost" onclick={loadLogs} disabled={isLoading} leadingIcon="mdi:refresh">
+			<div data-testid="webhook-logs-filter">
+				<Select
+					bind:value={filterStatus}
+					options={statusOptions}
+					size="sm"
+					class="min-w-44"
+					onchange={() => loadLogs()}
+				/>
+			</div>
+			<Button variant="ghost" onclick={loadLogs} disabled={isLoading} leadingIcon="mdi:refresh" data-testid="webhook-logs-refresh">
 				Refresh
 			</Button>
 		</div>
 	{/snippet}
 
+	<div data-testid="webhook-logs-page" class="contents">
 	{#if isLoading}
-		<AdminCard class="flex h-64 items-center justify-center border border-surface-200 bg-white p-6 dark:border-surface-800 dark:bg-surface-900/40">
+		<AdminCard class="flex h-64 items-center justify-center border border-surface-200 bg-white p-6 dark:border-surface-800 dark:bg-surface-900/40" data-testid="webhook-logs-loading">
 			<Loader variant="text" lines={2} lastLineWidth="40%" ariaLabel="Loading delivery logs" />
 		</AdminCard>
 	{:else if logs.length === 0}
-		<AdminCard class="border-2 border-dashed border-surface-300 p-12 text-center dark:border-surface-700">
+		<AdminCard class="border-2 border-dashed border-surface-300 p-12 text-center dark:border-surface-700" data-testid="webhook-logs-empty">
 			<iconify-icon icon="mdi:webhook" width="64" class="mx-auto mb-4 opacity-20"></iconify-icon>
 			<h3 class="text-xl font-semibold text-surface-900 dark:text-white">No logs found</h3>
 			<p class="text-surface-500">Webhook delivery attempts will appear here.</p>
 		</AdminCard>
 	{:else}
-		<AdminCard class="overflow-hidden border border-surface-200 bg-white p-0 shadow-xs backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/40">
+		<AdminCard class="overflow-hidden border border-surface-200 bg-white p-0 shadow-xs backdrop-blur-md dark:border-surface-800 dark:bg-surface-900/40" data-testid="webhook-logs-table">
 			<div class="overflow-x-auto w-full">
 				<table class="w-full border-collapse text-sm">
 					<thead>
@@ -100,7 +103,7 @@ onMount(loadLogs);
 						</tr>
 					</thead>
 					<tbody class="divide-y divide-surface-100 dark:divide-surface-800/60">
-						{#each logs as log}
+						{#each logs as log (log._id)}
 							<tr class="text-surface-700 transition-colors hover:bg-surface-50/40 dark:text-surface-200 dark:hover:bg-surface-900/30">
 								<td class="px-4 py-3">
 									<div class="font-medium">{log.payload?.webhook?.name}</div>
@@ -116,7 +119,7 @@ onMount(loadLogs);
 									{/if}
 								</td>
 								<td class="px-4 py-3">{log.attempts} / {log.maxAttempts || 5}</td>
-								<td class="px-4 py-3">{formatDate(log.updatedAt)}</td>
+								<td class="px-4 py-3">{formatDisplayDate(log.updatedAt)}</td>
 								<td class="max-w-xs truncate px-4 py-3 font-mono text-xs text-error-500">
 									{log.lastError || '-'}
 								</td>
@@ -134,4 +137,5 @@ onMount(loadLogs);
 			</div>
 		</AdminCard>
 	{/if}
+	</div>
 </AdminPageShell>

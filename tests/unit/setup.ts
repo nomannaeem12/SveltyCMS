@@ -6,6 +6,7 @@
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 import { CORE_WIDGETS, CUSTOM_WIDGETS } from "./widgets/widget-constants";
+import { widgetNameToFolder } from "@src/widgets/widget-naming";
 
 const isBun = typeof Bun !== "undefined";
 
@@ -19,8 +20,18 @@ const isBenchmark =
   process.env.BENCHMARK_STABLE === "true" ||
   currentTest?.includes("benchmark");
 
+// Quiet progress loggers (compile, etc.) for all unit runs — not just benchmarks.
+(globalThis as any).__SVELTY_QUIET__ = true;
+process.env.TEST_MODE = process.env.TEST_MODE || "true";
 if (isBenchmark) {
-  (globalThis as any).__SVELTY_QUIET__ = true;
+  process.env.BENCHMARK_MODE = process.env.BENCHMARK_MODE || "true";
+}
+
+import { argvIncludesRealDbTest } from "../helpers/real-db-test-markers";
+
+/** DB roundtrip tests need the real adapter stack — disable global mocks when detected on CLI. */
+if (argvIncludesRealDbTest()) {
+  process.env.BUN_TEST_MOCKS = "false";
 }
 
 const ENABLE_MOCKS = process.env.BUN_TEST_MOCKS !== "false";
@@ -124,13 +135,37 @@ if (isBun) {
     importActual: (path: string) => import(`${path}?bun-unmock=${Date.now()}`),
   };
 
-  setGlobal("vi", viShim);
-  setGlobal("vitest", viShim);
+  // Bun 1.3+ ships a partial built-in `vitest.vi` (timers/fn) that lacks stubGlobal.
+  // Prefer merging our shim onto any existing Bun vi so `import { vi } from "vitest"` works.
+  const mergeVi = (target: Record<string, any> | null | undefined) => {
+    if (!target || typeof target !== "object") return viShim;
+    for (const [k, v] of Object.entries(viShim)) {
+      if (typeof target[k] === "undefined") {
+        try {
+          Object.defineProperty(target, k, {
+            value: v,
+            writable: true,
+            configurable: true,
+            enumerable: true,
+          });
+        } catch {
+          target[k] = v;
+        }
+      }
+    }
+    return target;
+  };
+
+  // Patch global early
+  mergeVi((globalThis as any).vi);
+  setGlobal("vi", mergeVi((globalThis as any).vi) || viShim);
+  setGlobal("vitest", (globalThis as any).vi);
 
   const vitestMock = {
     ...bunTest,
-    vi: viShim,
-    vitest: viShim,
+    ...viShim,
+    vi: (globalThis as any).vi || viShim,
+    vitest: (globalThis as any).vi || viShim,
     describe: bunTest.describe,
     it: bunTest.it,
     test: bunTest.test,
@@ -139,14 +174,29 @@ if (isBun) {
     afterEach: bunTest.afterEach,
     beforeAll: bunTest.beforeAll,
     afterAll: bunTest.afterAll,
-    default: { ...bunTest, vi: viShim },
+    default: { ...bunTest, vi: (globalThis as any).vi || viShim },
   };
 
-  bunTest.mock.module("vitest", () => vitestMock);
+  bunTest.mock.module("vitest", () => {
+    // Re-merge every resolution in case Bun recreated its partial vi
+    if (vitestMock.vi) mergeVi(vitestMock.vi as Record<string, any>);
+    return vitestMock;
+  });
   try {
     const vitestPath = import.meta.resolve("vitest");
-    bunTest.mock.module(vitestPath, () => vitestMock);
+    bunTest.mock.module(vitestPath, () => {
+      if (vitestMock.vi) mergeVi(vitestMock.vi as Record<string, any>);
+      return vitestMock;
+    });
   } catch {}
+
+  // Best-effort: patch the already-resolved package export object
+  try {
+    const resolved = require("vitest") as { vi?: Record<string, any> };
+    if (resolved?.vi) mergeVi(resolved.vi);
+  } catch {
+    /* ignore */
+  }
 
   (globalThis as any).mock = bunTest.mock;
   if (!globalThis.describe) setGlobal("describe", bunTest.describe);
@@ -163,32 +213,39 @@ if (isBun) {
   });
 }
 
+// All test files on the CLI — not only the first match (multi-file `bun test` runs)
+const testFileArgs = process.argv.filter(
+  (arg) => arg.endsWith(".test.ts") || arg.endsWith(".bun.test.ts"),
+);
+
 // Normalized backslashes for Windows
 const isTestTarget = (path: string) => {
-  // Normalize backslashes for Windows
   const normalizedPath = path.replace(/\\/g, "/");
-  const normalizedCurrentTest = currentTest ? currentTest.replace(/\\/g, "/") : "";
+  const targetPart = path.split("/").pop()?.replace(".ts", "") || "___NON_EXISTENT___";
 
-  if (normalizedCurrentTest.includes("security-response-service")) {
-    if (normalizedPath.includes("security-response-service")) return true;
+  const matchesTestFile = (normalizedTestPath: string) => {
+    if (
+      normalizedTestPath.includes("security-response-service") &&
+      normalizedPath.includes("security-response-service")
+    ) {
+      return true;
+    }
+    return normalizedTestPath.includes(targetPart);
+  };
+
+  for (const testArg of testFileArgs) {
+    if (matchesTestFile(testArg.replace(/\\/g, "/"))) return true;
   }
+
   if (!isBun && vitest?.expect) {
     try {
       const { testPath } = (vitest.expect as any).getState();
-      if (testPath) {
-        const normalizedTestPath = testPath.replace(/\\/g, "/");
-        if (normalizedTestPath.includes("security-response-service")) {
-          if (normalizedPath.includes("security-response-service")) return true;
-        }
-        // Use testPath as the primary source of truth if available
-        const targetPart = path.split("/").pop()?.replace(".ts", "") || "___NON_EXISTENT___";
-        return normalizedTestPath.includes(targetPart);
-      }
+      if (testPath && matchesTestFile(testPath.replace(/\\/g, "/"))) return true;
     } catch {}
   }
-  // Fallback to simpler check for path using global currentTest
-  const targetPart = path.split("/").pop()?.replace(".ts", "") || "___NON_EXISTENT___";
-  return currentTest && currentTest.includes(targetPart);
+
+  const normalizedCurrentTest = currentTest ? currentTest.replace(/\\/g, "/") : "";
+  return normalizedCurrentTest ? matchesTestFile(normalizedCurrentTest) : false;
 };
 
 // --- TOP LEVEL MOCKS (Hoisted) ---
@@ -430,7 +487,20 @@ moduleMock("@src/databases/cache/types", () => ({
   default: CacheCategory,
 }));
 
+const mockOnceKeys = new Set<string>();
 const mockLogger = {
+  level: "info" as const,
+  isEnabled: mock((level: string) => {
+    const order = ["none", "fatal", "error", "warn", "info", "debug", "trace"];
+    return order.indexOf(level) <= order.indexOf("info") && order.indexOf(level) > 0;
+  }),
+  isLevel: mock((level: string) => mockLogger.isEnabled(level)),
+  once: mock((key: string, level: string, msg: string, ...args: any[]) => {
+    if (mockOnceKeys.has(key)) return;
+    mockOnceKeys.add(key);
+    const fn = (mockLogger as any)[level];
+    if (typeof fn === "function") fn(msg, ...args);
+  }),
   fatal: mock((msg: any) => {
     if (process.env.VERBOSE_TESTS) console.error(`[FATAL] ${msg}`);
   }),
@@ -443,7 +513,12 @@ const mockLogger = {
   info: mock(() => {}),
   debug: mock(() => {}),
   trace: mock(() => {}),
-  channel: mock(() => mockLogger),
+  channel: mock((name: string) => ({
+    ...mockLogger,
+    once: mock((key: string, level: string, msg: string, ...args: any[]) =>
+      mockLogger.once(`${name}:${key}`, level, msg, ...args),
+    ),
+  })),
   dump: mock(() => {}),
 };
 
@@ -860,12 +935,17 @@ const wrapError = (error: any, message = "An unexpected error occurred", status 
   return new AppError(finalMessage, status, "INTERNAL_ERROR", error);
 };
 
-moduleMock("@src/utils/error-handling", () => ({
+/** Shared mock factory for error-handling (must export rethrow — media handlers import it). */
+const createErrorHandlingMock = () => ({
   AppError,
   isAppError,
   isHttpError,
   getErrorMessage,
   wrapError,
+  // Match production rethrow: only re-throw framework redirects/HTTP errors
+  rethrow: (err: unknown) => {
+    if (isHttpError(err)) throw err;
+  },
   handleApiError: mock((err: any) => {
     const status = err?.status || (isHttpError(err) ? (err as any).status : 500);
     // Don't log expected errors during tests unless requested
@@ -892,40 +972,10 @@ moduleMock("@src/utils/error-handling", () => ({
       },
     );
   }),
-}));
-moduleMock("@utils/error-handling", () => ({
-  AppError,
-  isAppError,
-  isHttpError,
-  getErrorMessage,
-  wrapError,
-  handleApiError: mock((err: any) => {
-    const status = err?.status || (isHttpError(err) ? (err as any).status : 500);
-    // Don't log expected errors during tests unless requested
-    if (status >= 500 && process.env.VERBOSE_TEST !== "true") {
-      // Quiet mode for tests
-    } else if (status >= 500) {
-      console.error("--- handleApiError Details:", {
-        message: getErrorMessage(err),
-        status,
-        code: err?.code,
-        stack: err instanceof Error ? err.stack : undefined,
-        err,
-      });
-    }
-    return new Response(
-      JSON.stringify({
-        success: false,
-        message: getErrorMessage(err),
-        code: err?.code || (isHttpError(err) ? `HTTP_${err.status}` : "INTERNAL_ERROR"),
-      }),
-      {
-        status,
-        headers: { "Content-Type": "application/json" },
-      },
-    );
-  }),
-}));
+});
+
+moduleMock("@src/utils/error-handling", createErrorHandlingMock);
+moduleMock("@utils/error-handling", createErrorHandlingMock);
 
 // ============================================================================
 // WIDGET INFRASTRUCTURE MOCKS
@@ -977,8 +1027,12 @@ if (isBun && !isBenchmark && ENABLE_MOCKS) {
     return {
       coreModules,
       customModules,
+      marketplaceModules: {},
+      widgetComponents: {},
       allWidgetModules,
+      getComponentLoader: () => null,
       getWidgetNameFromPath: (p: string) => p.split("/").at(-2) || null,
+      widgetNameToFolder,
     };
   };
 
@@ -1107,21 +1161,53 @@ setGlobal("metricsService", mockMetricsService);
 
 const cacheMock = {
   get: mock(async () => null),
+  getSync: mock(() => null),
   getMany: mock(async (keys: string[]) => Array(keys.length).fill(null)),
   set: mock(async () => {}),
   setWithCategory: mock(async () => {}),
   delete: mock(async () => {}),
   clearByPattern: mock(async () => true),
+  clearByTags: mock(async () => {}),
   invalidateAll: mock(async () => {}),
   invalidateByCategory: mock(async () => {}),
+  invalidateCollection: mock(async () => {}),
   reconfigure: mock(async () => true),
+  initialize: mock(async () => true),
+  cleanup: mock(async () => {}),
+  generateKey: mock((key: string, tenantId?: string | null) => {
+    const tid =
+      tenantId === undefined || tenantId === null || tenantId === "" ? "default" : String(tenantId);
+    return `tenant:${tid}:${key}`;
+  }),
+  isNegativeHit: mock(() => false),
+  recordMiss: mock(() => {}),
+  setBootstrapping: mock(() => {}),
+  isBootstrapping: mock(() => false),
+  getRedisClient: mock(() => null),
+  getStats: mock(() => ({
+    hits: 0,
+    misses: 0,
+    evictions: 0,
+    l1Hits: 0,
+    l2Hits: 0,
+    l1Size: 0,
+    size: 0,
+    deletes: 0,
+  })),
+  computeETag: mock(() => '"mock-etag"'),
+  registerPrefetchPattern: mock(() => {}),
+  getGlobalVersion: mock(async () => 0),
+  incrementGlobalVersion: mock(async () => 1),
 };
 setGlobal("cacheService", cacheMock);
-if (!isTestTarget("cache-service")) {
+// Whitebox suites that exercise the real CacheService (not cacheMock):
+// cache-service.test.ts, credential-auth-cache.test.ts
+if (!isTestTarget("cache-service") && !isTestTarget("credential-auth-cache")) {
   moduleMock("@src/databases/cache/cache-service", () => ({
     cacheService: cacheMock,
     default: cacheMock,
     CacheCategory,
+    CacheService: class CacheServiceMock {},
     getSessionCacheTTL: mock(() => 3600),
     getUserPermCacheTTL: mock(() => 60),
     getApiCacheTTL: mock(() => 300),
@@ -1141,7 +1227,12 @@ moduleMock("sharp", () => {
   const sharpInstance: any = {
     metadata: mock(() => Promise.resolve({ width: 100, height: 100, format: "jpeg" })),
     resize: mock(() => sharpInstance),
-    toBuffer: mock(() => Promise.resolve(Buffer.from("mock-buffer"))),
+    // Support both Buffer and { data, info } (resolveWithObject) return shapes
+    toBuffer: mock((opts?: { resolveWithObject?: boolean }) =>
+      opts?.resolveWithObject
+        ? Promise.resolve({ data: Buffer.from("mock-buffer"), info: { size: 42 } })
+        : Promise.resolve(Buffer.from("mock-buffer")),
+    ),
     jpeg: mock(() => sharpInstance),
     webp: mock(() => sharpInstance),
     avif: mock(() => sharpInstance),
@@ -1152,6 +1243,12 @@ moduleMock("sharp", () => {
     extract: mock(() => sharpInstance),
     modulate: mock(() => sharpInstance),
     png: mock(() => sharpInstance),
+    linear: mock(() => sharpInstance),
+    grayscale: mock(() => sharpInstance),
+    greyscale: mock(() => sharpInstance),
+    recomb: mock(() => sharpInstance),
+    blur: mock(() => sharpInstance),
+    ensureAlpha: mock(() => sharpInstance),
   };
   sharpInstance.clone = mock(() => sharpInstance);
   const sharpMock = mock(() => sharpInstance);
@@ -1408,6 +1505,7 @@ const dbFactory = () => ({
   resetDbInitPromise: mock(() => {}),
   dbInitPromise: Promise.resolve({}),
   isDbConnected: mock(() => true),
+  shutdownSystem: mock(() => Promise.resolve()),
   default: dbMock,
 });
 
@@ -1519,15 +1617,19 @@ const mockSetupCheck = {
     );
   }),
 };
-moduleMock("@utils/setup-check", () => mockSetupCheck);
-moduleMock("@src/utils/setup-check", () => mockSetupCheck);
+moduleMock("@utils/server/setup-check", () => mockSetupCheck);
+moduleMock("@src/utils/server/setup-check", () => mockSetupCheck);
 setGlobal("mockSetupCheck", mockSetupCheck);
 
 moduleMock("@src/widgets/scanner", () => ({
   coreModules: {},
   customModules: {},
+  marketplaceModules: {},
+  widgetComponents: {},
   allWidgetModules: {},
+  getComponentLoader: () => null,
   getWidgetNameFromPath: (path: string) => path.split("/").at(-2) || null,
+  widgetNameToFolder,
 }));
 
 moduleMock("@node-saml/node-saml", () => ({
@@ -1570,10 +1672,21 @@ const mockLookup = mock(async (hostname: string) => {
   return { address: ip, family: 4 };
 });
 
+// Provide execSync/spawnSync so accidental imports (or suite argv leakage) do not
+// throw "Export named 'execSync' not found" under the unit mock layer.
+const mockExecSync = mock(() => Buffer.from(""));
+const mockSpawnSync = mock(() => ({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }));
 moduleMock("node:child_process", () => ({
   spawn: mockSpawn,
   exec: mockExec,
-  default: { spawn: mockSpawn, exec: mockExec },
+  execSync: mockExecSync,
+  spawnSync: mockSpawnSync,
+  default: {
+    spawn: mockSpawn,
+    exec: mockExec,
+    execSync: mockExecSync,
+    spawnSync: mockSpawnSync,
+  },
 }));
 
 moduleMock("node:dns/promises", () => ({
@@ -1590,7 +1703,11 @@ if (!isTestTarget("metrics-service")) {
   setGlobal("metricsService", mockMetricsService);
 }
 
-if (!isTestTarget("security-response-service")) {
+const includesSecurityResponseServiceTest = process.argv.some((arg) =>
+  arg.replace(/\\/g, "/").includes("security-response-service"),
+);
+
+if (!includesSecurityResponseServiceTest && !isTestTarget("security-response-service")) {
   try {
     const rsPath = import.meta.resolve("@src/services/security/response-service");
     mock.module(rsPath, () => ({

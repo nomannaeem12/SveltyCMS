@@ -4,9 +4,9 @@
  * Optimized API Gatekeeper using dynamic chunked dispatching and fail-closed endpoint authorization.
  */
 
+import { logger } from "@utils/logger";
 import { json, type RequestEvent } from "@sveltejs/kit";
-import { dev } from "$app/environment";
-import { createHash } from "node:crypto";
+import { xxhash64 } from "hash-wasm";
 import { validateCsrfForRequest } from "@utils/security/csrf-utils";
 import { apiHandler } from "@utils/api-handler";
 import { AppError } from "@utils/error-handling";
@@ -17,6 +17,7 @@ import { isPublicRoute } from "@src/utils/hook-utils";
 import { cacheService } from "@src/databases/cache/cache-service";
 import { hasPermissionWithRoles } from "@src/databases/auth/permissions";
 import { SESSION_COOKIE_NAME } from "@src/databases/auth/constants";
+import { getCorsHeaders } from "@utils/security/cors-utils";
 
 // Dynamic handlers map for build-time tree-shaking.
 // Hot handlers (collections, content, auth, system) are eager-preloaded at import
@@ -24,6 +25,7 @@ import { SESSION_COOKIE_NAME } from "@src/databases/auth/constants";
 const HANDLERS: Record<string, () => Promise<any>> = {
   auth: () => import("./handlers/auth"),
   collections: () => import("./handlers/collections"),
+  "virtual-collections": () => import("./handlers/virtual-collections"),
   content: () => import("./handlers/content"),
   dashboard: () => import("./handlers/dashboard"),
   media: () => import("./handlers/media"),
@@ -34,6 +36,16 @@ const HANDLERS: Record<string, () => Promise<any>> = {
   utility: () => import("./handlers/utility"),
   setup: () => import("./handlers/setup"),
   version: () => import("./handlers/version"),
+  database: () => import("./handlers/database"),
+  logs: () => import("./handlers/logs"),
+  "api-keys": () => import("./handlers/api-keys"),
+  config: () => import("./handlers/config"),
+  "content-transfer": () => import("./handlers/content-transfer"),
+  migrations: () => import("./handlers/migrations"),
+  importers: () => import("./handlers/importers"),
+  backups: () => import("./handlers/backups"),
+  "content-sync": () => import("./handlers/content-sync"),
+  gdpr: () => import("./handlers/gdpr"),
 };
 
 // Eager-preload hot handlers on first request (lazy-init to not break unit test mocks).
@@ -47,7 +59,9 @@ function ensureHotPreload() {
       HANDLERS.auth(),
       HANDLERS.system(),
       HANDLERS.tokens(),
-    ]).catch(() => {});
+    ])
+      .then(() => {})
+      .catch(() => {});
   }
   return _hotPreload;
 }
@@ -58,6 +72,10 @@ const NAMESPACE_CONFIG: Record<string, { handler: string; fn: string }> = {
   user: { handler: "auth", fn: "handleAuthUserRoutes" },
   permission: { handler: "auth", fn: "handlePermissionRoutes" },
   collections: { handler: "collections", fn: "handleCollectionsRoutes" },
+  "virtual-collections": {
+    handler: "virtual-collections",
+    fn: "handleVirtualCollectionsRoutes",
+  },
   content: { handler: "content", fn: "handleContentRoutes" },
   "content-structure": { handler: "content", fn: "handleContentRoutes" },
   widgets: { handler: "system", fn: "handleSystemRoutes" },
@@ -70,9 +88,9 @@ const NAMESPACE_CONFIG: Record<string, { handler: string; fn: string }> = {
   settings: { handler: "system", fn: "handleSettingsRoutes" },
   "system-settings": { handler: "system", fn: "handleSettingsRoutes" },
   importer: { handler: "system", fn: "handleImporterRoutes" },
-  "import-data": { handler: "system", fn: "handleImporterRoutes" },
   ai: { handler: "system", fn: "handleAiRoutes" },
   automations: { handler: "system", fn: "handleAutomationRoutes" },
+  workflows: { handler: "system", fn: "handleWorkflowRoutes" },
   setup: { handler: "setup", fn: "handleSetupRoutes" },
   export: { handler: "system", fn: "handleExportRoutes" },
   import: { handler: "system", fn: "handleImportRoutes" },
@@ -92,11 +110,13 @@ const NAMESPACE_CONFIG: Record<string, { handler: string; fn: string }> = {
   cache: { handler: "utility", fn: "handleUtilityRoutes" },
   marketplace: { handler: "utility", fn: "handleUtilityRoutes" },
   "version-check": { handler: "utility", fn: "handleUtilityRoutes" },
-  config_sync: { handler: "utility", fn: "handleUtilityRoutes" },
   "send-mail": { handler: "utility", fn: "handleUtilityRoutes" },
   trash: { handler: "utility", fn: "handleUtilityRoutes" },
   debug: { handler: "utility", fn: "handleUtilityRoutes" },
   "openapi.json": { handler: "utility", fn: "handleUtilityRoutes" },
+  database: { handler: "database", fn: "handleDatabaseRoutes" },
+  logs: { handler: "logs", fn: "handleLogsRoutes" },
+  "api-keys": { handler: "api-keys", fn: "handleApiKeyRoutes" },
   webhooks: { handler: "system", fn: "handleWebhookRoutes" },
   "system-webhooks": { handler: "system", fn: "handleWebhookRoutes" },
   "system-virtual-folder": {
@@ -110,12 +130,34 @@ const NAMESPACE_CONFIG: Record<string, { handler: string; fn: string }> = {
   version: { handler: "version", fn: "handleVersionRoutes" },
   graphql: { handler: "content", fn: "handleGraphqlRoutes" },
   "system-jobs": { handler: "system", fn: "handleSystemJobRoutes" },
+
+  // Data Operations (Phase 1)
+  config: { handler: "config", fn: "handleConfigRoutes" },
+  "content-export": { handler: "content-transfer", fn: "handleContentExportRoutes" },
+  "content-import": { handler: "content-transfer", fn: "handleContentImportRoutes" },
+  migrations: { handler: "migrations", fn: "handleMigrationRoutes" },
+  importers: { handler: "importers", fn: "handleImporterRoutes" },
+  backups: { handler: "backups", fn: "handleBackupRoutes" },
+  "content-sync": { handler: "content-sync", fn: "handleContentSyncRoutes" },
+
+  // Plugin Settings (encrypted, per-tenant, per-plugin)
+  "plugin-settings": { handler: "system", fn: "handlePluginSettingsRoutes" },
+
+  // GDPR Right to Access / Erasure (self or admin)
+  gdpr: { handler: "gdpr", fn: "handleGdprRoutes" },
+
+  // Deprecated Aliases
+  "import-data": { handler: "importers", fn: "handleImporterRoutes" },
+  config_sync: { handler: "config", fn: "handleConfigRoutes" },
+  "config-sync": { handler: "config", fn: "handleConfigRoutes" },
 };
 
 // Fail-closed mapping of namespaces/methods to core SveltyCMS permission IDs
 const ENDPOINT_PERMISSIONS: Record<string, string | ((method: string) => string)> = {
   collections: (method: string) =>
     ["GET", "OPTIONS"].includes(method) ? "collections:read" : "collections:write",
+  "virtual-collections": (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "collection:read" : "collection:write",
   content: (method: string) =>
     ["GET", "OPTIONS"].includes(method) ? "collection:read" : "collection:write",
   "content-structure": (method: string) =>
@@ -144,6 +186,8 @@ const ENDPOINT_PERMISSIONS: Record<string, string | ((method: string) => string)
   export: "config:importexport",
   ai: "system:settings",
   automations: "config:automations",
+  workflows: (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "config:automations" : "config:automations",
   theme: (method: string) =>
     ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
   "system-preferences": (method: string) =>
@@ -158,10 +202,42 @@ const ENDPOINT_PERMISSIONS: Record<string, string | ((method: string) => string)
   systemVirtualFolder: "system:settings",
   version: (method: string) =>
     ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
+  "version-check": (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
   permission: "system:admin",
   "system-jobs": (method: string) =>
     ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
   dashboard: "dashboard:read",
+  "openapi.json": (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
+  database: (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
+  logs: "system:admin",
+  "api-keys": (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "system:read" : "system:settings",
+
+  // Data Operations permissions
+  config: (method: string) => (method === "POST" ? "config:write" : "config:read"),
+  "content-export": (method: string) => (method === "POST" ? "content:export" : "content:read"),
+  "content-import": (method: string) => (method === "POST" ? "content:import" : "content:read"),
+  migrations: (method: string) => (method === "POST" ? "migration:apply" : "migration:read"),
+  importers: (method: string) => (method === "POST" ? "content:import" : "content:read"),
+  backups: (method: string) => {
+    if (method === "OPTIONS") return "backup:read";
+    if (method === "GET") return "backup:read";
+    if (method === "POST") return "backup:create";
+    return "backup:read";
+  },
+  "content-sync": (method: string) => (method === "POST" ? "content:sync" : "content:read"),
+  config_sync: (method: string) => (method === "POST" ? "config:write" : "config:read"),
+  "config-sync": (method: string) => (method === "POST" ? "config:write" : "config:read"),
+
+  // Plugin Settings (encrypted per-tenant settings, gated behind plugin:settings:manage)
+  "plugin-settings": (method: string) =>
+    ["GET", "OPTIONS"].includes(method) ? "plugin:settings:manage" : "plugin:settings:manage",
+
+  // GDPR — authenticated self-service (handler enforces self-or-admin)
+  gdpr: (method: string) => (["GET", "OPTIONS"].includes(method) ? "user:read" : "user:write"),
 };
 
 /**
@@ -185,6 +261,11 @@ function checkEndpointPermission(
   }
 
   // User management endpoints
+  // GDPR self-service: any authenticated user; handler enforces self-or-admin
+  if (namespace === "gdpr") {
+    return true;
+  }
+
   if (namespace === "user" || namespace === "auth") {
     const action = segments[1];
     // Public / self endpoints are allowed
@@ -193,6 +274,9 @@ function checkEndpointPermission(
       action === "me" ||
       action === "login" ||
       action === "logout" ||
+      action === "oidc-logout" ||
+      action === "frontchannel-logout" ||
+      action === "backchannel-logout" ||
       action === "saml" ||
       action === "2fa"
     ) {
@@ -200,7 +284,9 @@ function checkEndpointPermission(
     }
     // If updating user attributes or saving avatar on self:
     if (
-      (action === "update-user-attributes" || action === "save-avatar") &&
+      (action === "update-user-attributes" ||
+        action === "save-avatar" ||
+        action === "delete-avatar") &&
       segments.length === 2
     ) {
       return true;
@@ -239,11 +325,11 @@ const _noCacheHeaders = Object.freeze({
  * Main API Dispatcher - Exported for internal testing only
  */
 export const _handler = async (event: RequestEvent) => {
-  if (process.env.BENCHMARK_DEBUG === "true") console.log(`🔥 Dispatcher: ${event.url.pathname}`);
-  const { request, url, params, locals, cookies } = event;
+  if (process.env.BENCHMARK_DEBUG === "true") logger.debug(`🔥 Dispatcher: ${event.url.pathname}`);
+  const { request, url, locals, cookies } = event;
 
-  // 🚀 RESILIENCE: Derive path from URL if params are missing (common in Hook Bypasses)
-  const rawPath = params.path || url.pathname.replace(/^\/api\//, "");
+  // 🚀 RESILIENCE: Always derive path from URL pathname to prevent route leakage/pollution in pooled servers
+  const rawPath = url.pathname.replace(/^\/api\//, "");
 
   // 🚀 API VERSIONING: Strip /v1/ prefix for backward-compatible routing
   const versionedPath = rawPath.replace(/^v1\//, "");
@@ -263,9 +349,33 @@ export const _handler = async (event: RequestEvent) => {
 
   if (!namespace) return new Response("Not Found", { status: 404 });
 
+  // 🛡️ Global CORS Preflight handler
+  if (request.method.toUpperCase() === "OPTIONS") {
+    const origin = request.headers.get("Origin") || null;
+    const corsHeaders = getCorsHeaders(origin, true);
+    const responseHeaders: Record<string, string> = {};
+    if (corsHeaders) {
+      for (const [key, value] of Object.entries(corsHeaders)) {
+        if (value) responseHeaders[key] = value;
+      }
+    }
+    return new Response(null, {
+      status: 204,
+      headers: responseHeaders,
+    });
+  }
+
+  // ── Cached imports for hot paths (avoids dynamic import on every request) ────
+  let _getDatabaseResilience: any = null;
+
   // 🚀 HYPER-TURBO: Direct Health Check
   if (namespace === "system" && segments[1] === "health") {
     const connected = isDbConnected();
+    if (!_getDatabaseResilience) {
+      const mod = await import("@src/databases/database-resilience");
+      _getDatabaseResilience = mod.getDatabaseResilience;
+    }
+    const metrics = _getDatabaseResilience().getMetrics();
     return json(
       {
         status: connected ? "healthy" : "initializing",
@@ -275,6 +385,12 @@ export const _handler = async (event: RequestEvent) => {
         timestamp: Date.now(),
         dbType: process.env.DB_TYPE || "unknown",
         memory: process.memoryUsage(),
+        resilience: {
+          circuitState: metrics.circuitState,
+          totalRetries: metrics.totalRetries,
+          successfulReconnections: metrics.successfulReconnections,
+          averageRecoveryTime: metrics.averageRecoveryTime,
+        },
       },
       { status: connected ? 200 : 533 }, // Use 533 to differentiate from standard 503 if needed
     );
@@ -334,14 +450,31 @@ export const _handler = async (event: RequestEvent) => {
     }
   }
 
+  // 🧪 TEST-MODE BYPASS: Allow E2E/integration testing endpoints to bypass auth
+  // when x-test-mode and x-test-secret headers are present and valid.
+  // This is a defense-in-depth layer beneath the turbo-pipeline bypass,
+  // ensuring testing endpoints work even when the turbo pipeline hasn't
+  // populated locals (e.g., early in server startup or after hot-reload).
+  //
+  // ⚠️ Always apply for the testing namespace so x-test-tenant-id is
+  // respected even when an authenticated user session already exists
+  // (tenant-isolation tests need per-request tenant header overrides).
+  if (namespace === "testing" && !(locals as any).__testBypass) {
+    const { applyTestBypassFromRequest } = await import("@utils/test-bypass.server");
+    if (applyTestBypassFromRequest(request, locals as App.Locals)) {
+      if (!user) user = locals.user as any;
+      tenantId = (locals.tenantId as string) || tenantId;
+    }
+  }
+
   // Fail-closed authentication
   const isPublic = isPublicRoute(url.pathname, (locals as any).__testBypass === true);
-  if (!user && !isPublic) {
+  if (!user && !isPublic && request.method.toUpperCase() !== "OPTIONS") {
     throw new AppError("Authentication required", 401, "UNAUTHORIZED");
   }
 
   // Fail-closed authorization
-  if (!isPublic && !(locals as any).__testBypass) {
+  if (!isPublic && !(locals as any).__testBypass && request.method.toUpperCase() !== "OPTIONS") {
     const roles = locals.roles || [];
     if (!checkEndpointPermission(user, roles, request.method, namespace, segments)) {
       throw new AppError("Forbidden: Insufficient permissions", 403, "FORBIDDEN");
@@ -350,11 +483,15 @@ export const _handler = async (event: RequestEvent) => {
 
   // --- CSRF Protection ---
   if (
+    !isPublic &&
     !(locals as any).__testBypass &&
-    process.env.TEST_MODE !== "true" &&
-    ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)
+    (globalThis as any).process?.env?.TEST_MODE !== "true" &&
+    !(user as any)?.isApiKey &&
+    !(user as any)?.isApiToken &&
+    ["POST", "PUT", "PATCH", "DELETE"].includes(request.method.toUpperCase())
   ) {
-    const isSecure = url.protocol === "https:" || (!dev && url.hostname !== "localhost");
+    const { isSecureCookieContext } = await import("@src/databases/auth/constants");
+    const isSecure = isSecureCookieContext(url.protocol, url.hostname);
     const csrfResult = validateCsrfForRequest(cookies, request, isSecure);
     if (!csrfResult.isValid)
       throw new AppError(`Security violation: ${csrfResult.error}`, 403, "CSRF_VIOLATION");
@@ -372,13 +509,19 @@ export const _handler = async (event: RequestEvent) => {
     }
   }
 
-  // 🚀 PERFORMANCE: L1 Synchronous Cache Hit AFTER Auth
+  // 🚀 PERFORMANCE: L1 Synchronous Cache Hit AFTER Auth — pre-computed ETag avoids re-hash
   if (request.method === "GET") {
     const cached = cacheService.getSync?.(url.pathname + url.search, tenantId);
     if (cached) {
-      if (process.env.SVELTY_BENCHMARK_SUITE !== "true" && process.env.BENCHMARK !== "true") {
-        console.log(`[CacheHit] Hit: ${url.pathname + url.search}`);
+      // Per-request cache HIT is debug-only (default info/prod error stay quiet)
+      // Cache tuple { body, etag } — pre-computed, zero hash overhead
+      if (typeof cached === "object" && cached !== null && "body" in cached && "etag" in cached) {
+        const entry = cached as { body: string; etag: string };
+        return new Response(entry.body, {
+          headers: { ..._jsonHeaders, "X-Cache": "HIT-L1", ETag: entry.etag },
+        });
       }
+      // Legacy: plain string body
       if (typeof cached === "string") {
         return new Response(cached, {
           headers: { ..._jsonHeaders, "X-Cache": "HIT-L1" },
@@ -391,7 +534,10 @@ export const _handler = async (event: RequestEvent) => {
   }
 
   if (!NAMESPACE_CONFIG[namespace]) {
-    throw new AppError(`API Namespace "/api/${namespace}" not found`, 404, "NAMESPACE_NOT_FOUND");
+    // Fail-closed: unknown namespaces are Forbidden (not 404).
+    // Admin fast-path must not bypass this — avoids advertising valid vs invalid routes.
+    // Integration contract: tests/integration/databases/contract.test.ts Gate 5.
+    throw new AppError(`API Namespace "/api/${namespace}" not found`, 403, "NAMESPACE_FORBIDDEN");
   }
 
   // 🚀 Kick off hot-handler preload on first API request (non-blocking).
@@ -401,6 +547,14 @@ export const _handler = async (event: RequestEvent) => {
   const config = NAMESPACE_CONFIG[namespace];
   const handlerModule = await HANDLERS[config.handler]();
   const fn = handlerModule[config.fn];
+
+  if (typeof fn !== "function") {
+    throw new AppError(
+      `API Endpoint for namespace "/api/${namespace}" is not enabled or available in this environment`,
+      404,
+      "API_ENDPOINT_NOT_AVAILABLE",
+    );
+  }
 
   const response = await fn(event, cms, tenantId as DatabaseId, segments);
 
@@ -417,11 +571,37 @@ export const _handler = async (event: RequestEvent) => {
   const contentType = response.headers.get("content-type") || "";
   const isStreaming = contentType.includes("text/event-stream");
 
+  // ⚡ WEAK ETag FAST-PATH: Handler set apiDataHash on locals → skip body read entirely.
+  // Downstream handlers (collections, content) set this to a lightweight timestamp-based
+  // token (e.g. max updatedAt). The gateway uses it as a weak validator without cloning
+  // the response body, avoiding V8 string allocation and GC pressure on large payloads.
+  if (request.method === "GET" && response.status === 200 && !isStreaming) {
+    const apiDataHash = (event.locals as any).apiDataHash;
+    if (apiDataHash) {
+      const weakEtag = `W/"${apiDataHash}"`;
+      const ifNoneMatch = request.headers.get("if-none-match");
+
+      if (ifNoneMatch === weakEtag || ifNoneMatch === "*") {
+        return new Response(null, {
+          status: 304,
+          headers: {
+            ETag: weakEtag,
+            "Cache-Control": "private, must-revalidate",
+            "X-API-Version": "1",
+            "X-Cache": "WEAK-304",
+          },
+        });
+      }
+
+      response.headers.set("ETag", weakEtag);
+      response.headers.set("X-API-Version", "1");
+      response.headers.set("X-Cache", "WEAK-ETAG");
+      return response;
+    }
+  }
+
   // Cache successful GET responses AND compute ETag — read body ONCE for both
   if (request.method === "GET" && response.status === 200 && !isStreaming) {
-    const responseBody = await response.text(); // Single read for cache + ETag
-
-    // Cache write (fire-and-forget)
     const pathStr = url.pathname;
     const isCacheable =
       pathStr.includes("/api/collections") ||
@@ -432,16 +612,34 @@ export const _handler = async (event: RequestEvent) => {
       pathStr.includes("/api/navigation") ||
       pathStr.includes("/api/themes") ||
       pathStr.includes("/api/config");
-    if (isCacheable) {
+
+    // 🚀 HYPER-PERFORMANCE: Read body once for ETag — cache only if cacheable
+    const responseBody = await response.text();
+
+    // Compute ETag once — works for both cacheable (cache + 304) and non-cacheable (304 only)
+    let etag = "";
+    try {
+      etag = `"${await xxhash64(responseBody)}"`;
+    } catch {
+      // Hash unavailable — body served without ETag below
+    }
+
+    if (isCacheable && etag) {
+      // Only cache cacheable endpoints — non-cacheable still get ETag for 304 support
       const { CacheCategory } = await import("@src/databases/cache/types");
       cacheService
-        .set(url.pathname + url.search, responseBody, 300, tenantId, CacheCategory.API)
+        .set(
+          url.pathname + url.search,
+          { body: responseBody, etag },
+          300,
+          tenantId,
+          CacheCategory.API,
+        )
         .catch(() => {});
     }
 
     // ETag conditional response
-    try {
-      const etag = `"${createHash("sha256").update(responseBody).digest("hex").substring(0, 16)}"`;
+    if (etag) {
       const ifNoneMatch = request.headers.get("if-none-match");
 
       if (ifNoneMatch === etag || ifNoneMatch === "*") {
@@ -455,7 +653,7 @@ export const _handler = async (event: RequestEvent) => {
         });
       }
 
-      // Merge response headers with no-cache defaults + ETag — avoid new Headers() alloc
+      // Merge response headers with no-cache defaults + ETag
       const respHeaders: Record<string, string> = {
         ..._noCacheHeaders,
         ETag: etag,
@@ -468,20 +666,20 @@ export const _handler = async (event: RequestEvent) => {
         statusText: response.statusText,
         headers: respHeaders,
       });
-    } catch {
-      // Fallback: createHash unavailable (e.g., jsdom) — return body without ETag.
-      // responseBody was already read above; we must construct a new Response
-      // because the original response.body is now consumed/disturbed.
-      const fallbackHeaders: Record<string, string> = { ..._noCacheHeaders };
-      response.headers.forEach((val, key) => {
-        if (!fallbackHeaders[key]) fallbackHeaders[key] = val;
-      });
-      return new Response(responseBody, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: fallbackHeaders,
-      });
     }
+
+    // Hash unavailable — return body without ETag.
+    // responseBody was already read above; we must construct a new Response
+    // because the original response.body is now consumed/disturbed.
+    const fallbackHeaders: Record<string, string> = { ..._noCacheHeaders };
+    response.headers.forEach((val, key) => {
+      if (!fallbackHeaders[key]) fallbackHeaders[key] = val;
+    });
+    return new Response(responseBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: fallbackHeaders,
+    });
   }
 
   // Streaming or non-GET/non-200: add API version header, return response as-is
@@ -495,3 +693,12 @@ export const PUT = apiHandler(_handler);
 export const PATCH = apiHandler(_handler);
 export const DELETE = apiHandler(_handler);
 export const OPTIONS = apiHandler(_handler);
+
+/**
+ * Frozen list of catch-all API namespaces (for ownership / completeness tests).
+ * Underscore prefix required by SvelteKit (+server only allows HTTP handlers
+ * or `_`-prefixed private exports).
+ * When you add a namespace to NAMESPACE_CONFIG, unit ownership inventory will fail
+ * until a test owner is declared in tests/unit/api/namespace-ownership.test.ts.
+ */
+export const _API_NAMESPACE_KEYS: readonly string[] = Object.freeze(Object.keys(NAMESPACE_CONFIG));

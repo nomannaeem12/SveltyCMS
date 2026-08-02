@@ -42,7 +42,7 @@
 		entrylist_multibutton_viewing_active,
 		entrylist_multibutton_viewing_archived
 	} from '@src/paraglide/messages';
-	import { storeListboxValue } from '@src/stores/store.svelte';
+	import { app } from '@src/stores/store.svelte';
 	import { logger } from '@utils/logger';
 	import { toast } from '@src/stores/toast.svelte.ts';
 	import { onDestroy, onMount } from 'svelte';
@@ -189,7 +189,7 @@
 	const batchSizeLimit = $derived(isSlowConnection ? 10 : 50);
 
 	// --- Derived State ---
-	const currentAction = $derived((storeListboxValue.value as ActionType) || 'create');
+	const currentAction = $derived((app.listboxValueState as ActionType) || 'create');
 
 	const currentConfig = $derived.by(() => {
 		const config = ACTION_CONFIGS.find((c) => c.type === currentAction);
@@ -249,31 +249,31 @@
 	// Smart action selection based on selection state
 	$effect(() => {
 		if (isCollectionEmpty) {
-			storeListboxValue.set('create');
-			manualActionSet = false;
-			return;
-		}
+			app.listboxValueState = 'create';
+						manualActionSet = false;
+						return;
+					}
 
-		if (manualActionSet) {
+					if (manualActionSet) {
 			return;
 		}
 
 		if (!hasSelections) {
 			if (currentAction !== 'create') {
-				storeListboxValue.set('create');
-			}
+				app.listboxValueState = 'create';
+							}
 			return;
 		}
 
 		// Selection logic: prioritize Unpublish if only published items are selected
 		if (stats.published > 0 && stats.published === selectedCount) {
 			if (currentAction !== 'unpublish') {
-				storeListboxValue.set('unpublish');
-			}
+				app.listboxValueState = 'unpublish';
+							}
 		} else if (currentAction !== 'publish') {
 			// Mixed or Drafts: prioritize Publish
-			storeListboxValue.set('publish');
-		}
+			app.listboxValueState = 'publish';
+					}
 	});
 
 	// Connection awareness
@@ -449,7 +449,7 @@
 
 	function handleOptionClick(event: Event, actionType: ActionType) {
 		event.preventDefault();
-		storeListboxValue.set(actionType);
+		app.listboxValueState = actionType;
 		manualActionSet = true;
 		isDropdownOpen = false;
 	}
@@ -483,12 +483,13 @@
 			onclick={!hasSelections ? handleMainButtonClick : undefined}
 		>
 			<!-- Main Contextual Button -->
-			<button
-				type="button"
-				onclick={hasSelections ? handleMainButtonClick : undefined}
+			<Button
+				variant="ghost"
+				data-testid="entry-list-action-{currentAction}"
+				onclick={handleMainButtonClick}
 				disabled={isProcessing}
 				class="h-10 min-w-15 md:min-w-35 rtl:rotate-180 font-bold transition-all duration-200
-					{hasSelections ? 'active:scale-95' : 'pointer-events-none'}
+					active:scale-95
 					{currentConfig.gradient} {currentConfig.textColor}
 					rounded-l-full rounded-r-none px-6 flex items-center gap-2 border-e border-white
 					disabled:opacity-50 disabled:cursor-not-allowed"
@@ -496,12 +497,12 @@
 				aria-busy={isProcessing}
 			>
 				{#if isProcessing}
-					<iconify-icon icon="svg-spinners:ring-resize" width="24" class="animate-spin"></iconify-icon>
+					<div class="h-6 w-6 animate-spin rounded-full border-2 border-surface-300 border-t-tertiary-500 dark:border-surface-600 dark:border-t-primary-500"></div>
 				{:else}
 					<iconify-icon icon={currentConfig.icon} width="24"></iconify-icon>
 				{/if}
 				<span class="hidden md:inline-block">{dynamicLabel}</span>
-			</button>
+			</Button>
 
 			<!-- Selection Badge -->
 			{#if hasSelections && selectedCount > 0}
@@ -515,8 +516,8 @@
 
 			<!-- Dropdown Toggle -->
 			{#if !isCollectionEmpty}
-				<button
-					type="button"
+				<Button
+					variant="ghost"
 					onclick={hasSelections ? toggleDropdown : undefined}
 					disabled={!hasSelections || isProcessing}
 					class="h-10 w-8 border-s border-white/20 transition-all duration-200 text-white flex items-center justify-center shadow-inner
@@ -534,7 +535,7 @@
 							class="transition-transform duration-200 {isDropdownOpen ? 'rotate-180' : ''}"
 						></iconify-icon>
 					{/if}
-				</button>
+				</Button>
 			{/if}
 
 			<!-- Dropdown Menu -->
@@ -554,9 +555,9 @@
 									onmouseenter={() => (hoveredAction = config.type)}
 									onmouseleave={() => (hoveredAction = null)}
 								>
-									<button
-										type="button"
-										onclick={(e) => handleOptionClick(e, config.type)}
+									<Button
+										variant="ghost"
+										onclick={(e: MouseEvent) => handleOptionClick(e, config.type)}
 										role="menuitem"
 										class="group/item relative flex w-full items-center gap-3 rounded px-3 py-2.5 text-start text-white transition-all duration-200 hover:bg-white/5"
 										aria-label="{config.label} {config.shortcut ? `(${config.shortcut})` : ''}"
@@ -585,7 +586,7 @@
 												Warn
 											</span>
 										{/if}
-									</button>
+									</Button>
 								</li>
 							{/each}
 						</ul>

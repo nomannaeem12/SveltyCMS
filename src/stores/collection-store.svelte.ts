@@ -14,6 +14,20 @@
 import type { ContentNode, Schema, WidgetFieldPermissions } from "@src/content/types";
 import { logger } from "@utils/logger";
 
+/** Cheap FNV-1a fingerprint — avoids JSON.stringify of large ContentNode trees (client-safe). */
+function structureFingerprint(nodes: ContentNode[]): string {
+  let h = 2166136261;
+  for (const n of nodes) {
+    const fieldCount = n.collectionDef?.fields?.length ?? 0;
+    const s = `${n._id ?? ""}|${n.path ?? ""}|${n.parentId ?? ""}|${n.order ?? 0}|${n.nodeType ?? ""}|${n.name ?? ""}|${fieldCount}`;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+  }
+  return (h >>> 0).toString(36);
+}
+
 // Types
 export type ModeType = "view" | "edit" | "create" | "delete" | "modify" | "media";
 
@@ -57,19 +71,6 @@ class CollectionState {
   contentStructure = $state<ContentNode[]>([]);
   selectedEntries = $state<string[]>([]);
 
-  // Stepper state for Studio Mode Sidebar Integration
-  stepper = $state({
-    activeStep: 1,
-    completedSteps: new Set<number>(),
-    steps: [
-      { label: "General Setup", description: "Collection basics" },
-      {
-        label: "Field Configuration",
-        description: "Add and configure widgets",
-      },
-    ],
-  });
-
   // --- Derived Properties ---
 
   get total() {
@@ -111,11 +112,29 @@ class CollectionState {
 
   setContentStructure(newContentStructure: ContentNode[]) {
     // Prevent redundant syncs that trigger reactivity loops
-    const currentHash = JSON.stringify(newContentStructure);
+    const currentHash = structureFingerprint(newContentStructure);
     if (currentHash === this.lastStructureHash) return;
     this.lastStructureHash = currentHash;
 
     this.contentStructure = newContentStructure;
+  }
+
+  /**
+   * Surgical patch when the active collection schema was recompiled.
+   * Preserves mode / activeValue / selection (no session break).
+   */
+  patchActiveSchema(schema: Schema) {
+    if (!schema?._id && !schema?.name) return;
+    const id = String(schema._id || schema.name);
+    if (this.active) {
+      const activeId = String(this.active._id || this.active.name || "");
+      if (activeId.toLowerCase() === id.toLowerCase() || this.active.name === schema.name) {
+        this.active = { ...this.active, ...schema, fields: schema.fields ?? this.active.fields };
+      }
+    }
+    if (schema._id) {
+      this.all[String(schema._id)] = schema;
+    }
   }
 
   setTargetWidget(newWidget: Widget) {
@@ -256,10 +275,29 @@ export const entryActions = {
   clear: () => collections.clearSelected(),
 };
 
-// Direct state exports for legacy components that don't use the objects
-// Note: These might lose reactivity if rebound elsewhere, but should work for direct imports.
-export const currentCollectionId = collections.currentId;
-export const collectionsLoading = collections.loading;
-export const collectionsError = collections.error;
-export const unAssigned = collections.unassigned;
-export const selectedEntries = collections.selectedEntries;
+// Reactive getters for legacy components — reads from singleton directly
+export const currentCollectionId = {
+  get value() {
+    return collections.currentId;
+  },
+};
+export const collectionsLoading = {
+  get value() {
+    return collections.loading;
+  },
+};
+export const collectionsError = {
+  get value() {
+    return collections.error;
+  },
+};
+export const unAssigned = {
+  get value() {
+    return collections.unassigned;
+  },
+};
+export const selectedEntries = {
+  get value() {
+    return collections.selectedEntries;
+  },
+};

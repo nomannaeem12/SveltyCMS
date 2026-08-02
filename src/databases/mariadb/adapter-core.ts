@@ -67,7 +67,11 @@ export abstract class AdapterCore extends SqlAdapterCore {
   }
 
   protected isMissingTableError(err: any): boolean {
-    return err?.errno === 1146;
+    // drizzle-orm/mysql2 wraps the mysql2 error — the real errno/code live on
+    // `.cause`. Checking only the top level made auto-provision (insert) and
+    // empty-result (findMany/count) fallbacks silently not fire on MariaDB.
+    const e = err?.cause ?? err;
+    return e?.errno === 1146 || e?.code === "ER_NO_SUCH_TABLE";
   }
 
   public readonly schema = schema;
@@ -75,6 +79,12 @@ export abstract class AdapterCore extends SqlAdapterCore {
   public getJsonField(field: string): SQL {
     const path = `$.${field}`;
     return sql`JSON_UNQUOTE(JSON_EXTRACT(data, ${path}))`;
+  }
+
+  protected coerceJsonValue(val: unknown): unknown {
+    // JSON_UNQUOTE(JSON_EXTRACT(...)) renders JSON booleans as the text
+    // "true"/"false"; binding a JS boolean (1/0) never matches those rows.
+    return typeof val === "boolean" ? String(val) : val;
   }
 
   public getTable(collection: string): any {
@@ -236,6 +246,7 @@ export abstract class AdapterCore extends SqlAdapterCore {
 
   async disconnect(): Promise<DatabaseResult<void>> {
     if (this.pool) {
+      (this as any).__intentionalDisconnect__ = true;
       await this.pool.end();
       this.pool = null;
       this._db = null;
@@ -412,11 +423,18 @@ export abstract class AdapterCore extends SqlAdapterCore {
     _conflictTarget: any[],
     options: BaseQueryOptions = {},
   ): Promise<void> {
+    // Resolve string collection name to Drizzle table object
+    const resolvedTable = typeof table === "string" ? this.getTable(table) : table;
+    if (!resolvedTable) throw new Error(`Table not found: ${table}`);
     await this.wrap(
       async () => {
         const db = this.getDrizzleInstance(options);
-        await (db.insert(table).values(values) as any).onDuplicateKeyUpdate({
-          set: values,
+        // Strip undefined values — Drizzle crashes on undefined column values
+        const cleanValues = Object.fromEntries(
+          Object.entries(values).filter(([, v]) => v !== undefined),
+        );
+        await (db.insert(resolvedTable).values(cleanValues) as any).onDuplicateKeyUpdate({
+          set: cleanValues,
         });
       },
       "UPSERT_NATIVE_FAILED",
@@ -446,26 +464,27 @@ export abstract class AdapterCore extends SqlAdapterCore {
         const idCol = this.getColumn(table, "_id") || this.getColumn(table, "id");
         if (!idCol) throw new Error("ID column not found");
 
-        const tenantFilter = utils.buildRawTenantFilter(options, "mysql");
-
-        const dataCol = this.getColumn(table, "data");
+        // Identifiers may be embedded; values (_id, amount, tenantId) are always bound via raw.execute.
+        const safeField = utils.assertSafeSqlIdentifier(field);
+        const amountNum = utils.assertFiniteAmount(amount);
         const idStr = String(id);
-        const drizzle = this.getDrizzleInstance(options);
+        const dataCol = this.getColumn(table, "data");
+        const { sql: tenantSql, params: tenantParams } = utils.buildRawTenantClause(
+          options,
+          "mysql",
+        );
+        const idColName = idCol.name || "_id";
 
         if (this._returningSupported !== false) {
           try {
+            // Prefer single-round-trip upsert with bound params when RETURNING is available.
             const upsertSql = dataCol
-              ? `INSERT INTO \`${tableName}\` (\`_id\`, \`data\`, \`updatedAt\`) VALUES ('${idStr}', '{}', NOW()) ON DUPLICATE KEY UPDATE \`data\` = JSON_SET(COALESCE(\`data\`, '{}'), '$.${field}', COALESCE(JSON_EXTRACT(COALESCE(\`data\`, '{}'), '$.${field}'), 0) + ${amount}), \`updatedAt\` = NOW() RETURNING *`
-              : `INSERT INTO \`${tableName}\` (\`_id\`, \`${field}\`, \`updatedAt\`) VALUES ('${idStr}', ${amount}, NOW()) ON DUPLICATE KEY UPDATE \`${field}\` = COALESCE(\`${field}\`, 0) + ${amount}, \`updatedAt\` = NOW() RETURNING *`;
+              ? `INSERT INTO \`${tableName}\` (\`_id\`, \`data\`, \`updatedAt\`) VALUES (?, '{}', NOW()) ON DUPLICATE KEY UPDATE \`data\` = JSON_SET(COALESCE(\`data\`, '{}'), '$.${safeField}', COALESCE(JSON_EXTRACT(COALESCE(\`data\`, '{}'), '$.${safeField}'), 0) + ?), \`updatedAt\` = NOW() RETURNING *`
+              : `INSERT INTO \`${tableName}\` (\`_id\`, \`${safeField}\`, \`updatedAt\`) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE \`${safeField}\` = COALESCE(\`${safeField}\`, 0) + ?, \`updatedAt\` = NOW() RETURNING *`;
 
-            const execResult = await drizzle.execute(sql.raw(upsertSql));
-            let rows: any = null;
-            if (Array.isArray(execResult)) {
-              rows = execResult[0];
-            } else {
-              rows = (execResult as any).rows || execResult;
-            }
+            const upsertParams = dataCol ? [idStr, amountNum] : [idStr, amountNum, amountNum];
 
+            const rows = (await this.raw.execute(upsertSql, upsertParams)) as any[];
             if (Array.isArray(rows) && rows.length > 0) {
               this._returningSupported = true;
               return utils.convertDatesToISO(rows[0], {
@@ -481,35 +500,25 @@ export abstract class AdapterCore extends SqlAdapterCore {
           }
         }
 
-        // Fallback: UPDATE + inline SELECT
+        // Fallback: parameterized UPDATE + SELECT (works on all MariaDB/MySQL versions)
         if (dataCol) {
-          await drizzle.execute(
-            sql.raw(
-              `UPDATE \`${tableName}\` SET \`data\` = JSON_SET(COALESCE(\`data\`, '{}'), '$.${field}', COALESCE(JSON_EXTRACT(COALESCE(\`data\`, '{}'), '$.${field}'), 0) + ${amount}), \`updatedAt\` = NOW() WHERE \`_id\` = '${idStr}'${tenantFilter}`,
-            ),
+          await this.raw.execute(
+            `UPDATE \`${tableName}\` SET \`data\` = JSON_SET(COALESCE(\`data\`, '{}'), '$.${safeField}', COALESCE(JSON_EXTRACT(COALESCE(\`data\`, '{}'), '$.${safeField}'), 0) + ?), \`updatedAt\` = NOW() WHERE \`${idColName}\` = ?${tenantSql}`,
+            [amountNum, idStr, ...tenantParams],
           );
         } else {
-          await drizzle.execute(
-            sql.raw(
-              `UPDATE \`${tableName}\` SET \`${field}\` = COALESCE(\`${field}\`, 0) + ${amount}, \`updatedAt\` = NOW() WHERE \`_id\` = '${idStr}'${tenantFilter}`,
-            ),
+          await this.raw.execute(
+            `UPDATE \`${tableName}\` SET \`${safeField}\` = COALESCE(\`${safeField}\`, 0) + ?, \`updatedAt\` = NOW() WHERE \`${idColName}\` = ?${tenantSql}`,
+            [amountNum, idStr, ...tenantParams],
           );
         }
 
-        const selectResult = await drizzle.execute(
-          sql.raw(
-            `SELECT * FROM \`${tableName}\` WHERE \`_id\` = '${idStr}'${tenantFilter} LIMIT 1`,
-          ),
-        );
+        const fallbackRows = (await this.raw.execute(
+          `SELECT * FROM \`${tableName}\` WHERE \`${idColName}\` = ?${tenantSql} LIMIT 1`,
+          [idStr, ...tenantParams],
+        )) as any[];
 
-        let fallbackRows: any[] = [];
-        if (Array.isArray(selectResult)) {
-          fallbackRows = (selectResult as unknown as any[][])[0] || [];
-        } else {
-          fallbackRows = (selectResult as any).rows || [];
-        }
-
-        if (!fallbackRows || fallbackRows.length === 0) {
+        if (!Array.isArray(fallbackRows) || fallbackRows.length === 0) {
           throw new Error(`Entry not found after increment: ${idStr}`);
         }
 
@@ -542,7 +551,7 @@ export abstract class AdapterCore extends SqlAdapterCore {
         const debugMode = process.env.BENCHMARK_DEBUG === "true";
 
         if (debugMode && !isBenchSuite) {
-          console.log(
+          logger.debug(
             `[DB Provision] SVELTY_BENCHMARK_SUITE=${process.env.SVELTY_BENCHMARK_SUITE || "standalone"}`,
           );
         }
@@ -551,7 +560,7 @@ export abstract class AdapterCore extends SqlAdapterCore {
 
         if (ddl) {
           if (debugMode && !isBenchSuite) {
-            console.log(`[DB Provision] [MARIADB] Executing DDL for ${physicalName}`);
+            logger.debug(`[DB Provision] [MARIADB] Executing DDL for ${physicalName}`);
           }
           await this.raw.execute(ddl);
         }

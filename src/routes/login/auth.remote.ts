@@ -16,17 +16,32 @@ import {
 import { auditLogService, AuditEventType } from "@src/services/security/audit-service";
 import { getClientIp } from "@utils/hook-utils";
 import { getCachedFirstCollectionPath } from "@utils/server/collection-utils.server";
-import { sendMail } from "@utils/email.server";
 import { publicEnv } from "@src/stores/global-settings.svelte";
+import { cacheService } from "@src/databases/cache/cache-service";
+import { CacheCategory } from "@src/databases/cache/types";
+import { isMultiTenantEnabled } from "@utils/tenant";
 import { getPrivateSettingSync } from "@src/services/core/settings-service";
 import { tenantService } from "@src/services/core/tenant-service";
 import { invalidateUserCountCache } from "@src/hooks/handle-authorization";
 import { logger } from "@utils/logger";
+import { sendMail } from "@utils/email.server";
 import { isRedirect } from "@sveltejs/kit";
 import type { ISODateString, DatabaseId } from "@src/content/types";
 import type { RequestEvent } from "@sveltejs/kit";
 import { RateLimiter } from "sveltekit-rate-limiter/server";
 import { command, query, getRequestEvent } from "$app/server";
+import { isSecureCookieContext } from "@src/databases/auth/constants";
+import { pluginRegistry } from "@src/plugins";
+import {
+  buildDeviceFingerprint,
+  verifyTrustedDeviceToken,
+  getTrustedDeviceCookieConfig,
+} from "@src/databases/auth/totp";
+import type { AuthHookEvent } from "@src/plugins/types";
+
+function isSecureConnection(event: RequestEvent): boolean {
+  return isSecureCookieContext(event.url.protocol, event.url.hostname);
+}
 
 const limiter = new RateLimiter({
   IP: [10, "m"],
@@ -103,9 +118,32 @@ export const resetPW = command("unchecked", async (data: any) => {
   }
 });
 
+export const requestMagicLink = command("unchecked", async (data: any) => {
+  const event = getRequestEvent();
+  try {
+    return await requestMagicLinkInternal(event, data);
+  } catch (err: any) {
+    if (isRedirect(err)) {
+      return { success: true, redirectPath: err.location };
+    }
+    return {
+      success: false,
+      message: err.message || "Failed to process magic link request",
+    };
+  }
+});
+
 export const verify2FA = command(
   "unchecked",
-  async ({ userId, code }: { userId: string; code: string }) => {
+  async ({
+    userId,
+    code,
+    trustDevice,
+  }: {
+    userId: string;
+    code: string;
+    trustDevice?: boolean;
+  }) => {
     const event = getRequestEvent();
     await dbInitPromise;
     if (!auth) return { success: false, message: "Authentication system is not ready." };
@@ -116,7 +154,20 @@ export const verify2FA = command(
     const twoFactorService = getDefaultTwoFactorAuthService(auth as any);
     if (!twoFactorService) return { success: false, message: "2FA service unavailable." };
 
-    const twoFaResult = await twoFactorService.verify2FA(userId as any as DatabaseId, code);
+    // Build device fingerprint for trusted-device support
+    let deviceFingerprint: string | undefined;
+    if (trustDevice) {
+      const ip = getClientIp(event);
+      const ua = event.request.headers.get("user-agent") || "";
+      deviceFingerprint = await buildDeviceFingerprint(ip, ua);
+    }
+
+    const twoFaResult = await twoFactorService.verify2FA(
+      userId as any as DatabaseId,
+      code,
+      undefined,
+      deviceFingerprint,
+    );
     if (!twoFaResult.success) {
       return {
         success: false,
@@ -127,13 +178,28 @@ export const verify2FA = command(
     const user = await auth.getUserById(userId);
     if (!user) return { success: false, message: "User not found." };
 
-    const sessionCookie = auth.createSessionCookie(userId as any as DatabaseId);
+    const sc = auth.createSessionCookie(userId as any as DatabaseId, isSecureConnection(event));
     try {
-      event.cookies.set(sessionCookie.name, sessionCookie.value, {
-        ...(sessionCookie.attributes as Record<string, unknown>),
+      event.cookies.set(sc.name, sc.value, {
+        ...(sc.attributes as Record<string, unknown>),
         path: "/",
       });
     } catch {}
+
+    // Set trusted-device cookie if token was generated
+    if (trustDevice && twoFaResult.trustedDeviceToken) {
+      try {
+        const { name, maxAge, httpOnly, secure, sameSite, path } = getTrustedDeviceCookieConfig();
+        event.cookies.set(name, twoFaResult.trustedDeviceToken, {
+          maxAge,
+          httpOnly,
+          secure,
+          sameSite,
+          path,
+        });
+        logger.debug("Trusted device cookie set", { userId });
+      } catch {}
+    }
 
     auth
       .updateUserAttributes(
@@ -148,14 +214,9 @@ export const verify2FA = command(
         logger.debug("2FA verify user attribute update failed silently");
       });
 
-    let finalCollectionPath: string | null = null;
-    try {
-      finalCollectionPath = await getCachedFirstCollectionPath("en" as any);
-    } catch {}
-
     return {
       success: true,
-      redirectPath: finalCollectionPath ?? "/config/collectionbuilder",
+      redirectPath: "/config/collectionbuilder",
     };
   },
 );
@@ -163,7 +224,7 @@ export const verify2FA = command(
 export const resetSetup = command("unchecked", async (_payload?: {}) => {
   const { getSystemState } = await import("@src/stores/system/state.svelte.ts");
   const { shutdownSystem } = await import("@src/databases/db");
-  const { invalidateSetupCache } = await import("@src/utils/setup-check");
+  const { invalidateSetupCache } = await import("@src/utils/server/setup-check");
   const { logger } = await import("@utils/logger");
   const event = getRequestEvent();
 
@@ -218,6 +279,55 @@ export const resetSetup = command("unchecked", async (_payload?: {}) => {
 
   invalidateSetupCache(true);
   return { success: true, message: "Setup has been reset." };
+});
+
+/**
+ * Checks which authentication methods are available for a given email address.
+ * Used by the sign-in form to dynamically show/hide auth method buttons.
+ */
+export const checkAuthMethods = query("unchecked", async (email: string) => {
+  await dbInitPromise;
+  if (!auth)
+    return {
+      success: false,
+      hasPassword: true,
+      hasPasskey: false,
+      hasMagicLink: false,
+      hasOAuth: false,
+    };
+  try {
+    const user = await auth.checkUser({
+      email: String(email).trim().toLowerCase(),
+    });
+    if (!user) {
+      return {
+        success: true,
+        hasPassword: true,
+        hasPasskey: false,
+        hasMagicLink: false,
+        hasOAuth: false,
+      };
+    }
+    const hasPassword = !!(user as any).password;
+    const hasPasskey =
+      Array.isArray((user as any).authenticators) && (user as any).authenticators.length > 0;
+    const hasMagicLink = !!(user as any).email;
+    return {
+      success: true,
+      hasPassword,
+      hasPasskey,
+      hasMagicLink,
+      hasOAuth: false,
+    };
+  } catch {
+    return {
+      success: false,
+      hasPassword: true,
+      hasPasskey: false,
+      hasMagicLink: false,
+      hasOAuth: false,
+    };
+  }
 });
 
 export const prefetchFirstCollection = query("unchecked", async () => {
@@ -282,27 +392,76 @@ async function signInInternal(event: RequestEvent, input: any) {
     });
     if (ar?.user) {
       user = ar.user;
-      if (user.is2FAEnabled)
+
+      // ── Plugin Auth Hooks ──────────────────────────────────────────────
+      const ip = getClientIp(event);
+      const ua = event.request.headers.get("user-agent") || "";
+      const authHookEvent: AuthHookEvent = {
+        user,
+        method: "password",
+        ip,
+        userAgent: ua,
+        userHas2FA: !!user.is2FAEnabled,
+        tenantId: null,
+      };
+      const authHookResult = await pluginRegistry.runAuthHooks(authHookEvent);
+
+      // Plugin can deny the login
+      if (authHookResult?.deny) {
+        return { success: false, message: authHookResult.message || "Access denied." };
+      }
+
+      // Plugin can force 2FA even if user doesn't have it enabled
+      const requires2FA = user.is2FAEnabled || authHookResult?.requires2FA;
+
+      // ── Trusted Device Check ───────────────────────────────────────────
+      if (requires2FA && !authHookResult?.requires2FA) {
+        const trustedCookie = event.cookies.get("__Host-2fa-trusted-device");
+        if (trustedCookie) {
+          const trustedUserId = await verifyTrustedDeviceToken(trustedCookie);
+          if (trustedUserId === String(user._id)) {
+            logger.debug("Skipping 2FA for trusted device", { userId: user._id });
+            // Fall through to cookie issuance
+          } else {
+            return {
+              success: false,
+              requires2FA: true,
+              userId: user._id,
+              message: "2FA required",
+            };
+          }
+        } else {
+          return {
+            success: false,
+            requires2FA: true,
+            userId: user._id,
+            message: "2FA required",
+          };
+        }
+      } else if (requires2FA) {
         return {
           success: false,
           requires2FA: true,
           userId: user._id,
           message: "2FA required",
         };
+      }
       ok = true;
-      const sc = auth.createSessionCookie(ar.sessionId!);
+      const sc = auth.createSessionCookie(ar.sessionId!, isSecureConnection(event));
       try {
         event.cookies.set(sc.name, sc.value, {
           ...(sc.attributes as Record<string, unknown>),
           path: "/",
         });
-      } catch {}
+      } catch (e) {
+        logger.error("[auth.remote] Failed to set session cookie:", e);
+      }
       // Prime in-memory session cache so getUserFromSession bypasses sqlite-proxy
       try {
         const { primeSessionMemoryCache } = await import("@src/hooks/handle-authentication");
         primeSessionMemoryCache(ar.sessionId!, user);
         // Also force setup state to COMPLETE so handleAuthentication doesn't short-circuit
-        const { invalidateSetupCache } = await import("@src/utils/setup-check");
+        const { invalidateSetupCache } = await import("@src/utils/server/setup-check");
         invalidateSetupCache(false, true);
       } catch {}
     } else {
@@ -320,7 +479,7 @@ async function signInInternal(event: RequestEvent, input: any) {
       user_id: user._id,
       expires: new Date(Date.now() + 86400000).toISOString() as ISODateString,
     });
-    const sc = auth.createSessionCookie(s._id);
+    const sc = auth.createSessionCookie(s._id, isSecureConnection(event));
     try {
       event.cookies.set(sc.name, sc.value, {
         ...(sc.attributes as Record<string, unknown>),
@@ -361,8 +520,21 @@ async function signInInternal(event: RequestEvent, input: any) {
       logger.debug("Telemetry background check failed silently");
     });
 
-  const path = await getCachedFirstCollectionPath("en" as any).catch(() => null);
-  return { success: true, redirectPath: path ?? "/config/collectionbuilder" };
+  // Determine redirect: explicit redirect param takes priority, then first collection, else builder
+  let redirectPath = (input.redirect as string) || "/config/collectionbuilder";
+  if (!input.redirect) {
+    try {
+      const { getCachedFirstCollectionPath } =
+        await import("@utils/server/collection-utils.server");
+      const userLanguage = (user as any).locale || (user as any).language || "en";
+      const path = await getCachedFirstCollectionPath(userLanguage as any);
+      if (path) redirectPath = path;
+    } catch {
+      // Fall back to builder
+    }
+  }
+
+  return { success: true, redirectPath };
 }
 
 async function signUpInternal(event: RequestEvent, input: any) {
@@ -391,7 +563,7 @@ async function signUpInternal(event: RequestEvent, input: any) {
   if (!result.success) return { success: false, errors: flatten(result.issues).nested };
   const { email: e, username: u, password: p, token: t } = result.output;
 
-  const mt = getPrivateSettingSync("MULTI_TENANT");
+  const mt = isMultiTenantEnabled();
   const dm = getPrivateSettingSync("DEMO");
   const open = !!(mt && dm);
   let role = "user",
@@ -402,7 +574,13 @@ async function signUpInternal(event: RequestEvent, input: any) {
     if ((await auth.getUserCount({}, { bypassTenantCheck: true })) >= 100)
       return { success: false, message: "Demo capacity reached." };
     role = "admin";
-    tid = crypto.randomUUID();
+    // Use the demo_tenant_id cookie if present (set by handleDemoTenantAssignment)
+    // to keep tenant IDs consistent between the middleware and the sign-up flow.
+    // Check both __Host- prefixed (HTTPS) and unprefixed (HTTP) variants.
+    tid =
+      event.cookies.get("__Host-demo_tenant_id") ||
+      event.cookies.get("demo_tenant_id") ||
+      crypto.randomUUID();
   } else {
     if (!t) return { success: false, message: "Invitation required." };
     const td = await auth.validateRegistrationToken(t);
@@ -438,7 +616,7 @@ async function signUpInternal(event: RequestEvent, input: any) {
 
   const session = ur.data?.session;
   if (session) {
-    const sc = auth.createSessionCookie(session._id);
+    const sc = auth.createSessionCookie(session._id, isSecureConnection(event));
     try {
       event.cookies.set(sc.name, sc.value, {
         ...(sc.attributes as Record<string, unknown>),
@@ -486,6 +664,8 @@ async function forgotPWInternal(event: RequestEvent, input: any) {
     // Ignore errors
   }
 
+  let resetLink: string | undefined;
+
   try {
     const user = await auth.checkUser({ email: result.output.email });
     if (user?._id) {
@@ -507,7 +687,8 @@ async function forgotPWInternal(event: RequestEvent, input: any) {
         });
       const origin = new URL(event.request.url).origin;
       const baseUrl = publicEnv.HOST_PROD || origin;
-      const resetLink = `${baseUrl}/login?token=${token}&email=${encodeURIComponent(result.output.email)}`;
+      resetLink = `${baseUrl}/login?token=${token}&email=${encodeURIComponent(result.output.email)}`;
+
       sendMail({
         recipientEmail: result.output.email,
         subject: "Reset your password",
@@ -519,25 +700,21 @@ async function forgotPWInternal(event: RequestEvent, input: any) {
           resetLink,
         },
         languageTag: "en" as any,
-      })
-        .then((res) => {
-          if (!res.success || res.dev_mode) {
-            logger.warn(
-              `[DEVELOPMENT/NO-SMTP] Password Reset Link for ${user.email}: ${resetLink}`,
-            );
-          }
-        })
-        .catch(() => {
-          logger.warn(`[DEVELOPMENT/NO-SMTP] Password Reset Link for ${user.email}: ${resetLink}`);
-          logger.debug("Password reset email sending failed silently");
-        });
+      }).catch(() => {
+        logger.warn(`[DEVELOPMENT/NO-SMTP] Password Reset Link for ${user.email}: ${resetLink}`);
+      });
     }
   } catch {}
 
   return {
     success: true,
-    message: "If an account exists, a reset link has been sent.",
+    message: smtpConfigured
+      ? "If an account exists, a reset link has been sent."
+      : "SMTP not configured — use the link below to reset your password.",
     smtpConfigured,
+    // Only expose the reset link when SMTP is off (dev/no-config mode).
+    // When SMTP is on, the link is delivered via email for security.
+    resetLink: smtpConfigured ? undefined : resetLink,
   };
 }
 
@@ -552,17 +729,26 @@ async function resetPWInternal(event: RequestEvent, input: any) {
   if (!auth) return { success: false, message: "Authentication system unavailable." };
 
   const password = input.password as string;
+  const confirmPassword = (input.confirmPassword ?? input.confirm_password) as string;
   const token = input.token as string;
   const email = input.email as string;
 
-  const result = safeParse(resetFormSchema, { password, token, email });
+  const result = safeParse(resetFormSchema, { password, confirmPassword, token, email });
   if (!result.success) return { success: false, errors: flatten(result.issues).nested };
   const { password: p, token: t, email: e } = result.output;
 
   const user = await auth.checkUser({ email: e });
-  if (!user?._id) return { success: false, message: "Invalid reset link." };
+  if (!user?._id)
+    return { success: false, message: "Invalid reset link.", code: "TOKEN_NOT_FOUND" };
   const v = await auth.consumeToken(t, user._id, "password_reset");
-  if (!v.status) return { success: false, message: v.message || "Invalid reset link." };
+  if (!v.status) {
+    return {
+      success: false,
+      message: v.message || "Invalid reset link.",
+      // Surface TOKEN_EXPIRED / TOKEN_ALREADY_CONSUMED for precise UI toasts
+      code: v.code || "TOKEN_INVALID",
+    };
+  }
   if (p.length < 8) return { success: false, message: "Password too weak." };
 
   await auth.invalidateAllUserSessions(user._id);
@@ -582,3 +768,272 @@ async function resetPWInternal(event: RequestEvent, input: any) {
 
   return { success: true, redirectPath: "/login?reset=success" };
 }
+
+async function requestMagicLinkInternal(event: RequestEvent, input: any) {
+  if (process.env.TEST_MODE !== "true" && (await limiter.isLimited(event))) {
+    try {
+      event.setHeaders({ "Retry-After": "60" });
+    } catch {}
+    return { success: false, message: "Too many requests." };
+  }
+  await dbInitPromise;
+  if (!auth) return { success: false, message: "Authentication system unavailable." };
+
+  const email = input.email as string;
+  const result = safeParse(forgotFormSchema, { email });
+  if (!result.success) return { success: false, errors: flatten(result.issues).nested };
+
+  const { sendMagicLinkForEmail } = await import("@src/databases/auth/magic-link");
+  const sendResult = await sendMagicLinkForEmail(event, result.output.email);
+
+  return {
+    success: true,
+    message: "If an account exists, a magic link has been sent.",
+    smtpConfigured: sendResult.smtpConfigured,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// WebAuthn / Passkeys
+// ────────────────────────────────────────────────────────────
+
+const WEBAUTHN_CHALLENGE_PREFIX = "webauthn:challenge:";
+
+async function storeWebAuthnChallenge(
+  challenge: string,
+  payload: { userId: string; type: "registration" | "authentication" },
+) {
+  await cacheService.set(
+    `${WEBAUTHN_CHALLENGE_PREFIX}${challenge}`,
+    payload,
+    300,
+    null,
+    CacheCategory.SESSION,
+  );
+}
+
+async function consumeWebAuthnChallenge(
+  challenge: string,
+): Promise<{ userId: string; type: "registration" | "authentication" } | null> {
+  const key = `${WEBAUTHN_CHALLENGE_PREFIX}${challenge}`;
+  const stored = await cacheService.get<{
+    userId: string;
+    type: "registration" | "authentication";
+  }>(key, null);
+  await cacheService.delete(key, null);
+  return stored ?? null;
+}
+
+export const getPasskeyAuthOptions = command("unchecked", async (data: { email: string }) => {
+  const event = getRequestEvent();
+  await dbInitPromise;
+  if (!auth) return { success: false, message: "Authentication system unavailable." };
+
+  const email = String(data?.email || "")
+    .trim()
+    .toLowerCase();
+  if (!email) return { success: false, message: "Email is required." };
+
+  const user = await auth.checkUser({ email });
+  if (!user?._id || !user.authenticators?.length) {
+    return {
+      success: false,
+      message: "No passkey registered for this account.",
+    };
+  }
+
+  const { generateWebAuthnChallenge, buildAuthenticationOptions, resolveRpId } =
+    await import("@src/databases/auth/webauthn/webauthn-service");
+
+  const challenge = generateWebAuthnChallenge();
+  const rpId = resolveRpId(new URL(event.request.url).hostname);
+
+  await storeWebAuthnChallenge(challenge, {
+    userId: String(user._id),
+    type: "authentication",
+  });
+
+  const options = buildAuthenticationOptions(
+    rpId,
+    challenge,
+    user.authenticators.map((a: any) => ({
+      id: a.credentialID,
+      type: "public-key" as const,
+      transports: a.transports,
+    })),
+  );
+
+  return {
+    success: true,
+    options: {
+      ...options,
+      challenge: Buffer.from(options.challenge).toString("base64url"),
+      allowCredentials: options.allowCredentials?.map((c) => ({
+        ...c,
+        id: Buffer.from(c.id).toString("base64url"),
+      })),
+    },
+  };
+});
+
+export const verifyPasskeyAuth = command(
+  "unchecked",
+  async (data: { email: string; assertion: any }) => {
+    const event = getRequestEvent();
+    await dbInitPromise;
+    if (!auth) return { success: false, message: "Authentication system unavailable." };
+
+    try {
+      const email = String(data?.email || "")
+        .trim()
+        .toLowerCase();
+      const user = await auth.checkUser({ email });
+      if (!user?._id) return { success: false, message: "Invalid passkey authentication." };
+
+      const clientData = JSON.parse(
+        Buffer.from(data.assertion.response.clientDataJSON, "base64url").toString("utf8"),
+      );
+      const challengePayload = await consumeWebAuthnChallenge(clientData.challenge);
+      if (!challengePayload || challengePayload.userId !== String(user._id)) {
+        return {
+          success: false,
+          message: "Passkey challenge expired or invalid.",
+        };
+      }
+
+      const { verifyAuthenticationResponse, findAuthenticatorByCredentialId, resolveRpId } =
+        await import("@src/databases/auth/webauthn/webauthn-service");
+
+      const stored = findAuthenticatorByCredentialId(user.authenticators, data.assertion.id);
+      if (!stored) return { success: false, message: "Unknown passkey credential." };
+
+      const rpId = resolveRpId(new URL(event.request.url).hostname);
+      const { verified, newCounter } = verifyAuthenticationResponse(
+        data.assertion,
+        clientData.challenge,
+        rpId,
+        stored,
+      );
+
+      if (!verified)
+        return {
+          success: false,
+          message: "Passkey signature verification failed.",
+        };
+
+      const updatedAuthenticators = (user.authenticators || []).map((a: any) =>
+        a.credentialID === stored.credentialID ? { ...a, counter: newCounter } : a,
+      );
+      await auth.updateUserAttributes(
+        user._id as DatabaseId,
+        {
+          authenticators: updatedAuthenticators,
+          lastAuthMethod: "passkey" as any,
+        },
+        { bypassTenantCheck: true },
+      );
+
+      const session = await auth.createSession({
+        user_id: user._id as DatabaseId,
+        expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() as ISODateString,
+      });
+      const sessionCookie = auth.createSessionCookie(session._id as DatabaseId);
+      event.cookies.set(sessionCookie.name, sessionCookie.value, {
+        ...(sessionCookie.attributes as Record<string, unknown>),
+        path: "/",
+      });
+
+      return {
+        success: true,
+        redirectPath: "/config/collectionbuilder",
+      };
+    } catch (err: any) {
+      logger.error("Passkey authentication failed:", err.message);
+      return { success: false, message: "Passkey authentication failed." };
+    }
+  },
+);
+
+export const getPasskeyRegisterOptions = command("unchecked", async () => {
+  const event = getRequestEvent();
+  await dbInitPromise;
+  if (!auth) return { success: false, message: "Authentication system unavailable." };
+
+  const sessionId = event.locals.session_id;
+  const user = event.locals.user;
+  if (!sessionId || !user?._id) {
+    return {
+      success: false,
+      message: "You must be signed in to register a passkey.",
+    };
+  }
+
+  const { generateWebAuthnChallenge, buildRegistrationOptions, resolveRpId } =
+    await import("@src/databases/auth/webauthn/webauthn-service");
+
+  const challenge = generateWebAuthnChallenge();
+  const rpId = resolveRpId(new URL(event.request.url).hostname);
+  await storeWebAuthnChallenge(challenge, {
+    userId: String(user._id),
+    type: "registration",
+  });
+
+  const options = buildRegistrationOptions(user as any, rpId, challenge);
+  return {
+    success: true,
+    options: {
+      ...options,
+      challenge: Buffer.from(options.challenge).toString("base64url"),
+      user: {
+        ...options.user,
+        id: Buffer.from(options.user.id).toString("base64url"),
+      },
+    },
+  };
+});
+
+export const verifyPasskeyRegister = command("unchecked", async (data: { attestation: any }) => {
+  const event = getRequestEvent();
+  await dbInitPromise;
+  if (!auth) return { success: false, message: "Authentication system unavailable." };
+
+  const user = event.locals.user;
+  if (!user?._id)
+    return {
+      success: false,
+      message: "You must be signed in to register a passkey.",
+    };
+
+  try {
+    const clientData = JSON.parse(
+      Buffer.from(data.attestation.response.clientDataJSON, "base64url").toString("utf8"),
+    );
+    const challengePayload = await consumeWebAuthnChallenge(clientData.challenge);
+    if (!challengePayload || challengePayload.userId !== String(user._id)) {
+      return {
+        success: false,
+        message: "Passkey registration challenge expired.",
+      };
+    }
+
+    const { verifyRegistrationResponse, resolveRpId } =
+      await import("@src/databases/auth/webauthn/webauthn-service");
+    const rpId = resolveRpId(new URL(event.request.url).hostname);
+    const authenticator = verifyRegistrationResponse(data.attestation, clientData.challenge, rpId);
+
+    const existing = user.authenticators || [];
+    await auth.updateUserAttributes(
+      user._id as DatabaseId,
+      { authenticators: [...existing, authenticator] },
+      { bypassTenantCheck: true },
+    );
+
+    return { success: true, message: "Passkey registered successfully." };
+  } catch (err: any) {
+    logger.error("Passkey registration failed:", err.message);
+    return {
+      success: false,
+      message: err.message || "Passkey registration failed.",
+    };
+  }
+});

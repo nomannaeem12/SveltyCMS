@@ -56,6 +56,7 @@ import { page } from "$app/state";
 import type { PageData } from "../$types";
 import type { LoginBranding } from "@utils/theme-merge";
 import SignupIcon from "./icons/signup-icon.svelte";
+import { fade } from 'svelte/transition';
 
 // Props
 const {
@@ -115,7 +116,7 @@ async function prefetchFirstCollection() {
 	try {
 		await preloadData(firstCollectionPath);
 	} catch (error) {
-		console.error("Prefetch failed:", error);
+		logger.error("Prefetch failed:", error);
 	}
 }
 
@@ -288,7 +289,7 @@ $effect(() => {
 	class:hover={isHover}
 >
 	{#if active === 1}
-		<div class="relative flex min-h-screen w-full items-center justify-center overflow-hidden">
+		<div transition:fade={{ duration: 250 }} class="relative flex min-h-screen w-full items-center justify-center overflow-hidden">
 			{#if screen.isDesktop}
 				<div class="absolute inset-0 z-0">
 					<FloatingPaths position={1} background="dark" mirrorAnimation />
@@ -314,10 +315,10 @@ $effect(() => {
 						<div class="wrap-break-word lg:-mt-1">
 							{#if isInviteFlow}
 								{form_signup()}
-								<span class="text-2xl text-tertiary-500 dark:text-primary-500 sm:text-3xl">: Complete Invitation</span>
+								<span class="text-2xl text-primary-500 sm:text-3xl">: Complete Invitation</span>
 							{:else}
 								{form_signup()}
-								<span class="text-2xl capitalize text-tertiary-500 dark:text-primary-500 sm:text-3xl">: New User</span>
+								<span class="text-2xl capitalize text-primary-500 sm:text-3xl">: New User</span>
 							{/if}
 						</div>
 					</h1>
@@ -448,7 +449,7 @@ $effect(() => {
 						 Hidden only in open-signup mode (multiTenant + demoMode).
 						 Single-tenant demo mode still requires a token and will render this field. -->
 					{#if !isInviteFlow && !isOpenSignup}
-						<div class="flex items-center space-x-2">
+						<div class="flex items-center gap-2">
 							<FloatingInput
 								id="tokensignUp"
 								name="token"
@@ -565,7 +566,7 @@ $effect(() => {
 		flex-grow: 1;
 		width: var(--width);
 		background: #242728;
-		transition: 0.4s;
+		transition: width 0.15s ease-out, border-radius 0.15s ease-out;
 	}
 	.active {
 		--width: 90%;

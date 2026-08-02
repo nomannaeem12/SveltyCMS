@@ -67,6 +67,10 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
 			"totpSecret" TEXT,
 			"backupCodes" JSONB,
 			"last2FAVerification" TIMESTAMP WITH TIME ZONE,
+			"authenticators" JSONB,
+			"preferences" JSONB,
+			"failedAttempts" INT NOT NULL DEFAULT 0,
+			"lockoutUntil" TIMESTAMP WITH TIME ZONE,
 			"tenantId" VARCHAR(36),
 			"createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			"updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -150,7 +154,8 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
 			"createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			"updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
-    "CREATE UNIQUE INDEX IF NOT EXISTS content_nodes_path_unique ON content_nodes (path)",
+    "DROP INDEX IF EXISTS content_nodes_path_unique",
+    'CREATE UNIQUE INDEX IF NOT EXISTS content_nodes_path_tenant_unique ON content_nodes (path, "tenantId")',
     `CREATE INDEX IF NOT EXISTS content_nodes_parent_idx ON content_nodes ("parentId")`,
     `CREATE INDEX IF NOT EXISTS content_nodes_nodeType_idx ON content_nodes ("nodeType")`,
     "CREATE INDEX IF NOT EXISTS content_nodes_status_idx ON content_nodes (status)",
@@ -337,6 +342,21 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
     `CREATE INDEX IF NOT EXISTS plugin_states_tenant_idx ON plugin_states ("tenantId")`,
     `CREATE UNIQUE INDEX IF NOT EXISTS plugin_states_plugin_tenant_unique ON plugin_states ("pluginId", "tenantId")`,
 
+    // Plugin Storage
+    `CREATE TABLE IF NOT EXISTS plugin_storage (
+			"_id" VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+			"plugin" VARCHAR(255) NOT NULL,
+			"collection" VARCHAR(255) NOT NULL,
+			"tenantId" VARCHAR(36),
+			"data" JSONB NOT NULL DEFAULT '{}',
+			"createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			"updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+    `CREATE INDEX IF NOT EXISTS plugin_storage_plugin_idx ON plugin_storage ("plugin")`,
+    `CREATE INDEX IF NOT EXISTS plugin_storage_collection_idx ON plugin_storage ("collection")`,
+    `CREATE INDEX IF NOT EXISTS plugin_storage_tenant_idx ON plugin_storage ("tenantId")`,
+    `CREATE INDEX IF NOT EXISTS plugin_storage_plugin_collection_idx ON plugin_storage ("plugin", "collection")`,
+
     // Plugin Migrations
     `CREATE TABLE IF NOT EXISTS plugin_migrations (
 			"_id" VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -426,6 +446,26 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
     `CREATE INDEX IF NOT EXISTS svelty_jobs_next_run_idx ON svelty_jobs ("nextRunAt")`,
     `CREATE INDEX IF NOT EXISTS svelty_jobs_tenant_idx ON svelty_jobs ("tenantId")`,
 
+    // Transactional outbox
+    `CREATE TABLE IF NOT EXISTS svelty_outbox (
+			"_id" VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+			"tenantId" VARCHAR(36),
+			"eventType" VARCHAR(255) NOT NULL,
+			"aggregateType" VARCHAR(255) NOT NULL,
+			"aggregateId" VARCHAR(255) NOT NULL,
+			"payload" JSONB NOT NULL DEFAULT '{}',
+			"status" VARCHAR(50) NOT NULL DEFAULT 'pending',
+			"deliveredAt" TIMESTAMP WITH TIME ZONE,
+			"attempts" INT NOT NULL DEFAULT 0,
+			"lastError" TEXT,
+			"createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			"updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+    `CREATE INDEX IF NOT EXISTS outbox_status_idx ON svelty_outbox (status)`,
+    `CREATE INDEX IF NOT EXISTS outbox_tenant_idx ON svelty_outbox ("tenantId")`,
+    `CREATE INDEX IF NOT EXISTS outbox_event_type_idx ON svelty_outbox ("eventType")`,
+    `CREATE INDEX IF NOT EXISTS outbox_created_at_idx ON svelty_outbox ("createdAt")`,
+
     // 404 Logs
     `CREATE TABLE IF NOT EXISTS "404_logs" (
 			"_id" VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -437,14 +477,14 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
 			"createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			"updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
-    `CREATE INDEX IF NOT EXISTS "404_logs_path_tenant_idx" ON "404_logs" (path, "tenantId")`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "404_logs_path_tenant_idx" ON "404_logs" (path, "tenantId")`,
 
     // Redirects MV
     `CREATE TABLE IF NOT EXISTS redirects_mv (
 			"_id" VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
 			"tenantId" VARCHAR(36) NOT NULL,
-			"from" VARCHAR(2000) NOT NULL,
-			"to" VARCHAR(2000) NOT NULL,
+			"source" VARCHAR(2000) NOT NULL,
+			"target" VARCHAR(2000) NOT NULL,
 			"type" INT NOT NULL DEFAULT 301,
 			"isRegex" BOOLEAN NOT NULL DEFAULT FALSE,
 			"active" BOOLEAN NOT NULL DEFAULT TRUE,
@@ -452,7 +492,7 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
 			"createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			"updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
-    `CREATE INDEX IF NOT EXISTS redirects_mv_tenant_from_idx ON redirects_mv ("tenantId", "from")`,
+    `CREATE INDEX IF NOT EXISTS idx_redirects_mv_lookup ON redirects_mv ("tenantId", "source", "active")`,
 
     // Workflow Definitions
     `CREATE TABLE IF NOT EXISTS workflow_definitions (
@@ -485,7 +525,12 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
   ];
 
   for (const query of queries) {
-    await sql.unsafe(query);
+    try {
+      await sql.unsafe(query);
+    } catch (err: any) {
+      // Never abort the whole migration for a single statement; log and continue.
+      logger.warn(`[PostgreSQL] Migration statement failed (continuing): ${err?.message || err}`);
+    }
   }
 
   // Add isRegistered column if it doesn't exist (for existing databases)
@@ -503,6 +548,14 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
     await sql.unsafe(`ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS "backupCodes" JSONB`);
     await sql.unsafe(
       `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS "last2FAVerification" TIMESTAMP WITH TIME ZONE`,
+    );
+    await sql.unsafe(`ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS "authenticators" JSONB`);
+    await sql.unsafe(`ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS "preferences" JSONB`);
+    await sql.unsafe(
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS "failedAttempts" INT NOT NULL DEFAULT 0`,
+    );
+    await sql.unsafe(
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS "lockoutUntil" TIMESTAMP WITH TIME ZONE`,
     );
     await sql.unsafe(`ALTER TABLE content_nodes ADD COLUMN IF NOT EXISTS "collectionDef" JSONB`);
     await sql.unsafe(
@@ -536,6 +589,36 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
       // Ignore
     }
 
+    // 🚀 MIGRATION: Rename 'from'/'to' columns to 'source'/'target' in redirects_mv if needed
+    try {
+      const fromColumns = await sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'redirects_mv' AND column_name = 'from'
+      `;
+      if (fromColumns.length > 0) {
+        logger.info(
+          "[PostgreSQL] Migrating 'from'/'to' columns to 'source'/'target' in redirects_mv...",
+        );
+        await sql.unsafe('ALTER TABLE redirects_mv RENAME COLUMN "from" TO "source"');
+        await sql.unsafe('ALTER TABLE redirects_mv RENAME COLUMN "to" TO "target"');
+        try {
+          await sql.unsafe("DROP INDEX IF EXISTS redirects_mv_tenant_from_idx");
+        } catch {}
+      }
+    } catch {
+      // Ignore
+    }
+
+    // 🚀 MIGRATION: Ensure compound lookup index (tenantId, source, active) exists
+    try {
+      await sql.unsafe(
+        'CREATE INDEX IF NOT EXISTS idx_redirects_mv_lookup ON redirects_mv ("tenantId", "source", "active")',
+      );
+    } catch {
+      // Index may already exist
+    }
+
     // 🚀 MIGRATION: Ensure 'isDeleted' column exists in all dynamic collections
     try {
       const tables = await sql`
@@ -546,7 +629,7 @@ async function createTablesIfNotExist(sql: postgres.Sql): Promise<void> {
       for (const row of tables) {
         const tableName = row.table_name;
         await sql.unsafe(
-          `ALTER TABLE "${tableName}" ADD COLUMN IF NOT EXISTS "isDeleted" BOOLEAN NOT NULL DEFAULT FALSE`,
+          `ALTER TABLE "${tableName.replace(/"/g, '""')}" ADD COLUMN IF NOT EXISTS "isDeleted" BOOLEAN NOT NULL DEFAULT FALSE`,
         );
       }
     } catch {

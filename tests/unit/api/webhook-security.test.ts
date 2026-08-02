@@ -51,7 +51,11 @@ describe("Webhook API Security - IDOR and Tenant Isolation", () => {
 
     it("should allow super-admin to override tenantId via query parameter", async () => {
       const event = {
-        locals: { user: mockSuperAdmin, tenantId: myTenant, __testBypass: true },
+        locals: {
+          user: mockSuperAdmin,
+          tenantId: myTenant,
+          __testBypass: true,
+        },
         params: { path: "webhooks" },
         request: { method: "GET", headers: new Headers() },
         url: new URL(`http://localhost/api/webhooks?tenantId=${otherTenant}`),
@@ -79,7 +83,11 @@ describe("Webhook API Security - IDOR and Tenant Isolation", () => {
 
     it("should reject non-admins", async () => {
       const event = {
-        locals: { user: { role: "user" }, tenantId: myTenant, __testBypass: true },
+        locals: {
+          user: { role: "user" },
+          tenantId: myTenant,
+          __testBypass: true,
+        },
         params: { path: "webhooks" },
         request: { method: "POST", headers: new Headers() },
         url: new URL("http://localhost/api/webhooks"),
@@ -100,7 +108,10 @@ describe("Webhook API Security - IDOR and Tenant Isolation", () => {
         params: { path: "webhooks" },
         request: {
           method: "POST",
-          json: vi.fn().mockResolvedValue({ url: "http://example.com", event: "entry:create" }),
+          json: vi.fn().mockResolvedValue({
+            url: "http://example.com",
+            event: "entry:create",
+          }),
           headers: new Headers(),
         },
         url: new URL("http://localhost/api/webhooks"),
@@ -187,12 +198,11 @@ describe("Webhook API Security - IDOR and Tenant Isolation", () => {
         params: { path: `webhooks/${webhookId}` },
         locals: { user: mockUser, tenantId: myTenant, __testBypass: true },
         request: { method: "DELETE", headers: new Headers() },
-        url: new URL(`http://localhost/api/system/webhooks/${webhookId}`),
+        url: new URL(`http://localhost/api/webhooks/${webhookId}`),
         cookies: { get: vi.fn() },
       } as any;
 
-      const response = await dispatcherPOST(event); // DELETE is routed via POST dispatcher in unified gatekeeper or I should use DELETE?
-      // Actually, my +server.ts routes all methods. Let's use dispatcherPOST as it's the catch-all for now or exported DELETE.
+      const response = await dispatcherDELETE(event);
       expect(response.status).toBe(200);
       expect(webhookService.deleteWebhook).toHaveBeenCalledWith(webhookId, myTenant);
     });
@@ -224,9 +234,13 @@ describe("Webhook API Security - IDOR and Tenant Isolation", () => {
 
       const event = {
         params: { path: `webhooks/${webhookId}/test` },
-        locals: { user: mockSuperAdmin, tenantId: myTenant, __testBypass: true },
+        locals: {
+          user: mockSuperAdmin,
+          tenantId: myTenant,
+          __testBypass: true,
+        },
         request: { method: "POST", json: vi.fn(), headers: new Headers() },
-        url: new URL(`http://localhost/api/system/webhooks/${webhookId}/test`),
+        url: new URL(`http://localhost/api/webhooks/${webhookId}/test`),
         cookies: { get: vi.fn() },
       } as any;
 

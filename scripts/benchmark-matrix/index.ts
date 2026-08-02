@@ -1,470 +1,1026 @@
 /**
- * @file scripts\benchmark-matrix\index.ts
- * @description Entry point for the benchmark matrix tool.
+ * @file scripts/benchmark-matrix/index.ts
+ * @description Smart benchmark matrix orchestrator.
+ *
+ * Starts ONE server per database, seeds comprehensive data once,
+ * runs all benchmark tests against the shared server,
+ * shows per-test results inline with ETA, stops on first failure, evaluates results.
+ *
+ * Features:
+ * - clean, minimal terminal output with \r running indicators
+ * - ETA calculation using weighted heuristics
+ * - smart test grouping with ordered execution
+ * - fail-fast on first test failure
+ * - per-database report evaluation
+ *
+ * ### Benchmark modes (config isolation)
+ * - **Local** (`config/private.ts` exists): env-only via `BENCHMARK=true` — never reads or
+ *   writes the developer's `private.ts`. Uses isolated DB (`benchmark_shared` for SQLite).
+ *   Skips setup wizard; seeds via `/api/testing` only (same as `setupBenchmarkServer`).
+ * - **CI-fresh** (no `config/private.ts`, mirrors `.github/workflows/ci.yml` bench-core):
+ *   runs `setup-system.ts` wizard (writes `private.test.ts` under `TEST_MODE`).
+ *
+ * Usage:
+ *   COMPILE_ALL_ADAPTERS=true bun run build
+ *   bun run benchmark --db=sqlite
+ *   bun run scripts/benchmark-matrix/index.ts --db=sqlite,mongodb
  */
 
-// 🚀 ENTERPRISE HARDENING: Ensure benchmark mode is detectable by all sub-modules
-process.env.SVELTY_BENCHMARK_SUITE = "true";
-process.env.BENCHMARK_MODE = "1";
-process.env.BENCHMARK_STABLE = "true";
-
-import chalk from "chalk";
-import fs from "node:fs/promises";
+import { spawn, execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { getBenchmarkTestEnv } from "../../src/utils/test-db-credentials.ts";
+import {
+  getLocalSandboxMediaRel,
+  getLocalSandboxMediaRoot,
+  printBenchmarkIsolationBanner,
+  resolveBenchmarkProfile,
+} from "../../src/utils/benchmark-sandbox.ts";
+import { getTestApiSecret } from "./config.ts";
 
-import { version as pkgVersion } from "../../package.json";
-import { log } from "./logger";
-import { parseArgs, printList, filterScripts, filterDatabases, collectHostInfo } from "./cli";
-import { requiresRebuild } from "./utils";
-import { runAuditForDatabase, runTask } from "./runner";
-import {
-  printSummaryTable,
-  writeCISummary,
-  generateFinalReport,
-  scanResultsDirectory,
-} from "./reporting";
-import {
-  startServer,
-  stopServer,
-  ensureDatabaseExists,
-  setShuttingDown,
-  isShuttingDown,
-} from "./server";
-import { AsyncSemaphore } from "./semaphore";
-import {
-  ALL_DATABASES,
-  BENCHMARK_SCRIPTS,
-  DB_ORDER,
-  PORT_BASE,
-  getConcurrencyForDb,
-  ADMIN_PASSWORD,
-  TEST_API_SECRET,
-  JWT_SECRET_KEY,
-  ENCRYPTION_KEY,
-  ROOT_RESULTS_DIR,
-  HEALING_PORT_OFFSET,
-} from "./config";
-import type { BenchmarkResult } from "./types";
+/** After these tests the shared server is often unhealthy — force restart. */
+const DESTRUCTIVE_OR_STRESS_TESTS = new Set([
+  "concurrency-max",
+  "concurrency-race",
+  "concurrency-throughput",
+  "database-failover",
+  "chaos-resilience",
+  "circuit-breaker-failover",
+  "failure-propagation",
+  "data-residency-failover",
+  "graphql-stress",
+  "throttling-backoff-stress",
+  "media-upload-stress",
+  "large-payload-streaming",
+  "websocket-broadcast",
+]);
 
-import { initProgressTracker } from "./progress";
+const DBS = ["sqlite", "mariadb", "postgresql", "mongodb"];
+const filter =
+  process.argv
+    .find((a) => a.startsWith("--db="))
+    ?.split("=")[1]
+    .toLowerCase()
+    .split(",") || null;
+const databases = filter ? DBS.filter((d) => filter.includes(d)) : DBS;
+const CONTINUE_ON_ERROR =
+  process.argv.includes("--continue-on-error") || process.argv.includes("--continue");
+
+// Auto-discover all test files
+const testFiles = fs
+  .readdirSync("tests/benchmarks")
+  .filter((f) => f.endsWith(".test.ts"))
+  .sort();
+
+// Smart test ordering groups based on workload analysis
+const GROUPS = [
+  {
+    name: "Core HTTP Read",
+    parallel: true,
+    tests: [
+      "truth-latency",
+      "rest-api-performance",
+      "api-latency",
+      "auth-performance",
+      "failure-propagation",
+      "circuit-breaker-failover",
+      "chaos-resilience",
+    ],
+  },
+  {
+    name: "GraphQL + Cache",
+    parallel: true,
+    tests: [
+      "graphql-api-performance",
+      "graphql-stress",
+      "cache-performance",
+      "cache-hit-ratio",
+      "negative-cache",
+    ],
+  },
+  {
+    name: "Feature HTTP Read",
+    parallel: true,
+    tests: [
+      "admin-ux-vitality",
+      "multi-tenant-performance",
+      "openapi-performance",
+      "relational-performance",
+      "seo-performance",
+      "mixed-workload",
+      "realtime-performance",
+    ],
+  },
+  {
+    name: "SDK/Local Read",
+    parallel: true,
+    tests: [
+      "local-api-performance",
+      "entry-edit-hydration",
+      "widget-performance",
+      "etag-hash",
+      "ai-performance",
+      "telemetry-performance",
+    ],
+  },
+  {
+    name: "HTTP Write/Mutation",
+    parallel: false,
+    tests: [
+      "hooks-performance",
+      "production-day",
+      "data-residency-failover",
+      "temporal-integrity",
+      "client-journey",
+      "index-pressure",
+      "right-to-be-forgotten-audit",
+      "revision-stress",
+    ],
+  },
+  {
+    name: "SDK Write/Mutation",
+    parallel: false,
+    tests: [
+      "local-api-throughput",
+      "database-performance",
+      "transaction-acid",
+      "security-audit",
+      "behavioral-learning",
+      "cache-eviction-leak",
+      "cache-service",
+      "database-failover",
+    ],
+  },
+  {
+    name: "Filesystem + Stress",
+    parallel: false,
+    tests: [
+      "content-scan",
+      "content-incremental-reload",
+      "content-scale-stress",
+      "throttling-backoff-stress",
+      "state-machine-transition",
+      "media-performance",
+      "media-upload-stress",
+      "large-payload-streaming",
+      "migration-scale",
+      "concurrency-max",
+      "concurrency-race",
+      "concurrency-throughput",
+      "dev-dependency-load",
+      "edge-sync",
+      "websocket-broadcast",
+      "build-analysis",
+    ],
+  },
+];
+
+function getHistoricWeights(): Record<string, number> {
+  const jsonlPath = "tests/benchmarks/results/history.jsonl";
+  const weights: Record<string, number> = {};
+  if (!fs.existsSync(jsonlPath)) return weights;
+
+  try {
+    const raw = fs.readFileSync(jsonlPath, "utf8").trim().split("\n").filter(Boolean);
+    const entries = raw.map((line) => JSON.parse(line));
+
+    const groups: Record<string, number[]> = {};
+    for (const e of entries) {
+      if (e.testFile && e.wallClockMs && e.status === "SUCCESS") {
+        const baseName = path.basename(e.testFile).replace(".test.ts", "");
+        if (!groups[baseName]) groups[baseName] = [];
+        groups[baseName].push(e.wallClockMs);
+      }
+    }
+
+    for (const [testFile, times] of Object.entries(groups)) {
+      const avgSec = times.reduce((a, b) => a + b, 0) / times.length / 1000;
+      weights[testFile] = Math.max(avgSec, 1);
+    }
+  } catch {
+    // fallback
+  }
+  return weights;
+}
+
+// Tests to skip in matrix mode (not meaningful against a shared server)
+const SKIP_IN_MATRIX = new Set([
+  "cold-start-phased", // Measures server boot time, meaningless against shared server
+  "setup-proxy", // Measures server boot + cold start, meaningless against shared server
+  "longevity-soak", // Runs for hours, not suitable for matrix
+  "memory-stability", // Runs for minutes measuring memory, not suitable for matrix
+]);
 
 /**
- * ✨ Configuration Safeguard (Enterprise Resilience)
- * Ensures test configurations and mock artifacts are purged, leaving user private configs untouched.
+ * Estimated test durations (seconds) for ETA weighting.
+ * Used as fallback when fewer than 3 tests have completed,
+ * then actual averages take over.
  */
-class ConfigSafeguard {
-  private static configPath = path.join(process.cwd(), "config/private.test.ts");
+const TEST_WEIGHTS: Record<string, number> = {
+  // Core HTTP Read: ~12s avg
+  "truth-latency": 15,
+  "rest-api-performance": 5,
+  "api-latency": 3,
+  "auth-performance": 5,
+  "failure-propagation": 3,
+  "circuit-breaker-failover": 2,
+  "chaos-resilience": 60,
+  // GraphQL + Cache: ~10s avg
+  "graphql-api-performance": 10,
+  "graphql-stress": 10,
+  "cache-performance": 8,
+  "cache-hit-ratio": 10,
+  "negative-cache": 5,
+  // Feature HTTP Read: ~10s avg
+  "admin-ux-vitality": 10,
+  "multi-tenant-performance": 15,
+  "openapi-performance": 8,
+  "relational-performance": 12,
+  "seo-performance": 10,
+  "mixed-workload": 15,
+  "realtime-performance": 10,
+  // SDK/Local Read: ~5s avg
+  "local-api-performance": 5,
+  "entry-edit-hydration": 8,
+  "widget-performance": 10,
+  "etag-hash": 15,
+  "ai-performance": 5,
+  "telemetry-performance": 5,
+  // HTTP Write/Mutation: ~20s avg
+  "hooks-performance": 15,
+  "production-day": 20,
+  "data-residency-failover": 15,
+  "temporal-integrity": 10,
+  "client-journey": 15,
+  "index-pressure": 30,
+  "right-to-be-forgotten-audit": 15,
+  "revision-stress": 20,
+  // SDK Write/Mutation: ~20s avg
+  "local-api-throughput": 20,
+  "database-performance": 25,
+  "transaction-acid": 15,
+  "security-audit": 20,
+  "behavioral-learning": 10,
+  "cache-eviction-leak": 15,
+  "cache-service": 20,
+  "database-failover": 15,
+  // Filesystem + Stress: ~30s avg
+  "content-scan": 15,
+  "content-incremental-reload": 20,
+  "content-scale-stress": 20,
+  "throttling-backoff-stress": 15,
+  "state-machine-transition": 20,
+  "media-performance": 30,
+  "media-upload-stress": 25,
+  "large-payload-streaming": 20,
+  "migration-scale": 25,
+  "concurrency-max": 30,
+  "concurrency-race": 30,
+  "concurrency-throughput": 30,
+  "dev-dependency-load": 15,
+  "edge-sync": 10,
+  "websocket-broadcast": 20,
+  "build-analysis": 60,
+};
 
-  /** No backup needed for private.test.ts since it is dynamic and transient */
-  static async backup() {
-    // No-op: private.test.ts is transient
+function getTestName(file: string): string {
+  return file.replace(".test.ts", "");
+}
+
+function formatTime(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}m ${s}s`;
+}
+
+function isHealthReady(data: Record<string, unknown>): boolean {
+  const status = String(data.overallStatus ?? data.status ?? "").toUpperCase();
+  const db = data.database;
+  const dbOk = db === true || db === "connected";
+  const readyStates = new Set(["READY", "WARMED", "DEGRADED"]);
+  return readyStates.has(status) && dbOk;
+}
+
+async function waitForServerReady(url: string, maxAttempts = 90): Promise<boolean> {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const r = await fetch(`${url}/api/system/health`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!r.ok) continue;
+      const data = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+      if (isHealthReady(data)) return true;
+    } catch {
+      // retry
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
+}
+
+function spawnTestProcess(
+  file: string,
+  serverEnv: Record<string, string>,
+  baseUrl: string,
+  runId: string,
+): Promise<{ code: number; durationMs: number; output: string }> {
+  return new Promise((resolve) => {
+    const testStartTime = performance.now();
+    const p = spawn("bun", ["test", `tests/benchmarks/${file}`, "--timeout", "300000"], {
+      stdio: ["inherit", "pipe", "pipe"],
+      shell: process.platform === "win32",
+      env: {
+        ...serverEnv,
+        API_BASE_URL: baseUrl,
+        BENCHMARK_MATRIX: "1",
+        BENCHMARK_RUN_ID: runId,
+      } as Record<string, string>,
+    });
+
+    let output = "";
+    p.stdout.on("data", (d: Buffer) => {
+      output += d.toString();
+    });
+    p.stderr.on("data", (d: Buffer) => {
+      output += d.toString();
+    });
+
+    p.on("close", (code) => {
+      const durationMs = performance.now() - testStartTime;
+      resolve({
+        code: code ?? 1,
+        durationMs,
+        output,
+      });
+    });
+  });
+}
+
+function calculateGroupDuration(
+  groupFiles: string[],
+  historicWeights: Record<string, number>,
+  concurrency: number,
+): string {
+  let sum = 0;
+  for (const file of groupFiles) {
+    const name = getTestName(file);
+    sum += historicWeights[name] || TEST_WEIGHTS[name] || 10;
+  }
+  return formatTime(sum / concurrency);
+}
+
+function printProgressDashboard(opts: {
+  groupName: string;
+  groupDone: number;
+  groupTotal: number;
+  runningCount: number;
+  completedGlobal: number;
+  totalGlobal: number;
+  testEtaSeconds: number;
+  globalEtaSeconds: number;
+}) {
+  const width = 16;
+  const percent = Math.min(100, Math.max(0, (opts.completedGlobal / opts.totalGlobal) * 100));
+  const filled = Math.round((width * percent) / 100);
+  const bar = "\u2588".repeat(filled) + "\u2591".repeat(width - filled);
+  const active = opts.runningCount > 0 ? ` (${opts.runningCount} active)` : "";
+  const testEta = opts.runningCount > 0 ? ` | Test ETA: ${formatTime(opts.testEtaSeconds)}` : "";
+  const line1 = `  \u2192 Group [${opts.groupName}]: ${opts.groupDone}/${opts.groupTotal} passed${active}${testEta}`;
+  const line2 = `  \uD83D\uDCCA ${bar} ${Math.round(percent)}% | ${opts.completedGlobal}/${opts.totalGlobal} done | Total: ${formatTime(opts.globalEtaSeconds)}`;
+  process.stdout.write(`\r\x1B[K${line1}\n\x1B[K${line2}\x1B[1A`);
+}
+
+let globalRemainingFiles: string[] = [];
+const activeTestDurations = new Map<string, number>();
+
+function calculateGlobalRemainingSeconds(
+  runningTests: Set<string>,
+  historicWeights: Record<string, number>,
+  concurrency: number,
+): number {
+  let combinedWeightSeconds = 0;
+  for (const file of globalRemainingFiles) {
+    const name = getTestName(file);
+    combinedWeightSeconds += historicWeights[name] || TEST_WEIGHTS[name] || 10;
+  }
+  for (const file of runningTests) {
+    const name = getTestName(file);
+    const totalEst = historicWeights[name] || TEST_WEIGHTS[name] || 10;
+    const elapsed = (activeTestDurations.get(file) || 0) / 1000;
+    combinedWeightSeconds += Math.max(totalEst * 0.2, totalEst - elapsed);
+  }
+  return Math.max(0, combinedWeightSeconds / concurrency);
+}
+
+async function run() {
+  let totalFailed = 0;
+
+  const buildEntry = path.join(process.cwd(), "build", "index.js");
+  if (!fs.existsSync(buildEntry)) {
+    console.error("❌ build/index.js missing.");
+    console.error("   Run: COMPILE_ALL_ADAPTERS=true bun run build");
+    process.exit(1);
   }
 
-  /** Cleans up leaked test configurations and mock collections */
-  static async restore() {
-    try {
-      // Clean up the transient test configuration if it exists
-      await fs.rm(this.configPath, { force: true });
-      log.info("🛡️ Cleanup: Transient config/private.test.ts removed.");
+  try {
+    const { spawnSync: sync } = await import("node:child_process");
+    // Prefer `bun` on PATH (Windows installs may not expose `bun.cmd` to spawnSync).
+    const verify = sync("bun", ["run", "scripts/verify-prod-build-backdoor.ts", "--mode=bench"], {
+      cwd: process.cwd(),
+      stdio: "pipe",
+      shell: process.platform === "win32",
+      env: process.env,
+    });
+    if (verify.status !== 0) {
+      console.error(verify.stderr?.toString() || verify.stdout?.toString());
+      console.error(
+        "❌ Benchmark build verification failed. Run: COMPILE_ALL_ADAPTERS=true bun run build",
+      );
+      process.exit(1);
+    }
+  } catch {
+    /* verify script optional in minimal env */
+  }
 
-      // Purge mock collections to prevent redirection leaks
-      const compiledDir = path.join(process.cwd(), ".compiledCollections");
-      const files = await fs.readdir(compiledDir).catch(() => []);
-      for (const file of files) {
-        if (file.includes("bench") || file.includes("mock") || file.startsWith("benchmark_")) {
-          await fs.rm(path.join(compiledDir, file), {
-            recursive: true,
-            force: true,
-          });
+  const profile = resolveBenchmarkProfile();
+  process.env.BENCHMARK_PROFILE = profile;
+  process.env.BENCHMARK = "true";
+
+  // Build ordered test list from smart groups
+  const allGroupedNames = new Set(GROUPS.flatMap((g) => g.tests));
+  const orderedTests: string[] = [];
+
+  for (const group of GROUPS) {
+    for (const testName of group.tests) {
+      const file = testFiles.find((f) => getTestName(f) === testName);
+      if (file && !orderedTests.includes(file)) {
+        orderedTests.push(file);
+      }
+    }
+  }
+
+  // Add any remaining ungrouped tests at the end
+  for (const file of testFiles) {
+    if (!allGroupedNames.has(getTestName(file))) {
+      orderedTests.push(file);
+    }
+  }
+
+  for (const db of databases) {
+    const useRedis = process.env.USE_REDIS === "true";
+    const dbLabel = useRedis ? `${db.toUpperCase()}+REDIS` : db.toUpperCase();
+    // Per-DB run id so finalizeReport does not mix sqlite+pg+mongo metrics
+    const BENCHMARK_RUN_ID = randomUUID();
+    console.log(`\n${"\u2501".repeat(70)}`);
+    console.log(`  ${dbLabel}: ${orderedTests.length} tests`);
+    console.log(`${"\u2501".repeat(70)}`);
+
+    // ── Phase 1: Start server ──
+    const port = 4173 + Math.floor(Math.random() * 500);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const apiSecret = getTestApiSecret();
+    const adminPassword = "Password123!";
+
+    printBenchmarkIsolationBanner(db);
+
+    // Always ensure media sandbox exists (local + ci-fresh — avoids ENOENT on first upload)
+    try {
+      fs.mkdirSync(getLocalSandboxMediaRoot(), { recursive: true });
+    } catch {
+      /* ignore */
+    }
+
+    const mediaFolderRel = getLocalSandboxMediaRel();
+    const serverEnv = {
+      ...getBenchmarkTestEnv(db, {
+        PORT: String(port),
+        API_BASE_URL: baseUrl,
+        ORIGIN: baseUrl,
+        HOST: "127.0.0.1",
+        TEST_API_SECRET: apiSecret,
+        ADMIN_PASSWORD: adminPassword,
+        BENCHMARK_PROFILE: profile,
+        // Honour USE_REDIS=true for redis report variants (benchmark_*_redis.mdx)
+        USE_REDIS: process.env.USE_REDIS === "true" ? "true" : "false",
+        LOG_LEVEL: "fatal",
+        QUIET: "true",
+        SVELTY_BENCHMARK_SUITE: "true",
+        NODE_ENV: "test",
+        // Always point media at sandbox (ci-fresh wizard may leave mediaFolder missing)
+        MEDIA_FOLDER: mediaFolderRel,
+        ...(profile === "local" ? { BENCHMARK_LOCAL_SANDBOX: "1" } : {}),
+      }),
+    } as Record<string, string>;
+
+    let serverLogs = "";
+    /** True when the shared server child has exited (crash / kill). */
+    let serverExited = false;
+    // Prefer index.cjs (Yjs /ws on upgrade). adapter-node build/index.js has no WS attach.
+    const serverEntry = fs.existsSync(path.join(process.cwd(), "index.cjs"))
+      ? "index.cjs"
+      : "build/index.js";
+
+    /**
+     * Rebuild if mid-run cleanup wiped production artifacts.
+     * MUST use COMPILE_ALL_ADAPTERS=true — plain `bun run build` strips /api/testing
+     * via testBackdoorStripperPlugin and breaks matrix seed/media.
+     */
+    const ensureBuildArtifacts = () => {
+      const handler = path.join(process.cwd(), "build", "handler.js");
+      const adapterEntry = path.join(process.cwd(), "build", "index.js");
+      const yjs = path.join(process.cwd(), "build", "yjs-sync-server.js");
+      const needsHandler = !fs.existsSync(handler);
+      const needsAdapter = !fs.existsSync(adapterEntry);
+      const needsYjs = serverEntry.endsWith("index.cjs") && !fs.existsSync(yjs);
+      // Detect deploy-stripped builds (testing backdoor removed)
+      let stripped = false;
+      if (fs.existsSync(handler)) {
+        try {
+          const sample = fs.readFileSync(handler, "utf8");
+          stripped =
+            sample.includes("SVELTY_TEST_BACKDOOR_STRIPPED") ||
+            sample.includes("virtual:test-noop");
+        } catch {
+          /* ignore */
         }
       }
-      // Also purge 'nested' benchmark directory if it exists
-      await fs
-        .rm(path.join(compiledDir, "nested"), { recursive: true, force: true })
-        .catch(() => {});
-    } catch (err: any) {
-      log.error(`Safeguard failed: ${err.message}`);
-    }
-  }
-}
-
-/**
- * Register SIGINT / SIGTERM handlers so Ctrl-C cleanly kills any child
- * worker servers before exit.
- */
-function registerShutdownHandlers() {
-  const onSignal = async (sig: string) => {
-    setShuttingDown(true);
-    log.warn(`Received ${sig} — graceful shutdown...`);
-    await stopServer();
-    await ConfigSafeguard.restore(); // Ensure restoration on termination
-    process.exit(130);
-  };
-  process.on("SIGINT", () => onSignal("SIGINT"));
-  process.on("SIGTERM", () => onSignal("SIGTERM"));
-}
-
-/**
- * Smart cleanup: Only wipe when doing full or multi-test runs.
- * Preserve everything in single-test mode.
- */
-async function cleanupResults(activeDatabases: any[], cfg: any, activeScripts?: any[]) {
-  const isSingleTest = activeScripts && activeScripts.length === 1;
-  const isSingleDb = activeDatabases.length === 1;
-
-  if (cfg.forceClean) {
-    log.warn("Force clean mode — wiping all results for active databases");
-    // do full cleanup regardless of single test
-  } else if (isSingleTest) {
-    log.info(
-      `Single test mode (${activeScripts![0].shortLabel}) — preserving ALL previous results`,
-    );
-    return;
-  }
-
-  if (isSingleDb && activeDatabases[0]) {
-    const dbKey = (activeDatabases[0].label || activeDatabases[0].type)
-      .toLowerCase()
-      .replace("+", "-");
-
-    log.info(`Single database mode (${dbKey}) — preserving existing results`);
-
-    const dbDir = path.join(ROOT_RESULTS_DIR, dbKey);
-    // Preserve results — individual tests overwrite their own files
-    await fs.mkdir(dbDir, { recursive: true });
-    return;
-  }
-
-  log.info("Full suite — performing selective result cleanup...");
-  try {
-    const activeKeys = new Set(
-      activeDatabases.flatMap((db) => {
-        const key = (db.label || db.type).toLowerCase().replace("+", "-");
-        return [key, `${key}-redis`];
-      }),
-    );
-
-    log.info(`Active cleanup keys: ${Array.from(activeKeys).join(", ")}`);
-
-    const files = await fs.readdir(ROOT_RESULTS_DIR);
-    for (const file of files) {
-      if (file === "history.sqlite" || file === "ci-summary.json" || file === "history.jsonl")
-        continue;
-
-      if (activeKeys.has(file)) {
-        log.info(`Preserving: ${file}`);
-      } else {
-        log.info(`Preserving data: ${file}`);
-      }
-    }
-  } catch (err) {
-    log.warn(`Cleanup failed: ${err}`);
-  }
-}
-
-/**
- * Main orchestration entry point for the SveltyCMS Enterprise Audit.
- */
-async function main() {
-  registerShutdownHandlers();
-
-  const cfg = parseArgs();
-
-  // 🚀 WINDOWS RESILIENCE: Set local TMP/TEMP to avoid AppData\Local\Temp locking issues
-  if (process.platform === "win32") {
-    const localTmp = path.join(process.cwd(), "tmp");
-    await fs.mkdir(localTmp, { recursive: true });
-    process.env.TMP = localTmp;
-    process.env.TEMP = localTmp;
-  }
-
-  // 🚀 HARDENING: Purge stale SQLite files to avoid boot-time state contamination
-  const dbDir = path.join(process.cwd(), "config/database");
-  try {
-    const dbFiles = await fs.readdir(dbDir);
-    for (const f of dbFiles) {
-      if (
-        f.startsWith("bench_tmp_") &&
-        (f.endsWith(".sqlite") || f.endsWith(".sqlite-shm") || f.endsWith(".sqlite-wal"))
-      ) {
-        await fs.unlink(path.join(dbDir, f)).catch(() => {});
-      }
-    }
-    log.info("🛡️ Isolation: Stale SQLite files purged.");
-  } catch {
-    // Ignore if directory missing
-  }
-
-  // Initialize Safeguard before any logic
-  await ConfigSafeguard.backup();
-
-  if (cfg.list) {
-    await printList();
-    process.exit(0);
-  }
-
-  const hostInfo = await collectHostInfo();
-  const activeScripts = filterScripts(cfg);
-  const activeDatabases = filterDatabases(cfg);
-
-  // Clean up existing results only for the databases we are about to audit
-  await cleanupResults(activeDatabases, cfg, activeScripts);
-
-  if (cfg.sectionFilter) log.info(`Section filter: ${cfg.sectionFilter.join(", ")}`);
-  if (cfg.levelFilter !== null) log.info(`Level filter: ≤ ${cfg.levelFilter}`);
-  if (cfg.onlyFilter) log.info(`Only: ${cfg.onlyFilter.join(", ")}`);
-  if (cfg.dbFilter) log.info(`DB filter: ${cfg.dbFilter.join(", ")}`);
-  if (cfg.skipRedis) log.info("Redis variants: SKIPPED");
-  if (cfg.ci) log.info("CI mode: enabled");
-
-  log.header(`SveltyCMS Enterprise Audit v${pkgVersion}`);
-  log.info(`Scripts to run: ${activeScripts.length} / ${BENCHMARK_SCRIPTS.length}`);
-  log.info(`Databases to test: ${activeDatabases.length} / ${ALL_DATABASES.length}`);
-  log.info(`Retry attempts per script: ${cfg.retryCount}`);
-
-  // 🚀 Initialize Progress Tracker
-  const totalTasks = activeDatabases.length * activeScripts.length;
-  initProgressTracker(totalTasks);
-
-  const privateTestPath = path.join(process.cwd(), "config/private.test.ts");
-  try {
-    await fs.access(privateTestPath);
-    log.success("Isolation Guard: private.test.ts detected.");
-  } catch {
-    log.warn("Isolation Guard: private.test.ts missing. Attempting self-healing...");
-    // 🚀 DATABASE-AGNOSTIC: Use the first non-Redis db from the active filter
-    // (respects --db=mongodb, --db=postgresql, etc.) instead of hardcoding SQLite.
-    // This prevents failures when the SQLite adapter is excluded from the build.
-    const healingConf =
-      activeDatabases.find((d) => !d.useRedis) ??
-      ALL_DATABASES.find((d) => d.type === "sqlite" && !d.useRedis);
-    if (!healingConf) {
-      log.error("CRITICAL: No database config available for self-healing.");
-      process.exit(1);
-    }
-    log.info(`Self-healing using database: ${healingConf.type}`);
-    try {
-      const workerDbName_healing = `SveltyCMS_healing_test_${healingConf.type}`;
-      const healingPort = PORT_BASE + HEALING_PORT_OFFSET;
-      const server = await startServer(healingConf, healingPort, workerDbName_healing);
-      const ok = await runTask(
-        "Baseline Setup",
-        "bun run scripts/setup-system.ts",
-        {
-          DB_TYPE: healingConf.type,
-          DB_NAME: workerDbName_healing,
-          TEST_MODE: "true",
-          ADMIN_PASSWORD,
-          TEST_API_SECRET,
-          JWT_SECRET_KEY,
-          ENCRYPTION_KEY,
-          SUPPRESS_JEST_WARNINGS: "true",
-          API_BASE_URL: `http://127.0.0.1:${healingPort}`,
-        },
-        cfg.ci,
+      if (!needsHandler && !needsAdapter && !needsYjs && !stripped) return;
+      process.stdout.write(
+        stripped
+          ? "  Rebuilding (restore testing harness; COMPILE_ALL_ADAPTERS)... "
+          : "  Rebuilding missing production artifacts (COMPILE_ALL_ADAPTERS)... ",
       );
-      await server.stop();
-      if (!ok) {
-        log.error("CRITICAL: Self-healing failed. Run scripts/setup-system.ts manually.");
-        process.exit(1);
-      }
-      log.success(`Self-healing complete via ${healingConf.type}. private.test.ts generated.`);
-    } catch (e: any) {
-      log.error(`Self-healing interrupted: ${e.message}`);
-      await stopServer();
-      process.exit(1);
-    }
-  }
-
-  let buildMetrics: { durationMs: number } | null = null;
-  if (!cfg.skipBuild) {
-    if (!requiresRebuild()) {
-      log.success("Build is current — skipping rebuild.");
-    } else {
-      log.info("Phase 1: Production build (DX tracking)...");
-      const t0 = performance.now();
       try {
-        const buildEnv: Record<string, string | undefined> = {
-          ...process.env,
-          COMPILE_ALL_ADAPTERS: "true",
-        };
-        delete buildEnv.SVELTY_BENCHMARK_SUITE;
-        delete buildEnv.BENCHMARK_MODE;
-        delete buildEnv.BENCHMARK;
-        delete buildEnv.BENCHMARK_STABLE;
         execSync("bun run build", {
-          stdio: cfg.ci ? "pipe" : "inherit",
-          env: buildEnv,
-        });
-        const buildTimeMs = Math.round(performance.now() - t0);
-        log.success(`Build complete in ${(buildTimeMs / 1000).toFixed(3)}s.`);
-        buildMetrics = { durationMs: buildTimeMs };
-      } catch {
-        log.error("Build failed. Aborting.");
+          stdio: "pipe",
+          env: {
+            ...process.env,
+            COMPILE_ALL_ADAPTERS: "true",
+            NODE_ENV: "production",
+          },
+          timeout: 600_000,
+        } as any);
+        console.log("OK");
+      } catch (e: any) {
+        console.log("FAILED");
+        const note = e.stderr?.toString?.()?.slice(0, 400) || e.message;
+        console.error(`  Build recovery failed: ${note}`);
         process.exit(1);
       }
-    }
-  }
+    };
 
-  log.info("Phase 1.5: Infrastructure pre-check...");
-  for (const db of activeDatabases) {
-    try {
-      await ensureDatabaseExists(db);
-    } catch (e: any) {
-      log.warn(`Infrastructure check failed for ${db.type}: ${e.message}`);
-    }
-  }
-  log.success("Infrastructure readiness documented.");
+    const startServer = () => {
+      ensureBuildArtifacts();
+      process.stdout.write(`  Starting server (${serverEntry})... `);
+      serverExited = false;
+      const proc = spawn("node", [serverEntry], {
+        env: serverEnv,
+        stdio: "pipe",
+        shell: false,
+      });
+      serverLogs = "";
+      const appendLog = (d: Buffer) => {
+        serverLogs += d.toString();
+        if (serverLogs.length > 50_000) serverLogs = serverLogs.slice(-40_000);
+      };
+      proc.stdout?.on("data", appendLog);
+      proc.stderr?.on("data", appendLog);
+      proc.on("exit", (code, signal) => {
+        serverExited = true;
+        serverLogs += `\n[matrix] server exited code=${code} signal=${signal}\n`;
+      });
+      proc.on("error", (err) => {
+        serverExited = true;
+        serverLogs += `\n[matrix] server spawn error: ${err.message}\n`;
+      });
+      return proc;
+    };
 
-  log.info(`Phase 2: Database Audits (Mode: ${cfg.parallelMode.toUpperCase()})`);
-  const results: BenchmarkResult[] = [];
-  await fs.mkdir(ROOT_RESULTS_DIR, { recursive: true });
+    let server = startServer();
 
-  const sortedDbs = [...activeDatabases].sort((a, b) => {
-    const aKey = (a.label ?? a.type).toLowerCase().replace("+", "-");
-    const bKey = (b.label ?? b.type).toLowerCase().replace("+", "-");
-    const aIdx = (DB_ORDER as readonly string[]).indexOf(aKey);
-    const bIdx = (DB_ORDER as readonly string[]).indexOf(bKey);
-    return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
-  });
-
-  if (cfg.parallelMode === "off") {
-    for (let i = 0; i < sortedDbs.length; i++) {
-      if (isShuttingDown()) break;
-      const db = sortedDbs[i];
-      const dbKey = (db.label || db.type).toLowerCase().replace("+", "-");
-      log.info(`[${i + 1}/${sortedDbs.length}] Starting audit for ${dbKey.toUpperCase()}...`);
-      await runAuditForDatabase(
-        db,
-        hostInfo,
-        buildMetrics,
-        cfg,
-        activeScripts,
-        results,
-        ROOT_RESULTS_DIR,
-      );
-    }
-  } else {
-    // 🚀 ENGINE-AWARE CONCURRENCY: Limit parallel runs based on database capabilities
-    const semaphores = new Map<string, AsyncSemaphore>();
-    const tasks = sortedDbs.map(async (db, _i) => {
-      if (isShuttingDown()) return;
-
-      const engine = db.type.toLowerCase().split("-")[0];
-      if (!semaphores.has(engine)) {
-        semaphores.set(engine, new AsyncSemaphore(getConcurrencyForDb(engine)));
-      }
-
-      const semaphore = semaphores.get(engine)!;
-      await semaphore.acquire();
+    let healthy = await waitForServerReady(baseUrl);
+    if (!healthy) {
+      console.log("FAILED");
+      console.error(`  Server at ${baseUrl} did not reach READY+database in 45s`);
+      console.error(`  Logs: ${serverLogs.slice(0, 500)}`);
       try {
-        if (isShuttingDown()) return;
-        await runAuditForDatabase(
-          db,
-          hostInfo,
-          buildMetrics,
-          cfg,
-          activeScripts,
-          results,
-          ROOT_RESULTS_DIR,
+        server.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      totalFailed++;
+      console.error(`  Skipping remaining tests for ${dbLabel}; continuing with next DB…`);
+      continue;
+    }
+    console.log("OK");
+
+    /** Point DB MEDIA_FOLDER at sandbox (idempotent). */
+    const ensureMediaFolderSetting = async () => {
+      try {
+        const mediaSet = await fetch(`${baseUrl}/api/testing`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-mode": "true",
+            "x-test-secret": apiSecret,
+          },
+          body: JSON.stringify({
+            action: "set-setting",
+            key: "MEDIA_FOLDER",
+            value: mediaFolderRel,
+          }),
+        });
+        if (!mediaSet.ok) {
+          const t = await mediaSet.text().catch(() => "");
+          console.warn(`  ⚠️  MEDIA_FOLDER set-setting ${mediaSet.status}: ${t.slice(0, 120)}`);
+        }
+      } catch (e) {
+        console.warn(
+          `  ⚠️  MEDIA_FOLDER set-setting soft-failed: ${e instanceof Error ? e.message : e}`,
         );
-      } finally {
-        semaphore.release();
       }
-    });
-    await Promise.all(tasks);
-  }
+    };
 
-  const perfRegressions = await generateFinalReport(results, cfg);
-  const allRegressions = perfRegressions.map(
-    (r) =>
-      `${r.db} → ${r.metric}: ${r.current.toFixed(2)}ms (${r.changePct > 0 ? "+" : ""}${r.changePct.toFixed(1)}%)`,
-  );
+    /** Kill + respawn shared matrix server (always). */
+    const forceRestartServer = async (reason: string) => {
+      process.stdout.write(`  Restarting server (${reason})... `);
+      try {
+        server.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      // Wait until previous process is gone (avoids EADDRINUSE on Windows)
+      const deadDeadline = Date.now() + 5000;
+      while (!serverExited && Date.now() < deadDeadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      server = startServer();
+      healthy = await waitForServerReady(baseUrl);
+      console.log(healthy ? "OK" : "FAILED");
+      if (!healthy) {
+        console.error(`  Server restart failed. Logs: ${serverLogs.slice(0, 800)}`);
+        throw new Error(`Server restart failed (${reason})`);
+      }
+      // Re-seed admin + stable collection after cold restart (idempotent)
+      try {
+        await fetch(`${baseUrl}/api/testing`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-test-mode": "true",
+            "x-test-secret": apiSecret,
+          },
+          body: JSON.stringify({
+            action: "seed",
+            email: "admin@example.com",
+            password: adminPassword,
+          }),
+        });
+        await ensureMediaFolderSetting();
+        const { ensureStableTestData } =
+          await import("../../tests/benchmarks/modules/benchmark-utils.ts");
+        await ensureStableTestData(undefined, "global");
+      } catch (e) {
+        console.warn(
+          `  ⚠️  post-restart reseed soft-failed: ${e instanceof Error ? e.message : e}`,
+        );
+      }
+    };
 
-  printSummaryTable(results);
+    /** Restart when process died or health probe fails. */
+    const restartServerIfNeeded = async (reason: string) => {
+      if (!serverExited && (await waitForServerReady(baseUrl, 5))) return;
+      await forceRestartServer(serverExited ? `process-dead ${reason}` : reason);
+    };
 
-  const failedTests = results.filter((r) => r.status === "FAILED");
+    // ── Phase 2: Setup + seed (mode-aware) ──
+    // Never process.exit here — one DB failure must not abort remaining DBs (e.g. mongo after postgres).
+    let setupOk = true;
+    process.stdout.write(`  Setting up system... `);
+    if (profile === "ci-fresh") {
+      try {
+        execSync("bun run scripts/setup-system.ts", {
+          env: { ...serverEnv, API_BASE_URL: baseUrl, PRESET: "demo" },
+          stdio: "pipe",
+          timeout: 180_000,
+        } as any);
+        console.log("OK (CI-fresh wizard)");
+      } catch (e: any) {
+        console.log("FAILED");
+        const note = e.stderr?.toString().slice(0, 300) || e.message;
+        if (note) console.error(`  Setup error: ${note}`);
+        // Wizard may have partially written private.test.ts — still try seed path
+        console.warn("  ⚠️  Wizard failed; attempting seed against already-booted server…");
+      }
+    } else {
+      console.log("SKIP (local — never touches config/private.ts)");
+    }
 
-  if (cfg.ci) {
-    const summary = await writeCISummary(results, allRegressions);
-    if (summary.overall !== "PASS") {
-      log.error(
-        `CI check FAILED — ${summary.failed} DB(s) failed, ${allRegressions.length} regression(s), ${summary.budgetViolations.length} budget violation(s).`,
+    process.stdout.write(`  Seeding benchmark data... `);
+    try {
+      process.env.API_BASE_URL = baseUrl;
+      process.env.TEST_API_SECRET = apiSecret;
+
+      const seedRes = await fetch(`${baseUrl}/api/testing`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-test-mode": "true",
+          "x-test-secret": apiSecret,
+        },
+        body: JSON.stringify({
+          action: "seed",
+          email: "admin@example.com",
+          password: adminPassword,
+        }),
+      });
+      if (!seedRes.ok) {
+        const txt = await seedRes.text().catch(() => "");
+        throw new Error(`admin seed (${seedRes.status}): ${txt.slice(0, 300)}`);
+      }
+
+      // Point DB settings MEDIA_FOLDER at sandbox (wizard may still say mediaFolder)
+      await ensureMediaFolderSetting();
+
+      const { ensureStableTestData } =
+        await import("../../tests/benchmarks/modules/benchmark-utils.ts");
+      await ensureStableTestData(undefined, "global");
+      console.log("OK");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log("FAILED");
+      console.error(`  Seed error: ${msg}`);
+      setupOk = false;
+    }
+
+    if (!setupOk) {
+      try {
+        server.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      totalFailed++;
+      console.error(`  Skipping remaining tests for ${dbLabel}; continuing with next DB…`);
+      continue;
+    }
+
+    // ── Phase 3: Run tests ──
+    let passed = 0;
+    let failed = 0;
+    let skipped = 0;
+    const startTime = Date.now();
+
+    // ETA tracking
+    let totalElapsedTime = 0;
+    let completedTests = 0;
+
+    // Load historic weights
+    const historicWeights = getHistoricWeights();
+
+    // Initialize global time tracker
+    globalRemainingFiles = orderedTests.filter((f) => !SKIP_IN_MATRIX.has(getTestName(f)));
+    const totalGlobalCount = globalRemainingFiles.length;
+
+    // Count skipped tests
+    for (const file of orderedTests) {
+      if (SKIP_IN_MATRIX.has(getTestName(file))) skipped++;
+    }
+
+    const runningTests = new Set<string>();
+
+    for (const group of GROUPS) {
+      const groupFiles = orderedTests.filter(
+        (f) => group.tests.includes(getTestName(f)) && !SKIP_IN_MATRIX.has(getTestName(f)),
       );
-      await stopServer();
-      await ConfigSafeguard.restore();
-      process.exit(1);
+      if (groupFiles.length === 0) continue;
+
+      // Always serial against the shared server — parallel groups on
+      // MariaDB/Postgres/Mongo killed the process (process-dead storms).
+      const concurrency = 1;
+      const aboutTime = calculateGroupDuration(groupFiles, historicWeights, concurrency);
+
+      console.log(`\n  \u26A1 ${group.name} (${groupFiles.length} tests \u2248 ${aboutTime})`);
+      console.log(`  ${"\u2500".repeat(45)}`);
+
+      const groupQueue = [...groupFiles];
+      const groupTotalCount = groupFiles.length;
+      let groupPassedCount = 0;
+      const activePromises: Promise<void>[] = [];
+      activeTestDurations.clear();
+
+      // UI ticker (200ms refresh)
+      const UIInterval = setInterval(() => {
+        for (const file of runningTests) {
+          activeTestDurations.set(file, (activeTestDurations.get(file) || 0) + 200);
+        }
+        // Calculate test-level ETA for active tests
+        let testEtaSeconds = 0;
+        for (const file of runningTests) {
+          const name = getTestName(file);
+          const totalEst = historicWeights[name] || TEST_WEIGHTS[name] || 10;
+          const elapsed = (activeTestDurations.get(file) || 0) / 1000;
+          const remaining = Math.max(0, totalEst - elapsed);
+          if (testEtaSeconds === 0 || remaining < testEtaSeconds) testEtaSeconds = remaining;
+        }
+        const currentGlobalEta = calculateGlobalRemainingSeconds(
+          runningTests,
+          historicWeights,
+          concurrency,
+        );
+        printProgressDashboard({
+          groupName: group.name,
+          groupDone: groupPassedCount,
+          groupTotal: groupTotalCount,
+          runningCount: runningTests.size,
+          completedGlobal: completedTests,
+          totalGlobal: totalGlobalCount,
+          testEtaSeconds,
+          globalEtaSeconds: currentGlobalEta,
+        });
+      }, 200);
+
+      while (groupQueue.length > 0 || activePromises.length > 0) {
+        while (activePromises.length < concurrency && groupQueue.length > 0) {
+          const file = groupQueue.shift()!;
+          globalRemainingFiles = globalRemainingFiles.filter((f) => f !== file);
+          runningTests.add(file);
+          activeTestDurations.set(file, 0);
+
+          const name = getTestName(file);
+
+          const testPromise = (async () => {
+            try {
+              // Health-gate before every test — kills ConnectionRefused cascades after server death
+              await restartServerIfNeeded(`before ${name}`);
+              if (DESTRUCTIVE_OR_STRESS_TESTS.has(name)) {
+                if (!(await waitForServerReady(baseUrl, 2))) {
+                  await forceRestartServer(`pre-stress ${name}`);
+                }
+              }
+
+              const { code, durationMs, output } = await spawnTestProcess(
+                file,
+                serverEnv,
+                baseUrl,
+                BENCHMARK_RUN_ID,
+              );
+              runningTests.delete(file);
+              activeTestDurations.delete(file);
+              completedTests++;
+              totalElapsedTime += durationMs;
+
+              process.stdout.write("\r\x1B[K\n\x1B[K\x1B[1A");
+
+              const seqNum = groupPassedCount + 1;
+              const durationSec = (durationMs / 1000).toFixed(1);
+
+              if (code !== 0) {
+                failed++;
+                clearInterval(UIInterval);
+                console.log(
+                  `  ${seqNum.toString().padEnd(2)} ${name.padEnd(35)} \u274C  FAILED (${durationSec}s)`,
+                );
+                const lines = output.split("\n").filter(Boolean);
+                const tail = lines.slice(-20);
+                console.log(`  ${"\u2500".repeat(55)}`);
+                for (const line of tail) console.log(`  ${line}`);
+                console.log(`  ${"\u2500".repeat(55)}`);
+                if (CONTINUE_ON_ERROR) {
+                  try {
+                    await forceRestartServer(`after failure ${name}`);
+                  } catch (re) {
+                    console.warn(
+                      `  ⚠️  restart after failure soft-failed: ${re instanceof Error ? re.message : re}`,
+                    );
+                  }
+                } else {
+                  server.kill("SIGKILL");
+                  process.exit(1);
+                }
+              } else {
+                groupPassedCount++;
+                passed++;
+                console.log(
+                  `  ${seqNum.toString().padEnd(2)} ${name.padEnd(35)} \u2705  ${durationSec}s`,
+                );
+                if (DESTRUCTIVE_OR_STRESS_TESTS.has(name)) {
+                  try {
+                    await forceRestartServer(`after ${name}`);
+                  } catch (re) {
+                    console.warn(
+                      `  ⚠️  post-stress restart soft-failed: ${re instanceof Error ? re.message : re}`,
+                    );
+                  }
+                }
+              }
+            } catch (e) {
+              runningTests.delete(file);
+              activeTestDurations.delete(file);
+              completedTests++;
+              failed++;
+              process.stdout.write("\r\x1B[K\n\x1B[K\x1B[1A");
+              console.log(
+                `  ${name.padEnd(35)} \u274C  FAILED (orchestrator: ${e instanceof Error ? e.message : e})`,
+              );
+              if (!CONTINUE_ON_ERROR) {
+                try {
+                  server.kill("SIGKILL");
+                } catch {
+                  /* ignore */
+                }
+                process.exit(1);
+              }
+            }
+          })();
+
+          activePromises.push(testPromise);
+          testPromise.then(() => {
+            const idx = activePromises.indexOf(testPromise);
+            if (idx !== -1) activePromises.splice(idx, 1);
+          });
+        }
+
+        if (activePromises.length > 0) {
+          await Promise.race(activePromises);
+        }
+      }
+
+      clearInterval(UIInterval);
+      process.stdout.write("\r\x1B[K\n\x1B[K\x1B[1A");
     }
-  } else if (failedTests.length > 0 || allRegressions.length > 0) {
-    log.warn(
-      `\nSuite completed with ${failedTests.length} failures and ${allRegressions.length} regressions.`,
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    // ── Phase 4: Finalize report (batch MDX write) ──
+    process.stdout.write(`  Finalizing report...`);
+    try {
+      process.env.DB_TYPE = db;
+      process.env.BENCHMARK_MATRIX = "1";
+      process.env.USE_REDIS = useRedis ? "true" : "false";
+      const { finalizeReport } = await import("../../tests/benchmarks/modules/benchmark-reporting");
+      await finalizeReport(BENCHMARK_RUN_ID);
+      process.stdout.write(" OK\n");
+    } catch (e: any) {
+      process.stdout.write(` ${e.message}\n`);
+    }
+
+    // ── Phase 5: Evaluate report ──
+    let reportedRegressions = false;
+    const reportPath = useRedis
+      ? `docs/project/benchmarks/benchmark_${db}_redis.mdx`
+      : `docs/project/benchmarks/benchmark_${db}.mdx`;
+    if (fs.existsSync(reportPath)) {
+      const content = fs.readFileSync(reportPath, "utf8");
+      const regressions: string[] = [];
+
+      // Look for \uD83D\uDD34 indicators in trend labels
+      const trendLines = content.split("\n").filter((l) => l.includes("### "));
+      for (const line of trendLines) {
+        const m = line.match(/### [^\s]+\s+(.+?)\s+[\u26AA\uD83D\uDFE2\uD83D\uDD34]/u);
+        const name = m?.[1]?.trim();
+        // Check for red indicators or negative percentages
+        if (line.includes("\uD83D\uDD34")) {
+          const pct = line.match(/[-+]\d+%/);
+          if (name && pct) regressions.push(`${name} ${pct[0]}`);
+        }
+      }
+
+      if (regressions.length) {
+        reportedRegressions = true;
+        console.log(`  \u26A0 Regressions detected:`);
+        for (const r of regressions) console.log(`       ${r}`);
+      }
+    }
+
+    // ── Summary ──
+    console.log(`  ${"\u2500".repeat(55)}`);
+    console.log(
+      `  ${db.toUpperCase()}: ${passed} passed, ${failed} failed${skipped > 0 ? `, ${skipped} skipped` : ""} in ${elapsed}s`,
     );
-
-    if (failedTests.length > 0) {
-      log.error(`❌ ${failedTests.length} benchmark(s) failed. Check logs above.`);
-      for (const failure of failedTests) {
-        log.error(`   ✗ ${failure.db}: ${failure.error || "Unknown error"}`);
-      }
+    if (fs.existsSync(reportPath)) {
+      const trend = reportedRegressions ? "Regressions found" : "All stable";
+      const reportName = useRedis ? `benchmark_${db}_redis.mdx` : `benchmark_${db}.mdx`;
+      console.log(`  Evaluated: ${reportName} \u2192 ${trend}`);
     }
 
-    if (perfRegressions.length > 0) {
-      const bannerWidth = 85;
-      const border = "═".repeat(bannerWidth);
-      const title = "⚠️  PERFORMANCE REGRESSION WARNING (DEVIATION > 15%)  ⚠️";
-      const padSize = Math.max(0, Math.floor((bannerWidth - title.length) / 2));
-      const paddedTitle =
-        " ".repeat(padSize) + title + " ".repeat(bannerWidth - title.length - padSize);
+    totalFailed += failed;
 
-      console.log(chalk.red.bold(`\n╔${border}╗`));
-      console.log(chalk.red.bold(`║${paddedTitle}║`));
-      console.log(chalk.red.bold(`╠${border}╣`));
-
-      for (const r of perfRegressions) {
-        const changeStr =
-          r.changePct > 0 ? `+${r.changePct.toFixed(1)}%` : `${r.changePct.toFixed(1)}%`;
-        const line = ` ${r.db} → ${r.metric}: ${r.current.toFixed(2)}ms (was ${r.previousAvg.toFixed(2)}ms, delta: ${changeStr})`;
-        const padRight = Math.max(0, bannerWidth - line.length - 2);
-        console.log(chalk.yellow(`║${line}${" ".repeat(padRight)}  ║`));
-      }
-      console.log(chalk.red.bold(`╚${border}╝\n`));
-    }
-
-    // Exit with 1 if there are actual hard failures (crashes), or if in CI with regressions/violations
-    if (failedTests.length > 0 || (cfg.ci && allRegressions.length > 0)) {
-      await stopServer();
-      await ConfigSafeguard.restore();
-      process.exit(1);
-    }
+    // Cleanup
+    server.kill("SIGTERM");
+    await new Promise((r) => setTimeout(r, 300));
+    server.kill("SIGKILL");
+    await new Promise((r) => setTimeout(r, 200));
   }
 
-  try {
-    await stopServer();
-    await ConfigSafeguard.restore();
-    log.success("Audit complete.");
-  } catch (err: any) {
-    log.error(`Final cleanup failed: ${err.message}`);
-  }
-}
-
-if (process.argv.includes("--generate")) {
-  log.info("🔍 Crawling results directory for standalone report generation...");
-  scanResultsDirectory()
-    .then(async (results) => {
-      const regressions = await generateFinalReport(results);
-      await writeCISummary(results, regressions);
-      log.success("✅ Standalone report generated (MDX + JSON).");
-      process.exit(0);
-    })
-    .catch((err) => {
-      log.error(`❌ Standalone report failed: ${err.message}`);
-      process.exit(1);
-    });
-} else {
-  main().catch(async (err) => {
-    console.error(chalk.red("\n💥 FATAL ERROR:"), err);
-    await stopServer();
-    await ConfigSafeguard.restore(); // Ensure restoral on fatal error
+  if (totalFailed > 0) {
+    console.log(`\n  Done. Completed with ${totalFailed} failures.`);
     process.exit(1);
-  });
+  } else {
+    console.log(`\n  Done.`);
+  }
 }
+
+run();

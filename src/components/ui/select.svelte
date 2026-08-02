@@ -107,7 +107,7 @@ and full accessibility. For search/filterable selects, use Combobox instead.
 	{#if variant === 'floating' && label}
 		<!-- Floating label variant -->
 		<div class="relative">
-			<select
+			<select aria-label={label || undefined}
 				id={generatedId}
 				{disabled}
 				{required}
@@ -128,7 +128,9 @@ and full accessibility. For search/filterable selects, use Combobox instead.
 					disabled && 'opacity-50 cursor-not-allowed'
 				)}
 			>
-				<option value="" disabled={!allowEmptySelection}>{placeholder}</option>
+				{#if !options.some((o) => o.value === '')}
+					<option value="" disabled={!allowEmptySelection}>{placeholder}</option>
+				{/if}
 				{#each options as opt (opt.value)}
 					<option value={opt.value} disabled={opt.disabled}>{opt.label}</option>
 				{/each}
@@ -172,7 +174,7 @@ and full accessibility. For search/filterable selects, use Combobox instead.
 		{/if}
 
 		<div class="relative">
-			<select
+			<select aria-label={label || undefined}
 				id={generatedId}
 				{disabled}
 				{required}
@@ -194,7 +196,9 @@ and full accessibility. For search/filterable selects, use Combobox instead.
 					disabled && 'opacity-50 cursor-not-allowed'
 				)}
 			>
-				<option value="" disabled={!allowEmptySelection}>{placeholder}</option>
+				{#if !options.some((o) => o.value === '')}
+					<option value="" disabled={!allowEmptySelection}>{placeholder}</option>
+				{/if}
 				{#each options as opt (opt.value)}
 					<option value={opt.value} disabled={opt.disabled}>{opt.label}</option>
 				{/each}

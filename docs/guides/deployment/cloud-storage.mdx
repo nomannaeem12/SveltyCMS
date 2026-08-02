@@ -60,7 +60,7 @@ SveltyCMS supports multiple storage backends for media files, allowing you to ch
        │                 │
        ▼ (local)         ▼ (cloud)
 ┌──────────────┐  ┌─────────────────┐
-│  Filesystem  │  │  uploadToCloud() │
+│  Filesystem  │  │    upload()      │
 │  ./media/... │  │  cloudStorage.ts │
 └──────────────┘  └─────┬───────────┘
                         │
@@ -307,7 +307,7 @@ Use the respective CLI tools or APIs to transfer files between services. Update 
 3. **Bucket Policies**: Restrict public access to necessary paths only
 4. **HTTPS Only**: Always use HTTPS for public URLs
 5. **Token Rotation**: Rotate API keys regularly
-6. **SSRF Protection** (June 2026): The S3/R2 adapter validates endpoints before connection — blocks private IPs (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), cloud metadata hosts (169.254.169.254), and non-HTTP protocols
+6. **SSRF Protection**: The S3/R2 adapter validates endpoints before connection — blocks private IPs (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), cloud metadata hosts (169.254.169.254), and non-HTTP protocols
 
 ### Performance
 
@@ -409,11 +409,11 @@ const { avatarUrl } = await response.json();
 ### Direct Cloud Upload (Advanced)
 
 ```
-// Server-side - utils/media/cloudStorage.ts
-import { uploadToCloud, getCloudUrl } from "@utils/media/cloud-storage";
+// Server-side
+import { upload, getUrl } from "@utils/media/cloud-storage";
 
 const buffer = await file.arrayBuffer();
-const publicUrl = await uploadToCloud(Buffer.from(buffer), "avatars/image.avif");
+const publicUrl = await upload(Buffer.from(buffer), "avatars/image.avif");
 // Returns: https://cdn.example.com/cms-media/avatars/image.avif
 ```
 
@@ -421,10 +421,10 @@ const publicUrl = await uploadToCloud(Buffer.from(buffer), "avatars/image.avif")
 
 ```
 // Server-side
-import { isCloudStorage, getCloudStorageConfig } from "@utils/media/cloud-storage";
+import { isCloud, getConfig } from "@utils/media/cloud-storage";
 
-if (isCloudStorage()) {
-  const config = getCloudStorageConfig();
+if (isCloud()) {
+  const config = getConfig();
   console.log("Using cloud storage:", config.storageType);
   console.log("Media folder prefix:", config.mediaFolder);
 }
@@ -432,7 +432,7 @@ if (isCloudStorage()) {
 
 ## API Reference
 
-See [Media Reference](/docs/api/media.mdx) for complete API details.
+See [Media Reference](/docs/reference/api/media.mdx) for complete API details.
 
 ## FAQ
 
@@ -470,5 +470,5 @@ For issues or questions:
 ## Related
 
 - [Getting Started](../../getting-started.mdx)
-- [Architecture Overview](../../architecture/index.mdx)
-- [Security Overview](../../architecture/security/index.mdx)
+- [Architecture Overview](../../reference/architecture/index.mdx)
+- [Security Overview](../../reference/security/index.mdx)

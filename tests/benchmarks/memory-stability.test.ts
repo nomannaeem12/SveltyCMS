@@ -1,6 +1,6 @@
 /**
  * @file tests/benchmarks/memory-stability.test.ts
- * @description Memory Stability Benchmark
+ * @description Memory Stability Benchmark (Optimized)
  * @summary Tracks RSS, heap, and external memory growth under sustained load with automated leak detection.
  *
  * ### Features:
@@ -56,7 +56,6 @@ async function getMemoryStats(baseUrl: string, forceGC = false, signal?: AbortSi
 }
 
 export async function runMemoryStabilityAudit() {
-  // pre-existing unused var removed for TS strict mode
   console.log(`🚀 Starting Memory Stability Audit (${DURATION_SECONDS}s sustained load)...\n`);
 
   try {
@@ -70,7 +69,7 @@ export async function runMemoryStabilityAudit() {
 
     const controllers = new Set<AbortController>();
 
-    // Baseline
+    // Baseline Assessment (with explicit GC invocation)
     const baselineController = new AbortController();
     const baselineId = setTimeout(() => baselineController.abort(), 5000);
     const baseline = await getMemoryStats(baseUrl, true, baselineController.signal);
@@ -79,16 +78,16 @@ export async function runMemoryStabilityAudit() {
 
     let running = true;
     let totalRequests = 0;
+    let failedRequests = 0;
     const startTime = performance.now();
 
     // Background sampler
     const sampler = (async () => {
-      let tick = 0;
-      while (running) {
+      // oxlint-disable-next-line eslint/no-unreachable-loop
+      for (let tick = 0; running; tick++) {
         const targetTime = tick * SAMPLING_INTERVAL_MS;
         const delay = targetTime - (performance.now() - startTime);
         if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-        if (!running) break;
 
         const sampleStart = performance.now();
         const controller = new AbortController();
@@ -110,7 +109,6 @@ export async function runMemoryStabilityAudit() {
           clearTimeout(tid);
           controllers.delete(controller);
         }
-        tick++;
       }
     })();
 
@@ -119,6 +117,7 @@ export async function runMemoryStabilityAudit() {
     console.log(`🔥 Sustaining load with ${CONCURRENCY} concurrent workers...`);
 
     const workers = Array.from({ length: CONCURRENCY }, async (_, i) => {
+      // oxlint-disable-next-line eslint/no-unreachable-loop
       while (running) {
         const controller = new AbortController();
         controllers.add(controller);
@@ -126,18 +125,26 @@ export async function runMemoryStabilityAudit() {
 
         try {
           const res: any = await fetch(`${baseUrl}/api/system/health`, {
-            headers: {
-              "x-test-secret": TEST_API_SECRET,
-            },
+            headers: { "x-test-secret": TEST_API_SECRET },
             signal: controller.signal,
           });
+
           await res.arrayBuffer();
-          totalRequests++;
+
+          if (res.ok) {
+            totalRequests++;
+          } else {
+            failedRequests++;
+          }
         } catch {
+          failedRequests++;
         } finally {
           clearTimeout(tid);
           controllers.delete(controller);
         }
+
+        // Prevent event loop starvation and socket pool saturation
+        await new Promise(setImmediate);
       }
       if (process.env.BENCHMARK_DEBUG === "true") console.log(`[Worker ${i}] Finished.`);
     });
@@ -145,16 +152,14 @@ export async function runMemoryStabilityAudit() {
     await Promise.race([sleep(DURATION_SECONDS * 1000), Promise.allSettled([...workers, sampler])]);
 
     running = false;
-    // 🚀 CRITICAL: Instantly terminate all pending fetches so the workers drain immediately.
-    // Convert to array first to prevent Set iteration bugs if elements are deleted synchronously.
+    // Tear down remaining active connections
     Array.from(controllers).forEach((c) => c.abort());
 
     console.log(
-      `⏹ Load stopped at ${Math.round(performance.now() - startTime)}ms. Draining ${CONCURRENCY} workers and 1 sampler...`,
+      `⏹ Load stopped at ${Math.round(performance.now() - startTime)}ms. Draining workers...`,
     );
 
     const drainStart = performance.now();
-    // Add a hard timeout to the drain phase to completely prevent test hangs
     await Promise.race([
       Promise.allSettled([...workers, sampler]),
       sleep(5000).then(() =>
@@ -163,7 +168,7 @@ export async function runMemoryStabilityAudit() {
     ]);
     console.log(`✅ All workers drained in ${Math.round(performance.now() - drainStart)}ms.`);
 
-    // Final measurement
+    // Cool-down period before final GC check
     await stabilize(3000);
     const finalController = new AbortController();
     const finalId = setTimeout(() => finalController.abort(), 5000);
@@ -176,7 +181,7 @@ export async function runMemoryStabilityAudit() {
     const rssGrowth = (finalMem.rss - baseline.rss) / 1024 / 1024;
     const heapGrowth = (finalMem.heapUsed - baseline.heapUsed) / 1024 / 1024;
 
-    // Calculate linear regression slope for leak detection
+    // Calculate slope safely
     const heapSlope = calculateHeapSlope(snapshots);
 
     printTruthTable({
@@ -195,14 +200,22 @@ export async function runMemoryStabilityAudit() {
     });
 
     printSummaryTable([
-      { key: "Total Requests", val: totalRequests, unit: "" },
+      { key: "Success Requests", val: totalRequests, unit: "" },
+      { key: "Failed Requests", val: failedRequests, unit: "" },
       { key: "Average RPS", val: Math.round(rps), unit: "req/s" },
       { key: "RSS Growth", val: rssGrowth.toFixed(2), unit: "MB" },
       { key: "Heap Growth", val: heapGrowth.toFixed(2), unit: "MB" },
       { key: "Leak Slope", val: heapSlope.toFixed(2), unit: "MB/min" },
       {
         key: "Stability",
-        val: heapSlope < 1.5 && heapGrowth < 10 ? "EXCELLENT" : heapSlope < 4 ? "STABLE" : "LEAKY",
+        val:
+          failedRequests > totalRequests * 0.05
+            ? "UNSTABLE (FAILURES)"
+            : heapSlope < 1.5 && heapGrowth < 10
+              ? "EXCELLENT"
+              : heapSlope < 4
+                ? "STABLE"
+                : "LEAKY",
         unit: "",
       },
     ]);
@@ -210,6 +223,7 @@ export async function runMemoryStabilityAudit() {
     exportResult({
       name: "Memory Stability",
       totalRequests,
+      failedRequests,
       rps,
       rssDelta: rssGrowth,
       heapDelta: heapGrowth,
@@ -245,7 +259,11 @@ function calculateHeapSlope(snapshots: MemorySnapshot[]): number {
     sumXX += x * x;
   }
 
-  return (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+  const divisor = n * sumXX - sumX * sumX;
+  // Guard clause against perfect vertical lines or single point iterations
+  if (divisor === 0) return 0;
+
+  return (n * sumXY - sumX * sumY) / divisor;
 }
 
 function sleep(ms: number) {
@@ -258,4 +276,4 @@ test(
     await runMemoryStabilityAudit();
   },
   600 * 1000,
-); // Massive 10m timeout
+);

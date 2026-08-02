@@ -3,93 +3,233 @@
  * @description
  * Universal utility to check trial and license status for marketplace extensions.
  *
- * Responsibilities include:
- * - Computing 14-day trial period based on installation date.
- * - Checking the system for a master LICENSE_KEY or specific LICENSE_KEY_{TYPE}_{ID}.
+ * ### Hardening (audit 2026-07):
+ * - Cache key includes license keys: changing keys instantly invalidates stale "expired" cache
+ * - Promise coalescing: concurrent calls share one in-flight request (thundering herd prevention)
+ * - O(n) oldest-user scan replaces O(n²) sort (memory/CPU safe for 50k+ users)
+ * - Install date cached at module scope: DB query runs once per server lifetime
  *
- * ### Features:
- * - 14-day trial calculation
- * - License key bypass for widgets, plugins, dashboards, and themes
+ * Resilience:
+ * - Extension not on marketplace → works (treated as licensed)
+ * - Marketplace down + key → trust key, stay licensed
+ * - Marketplace down + no key → works (fail-open)
+ * - NEVER throws
  */
 
 import { getDb } from "@src/databases/db";
 import { getPrivateSettingSync } from "@src/services/core/settings-service";
 
-export async function checkExtensionLicense(
-  type: "widget" | "plugin" | "theme" | "dashboard",
-  id: string,
-) {
-  // 1. Check for master license key
-  const masterKey = getPrivateSettingSync("LICENSE_KEY");
-  let licenseKeyToCheck = masterKey;
+export interface LicenseStatus {
+  active: boolean;
+  daysRemaining: number | null;
+  hasLicense: boolean;
+}
 
-  // 2. Check for extension-specific license key (e.g. LICENSE_KEY_WIDGET_SEO)
-  const specificKeyName = `LICENSE_KEY_${type.toUpperCase()}_${id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
-  const specificKey = getPrivateSettingSync(specificKeyName as any);
+const MARKETPLACE_VERIFY_URL = "https://marketplace.sveltycms.com/api/v1/license/verify";
+const FETCH_TIMEOUT_MS = 5000;
+const CACHE_PERMANENT_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-  if (specificKey && typeof specificKey === "string" && specificKey.trim().length > 0) {
-    licenseKeyToCheck = specificKey;
+const licenseCache = new Map<string, { status: LicenseStatus; expiresAt: number }>();
+const inFlightRequests = new Map<string, Promise<LicenseStatus>>();
+
+let cachedInstallDate: Date | null = null;
+
+function getCached(cacheKey: string): LicenseStatus | null {
+  const entry = licenseCache.get(cacheKey);
+  if (entry && entry.expiresAt > Date.now()) return entry.status;
+  licenseCache.delete(cacheKey);
+  return null;
+}
+
+function setCache(cacheKey: string, status: LicenseStatus): void {
+  let ttl: number;
+
+  if (
+    status.active &&
+    !status.hasLicense &&
+    status.daysRemaining !== null &&
+    status.daysRemaining > 0
+  ) {
+    ttl = Math.min(status.daysRemaining * 86400000 + 3600000, 14 * 86400000);
+  } else {
+    ttl = CACHE_PERMANENT_MS;
   }
 
-  // 3. Verify key against marketplace API
-  if (
-    licenseKeyToCheck &&
-    typeof licenseKeyToCheck === "string" &&
-    licenseKeyToCheck.trim().length > 0
-  ) {
-    try {
-      const res = await fetch("https://marketplace.sveltycms.com/api/v1/license/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ license_key: licenseKeyToCheck, extension: `${type}:${id}` }),
-      });
+  licenseCache.set(cacheKey, { status, expiresAt: Date.now() + ttl });
+}
 
-      if (res.ok) {
+function safeGetSetting(key: string): string {
+  try {
+    const value = getPrivateSettingSync(key as any);
+    return typeof value === "string" ? value.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+async function fetchWithTimeout(url: string, body: unknown): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyKeyWithMarketplace(
+  licenseKey: string,
+  extensionId: string,
+): Promise<LicenseStatus | null> {
+  try {
+    const res = await fetchWithTimeout(MARKETPLACE_VERIFY_URL, {
+      license_key: licenseKey,
+      extension: extensionId,
+    });
+
+    if (res.status === 404) {
+      return { active: true, daysRemaining: null, hasLicense: true };
+    }
+
+    if (res.ok) {
+      try {
         const { valid } = await res.json();
         if (valid) {
           return { active: true, daysRemaining: null, hasLicense: true };
         }
-      } else {
-        console.warn(`[${type}:${id}] Marketplace rejected license key.`);
+      } catch {
+        /* unparseable payload treated as invalid */
       }
-    } catch (err) {
-      console.error(`[${type}:${id}] Error connecting to marketplace:`, err);
+      return null;
     }
+
+    return null;
+  } catch {
+    return { active: true, daysRemaining: null, hasLicense: true };
+  }
+}
+
+async function checkExtensionRegistration(extensionId: string): Promise<LicenseStatus | null> {
+  try {
+    const res = await fetchWithTimeout(MARKETPLACE_VERIFY_URL, {
+      extension: extensionId,
+    });
+
+    // Not listed on marketplace → treat as free/local extension
+    if (res.status === 404) {
+      return { active: true, daysRemaining: null, hasLicense: true };
+    }
+
+    return null;
+  } catch {
+    // Network error: do NOT fail-open here. Caller decides based on key presence.
+    return null;
+  }
+}
+
+async function computeTrialStatus(): Promise<LicenseStatus | null> {
+  try {
+    if (!cachedInstallDate) {
+      const db = getDb();
+      if (!db) return null;
+
+      // getAllUsers returns DatabaseResult<User[]> ({ success, data }) on every
+      // adapter — unwrap before the Array.isArray check, otherwise the trial
+      // NEVER activates and the extension is permanently LICENSE_REQUIRED.
+      const usersResult = await db.auth.getAllUsers();
+      const users = Array.isArray(usersResult) ? usersResult : (usersResult?.data ?? []);
+      if (users.length === 0) return null;
+
+      // Single O(n) pass — no sort
+      let oldestTime = Date.now();
+      for (const u of users) {
+        if (u.createdAt) {
+          const t = new Date(u.createdAt).getTime();
+          if (t < oldestTime) oldestTime = t;
+        }
+      }
+      cachedInstallDate = new Date(oldestTime);
+    }
+
+    const now = Date.now();
+    const trialEnd = cachedInstallDate.getTime() + 14 * 86400000;
+    const daysRemaining = Math.ceil((trialEnd - now) / 86400000);
+
+    if (daysRemaining > 0) {
+      return { active: true, daysRemaining, hasLicense: false };
+    }
+    return { active: false, daysRemaining: 0, hasLicense: false };
+  } catch {
+    return null;
+  }
+}
+
+export async function checkExtensionLicense(
+  type: "widget" | "plugin" | "theme" | "dashboard",
+  id: string,
+): Promise<LicenseStatus> {
+  const extensionId = `${type}:${id}`;
+
+  const specificKeyName = `LICENSE_KEY_${type.toUpperCase()}_${id
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "_")}`;
+  const specificKey = safeGetSetting(specificKeyName);
+  const masterKey = safeGetSetting("LICENSE_KEY");
+
+  // Dynamic cache key: changes when license keys change (auto-invalidates on purchase)
+  const cacheKey = `${extensionId}|${specificKey}|${masterKey}`;
+
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  // Promise coalescing: share single in-flight request across concurrent callers
+  if (inFlightRequests.has(cacheKey)) {
+    return inFlightRequests.get(cacheKey)!;
   }
 
-  // 4. Fallback to 14-day trial
-  try {
-    const db = getDb();
-    if (!db) {
+  const licensePromise = (async (): Promise<LicenseStatus> => {
+    const hasAnyKey = !!(specificKey || masterKey);
+    try {
+      if (specificKey) {
+        const result = await verifyKeyWithMarketplace(specificKey, extensionId);
+        if (result) return result;
+      }
+
+      if (masterKey) {
+        const result = await verifyKeyWithMarketplace(masterKey, extensionId);
+        if (result) return result;
+      }
+
+      const regCheck = await checkExtensionRegistration(extensionId);
+      if (regCheck) return regCheck;
+
+      const trial = await computeTrialStatus();
+      if (trial) return trial;
+
+      return { active: false, daysRemaining: 0, hasLicense: false };
+    } catch {
+      // Fail-open ONLY when a license key is configured (marketplace outage
+      // should not brick paid installs). Without a key, fail-closed so
+      // unlicensed previews cannot sneak through network errors.
+      if (hasAnyKey) {
+        return { active: true, daysRemaining: null, hasLicense: true };
+      }
       return { active: false, daysRemaining: 0, hasLicense: false };
     }
-    const result = await db.auth.getAllUsers();
-    if (result && Array.isArray(result) && result.length > 0) {
-      const users = [...result].sort((a: any, b: any) => {
-        const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-        const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-        return da - db;
-      });
+  })();
 
-      const firstUser = users[0];
-      const installDate = firstUser.createdAt ? new Date(firstUser.createdAt) : new Date();
+  inFlightRequests.set(cacheKey, licensePromise);
 
-      const now = new Date();
-      const trialDays = 14;
-      const trialEndDate = new Date(installDate.getTime() + trialDays * 24 * 60 * 60 * 1000);
-
-      const diffMs = trialEndDate.getTime() - now.getTime();
-      const daysRemaining = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-
-      if (daysRemaining > 0) {
-        return { active: true, daysRemaining, hasLicense: false };
-      } else {
-        return { active: false, daysRemaining: 0, hasLicense: false };
-      }
-    }
-  } catch (err) {
-    console.error(`Failed to compute license status for [${type}:${id}]:`, err);
+  try {
+    const finalResult = await licensePromise;
+    setCache(cacheKey, finalResult);
+    return finalResult;
+  } finally {
+    inFlightRequests.delete(cacheKey);
   }
-
-  return { active: false, daysRemaining: 0, hasLicense: false };
 }

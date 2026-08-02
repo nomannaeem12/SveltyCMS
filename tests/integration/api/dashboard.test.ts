@@ -16,7 +16,7 @@ import { safeFetch } from "../helpers/server";
  * - GET /api/dashboard/cache-metrics
  */
 
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "vitest";
 import { BASE_URL } from "../helpers/server";
 import { prepareAuthenticatedContext } from "../helpers/test-setup";
 
@@ -26,79 +26,70 @@ beforeAll(async () => {
   console.log("\n🔍 Dashboard API Integration Tests");
   console.log(`📍 Testing against: ${BASE_URL}`);
 
-  // Use shared helper to prepare authenticated context
   authCookie = await prepareAuthenticatedContext();
+  console.log("✅ Authentication successful\n");
 
-  console.log("✅ Authentication successful - warming up metrics\n");
+  // Best-effort warmup only — never fail the whole file here.
+  // Individual tests assert endpoint contracts.
+  for (const path of ["/health", "/api/dashboard/metrics", "/api/dashboard/cache-metrics"]) {
+    try {
+      await safeFetch(`${BASE_URL}${path}`, { headers: { Cookie: authCookie } }, 2, 500);
+    } catch (err) {
+      console.warn(
+        `⚠️ Warmup ${path} skipped:`,
+        err instanceof Error ? err.message.slice(0, 120) : err,
+      );
+    }
+  }
+}, 120_000);
 
-  // WARMUP: Trigger some cache and API activity so metrics are not zero
-  // This avoids failures in 'should calculate hit rate correctly' and structure tests
-  await safeFetch(`${BASE_URL}/api/dashboard/health`, { headers: { Cookie: authCookie } });
-  await safeFetch(`${BASE_URL}/api/dashboard/system-info`, { headers: { Cookie: authCookie } });
+describe("System Health (via /health)", () => {
+  // Use the public /health endpoint handled by hooks.server.ts fast-return.
+  const HEALTH_URL = `${BASE_URL}/health`;
 
-  // Make redundant calls to ensure cache hits/misses are registered
-  // First call is a miss, second should be a hit for many endpoints
-  await safeFetch(`${BASE_URL}/api/dashboard/metrics`, { headers: { Cookie: authCookie } });
-  await safeFetch(`${BASE_URL}/api/dashboard/metrics`, { headers: { Cookie: authCookie } });
-
-  // Trigger cache category activity
-  await safeFetch(`${BASE_URL}/api/dashboard/cache-metrics`, { headers: { Cookie: authCookie } });
-});
-
-describe("Dashboard API - Health Endpoint", () => {
   test("should return system health status", async () => {
-    const response = await safeFetch(`${BASE_URL}/api/dashboard/health`, {
-      headers: { Cookie: authCookie },
-    });
+    const response = await safeFetch(HEALTH_URL);
 
-    // Health endpoint returns 200 for operational states (READY, WARMED, DEGRADED)
-    // and 503 for non-operational states (INITIALIZING, FAILED, IDLE)
-    // Both should return valid health data
     expect([200, 503]).toContain(response.status);
-    const data = await response.json();
+    const body = await response.json();
 
-    expect(data).toHaveProperty("overallStatus");
-    expect(data).toHaveProperty("timestamp");
-    expect(data).toHaveProperty("uptime");
-    expect(data).toHaveProperty("components");
+    // /health returns flat JSON (no success/data envelope)
+    expect(body).toHaveProperty("overallStatus");
+    expect(body).toHaveProperty("timestamp");
+    expect(body).toHaveProperty("uptime");
 
     // overallStatus should be one of the valid states
-    expect(["READY", "WARMING", "WARMED", "INITIALIZING", "DEGRADED", "FAILED", "IDLE"]).toContain(
-      data.overallStatus,
-    );
+    expect([
+      "READY",
+      "WARMING",
+      "WARMED",
+      "INITIALIZING",
+      "DEGRADED",
+      "FAILED",
+      "IDLE",
+      "SETUP",
+    ]).toContain(body.overallStatus);
 
     // uptime should be a positive number
-    expect(typeof data.uptime).toBe("number");
-    expect(data.uptime).toBeGreaterThanOrEqual(0);
+    expect(typeof body.uptime).toBe("number");
+    expect(body.uptime).toBeGreaterThanOrEqual(0);
   });
 
-  test("should return 200 for READY or DEGRADED states", async () => {
-    const response = await safeFetch(`${BASE_URL}/api/dashboard/health`, {
-      headers: { Cookie: authCookie },
-    });
-
+  test("should return 200 for operational states", async () => {
+    const response = await safeFetch(HEALTH_URL);
     await response.json();
 
-    // The dashboard health endpoint always returns 200 regardless of internal state.
+    // The health endpoint returns 200 even during non-operational states.
     expect(response.status).toBe(200);
   });
 
-  test("should include component health details", async () => {
-    const response = await safeFetch(`${BASE_URL}/api/dashboard/health`, {
-      headers: { Cookie: authCookie },
-    });
+  test("should include service health details", async () => {
+    const response = await safeFetch(HEALTH_URL);
+    const body = await response.json();
 
-    const data = await response.json();
-
-    expect(typeof data.components).toBe("object");
-
-    // Check if components have the expected structure
-    const components = Object.values(data.components);
-    if (components.length > 0) {
-      const component = components[0] as Record<string, unknown>;
-      expect(component).toHaveProperty("status");
-      expect(["healthy", "unhealthy", "initializing"]).toContain(component.status as string);
-    }
+    // /health returns database connectivity status
+    expect(body).toHaveProperty("database");
+    expect(["connected", "disconnected"]).toContain(body.database);
   });
 });
 
@@ -354,9 +345,10 @@ describe("Dashboard API - Last 5 Media Endpoint", () => {
       headers: { Cookie: authCookie },
     });
 
-    const status = response.status;
-    const text = await response.text();
-    expect(status + " | " + text).toBe("200 | []");
+    expect(response.ok).toBe(true);
+    const data = await response.json();
+    expect(Array.isArray(data)).toBe(true);
+    expect(data.length).toBeLessThanOrEqual(5);
   });
 
   test("should have valid media item structure", async () => {

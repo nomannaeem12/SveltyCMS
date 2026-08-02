@@ -117,7 +117,7 @@ Selecting a template auto-creates the collections using the installTemplateColle
 				<!-- Icon & Title -->
 				<div class="mb-3 flex items-center gap-3">
 					<div class="flex h-10 w-10 items-center justify-center rounded bg-surface-100 dark:bg-surface-700">
-						<iconify-icon icon={preset.icon} width="22" class="text-tertiary-600 dark:text-primary-400" aria-hidden="true"></iconify-icon>
+						<iconify-icon icon={preset.icon} width="22" class="text-tertiary-600 dark:text-primary-500" aria-hidden="true"></iconify-icon>
 					</div>
 					<div>
 						<h3 class="text-sm font-semibold text-surface-900 dark:text-white">{preset.title}</h3>
@@ -132,7 +132,7 @@ Selecting a template auto-creates the collections using the installTemplateColle
 				<div class="mt-auto space-y-1 border-t border-surface-100 pt-3 dark:border-surface-700">
 					<span class="text-xs font-medium text-surface-400">Creates {collections.length} collection{collections.length !== 1 ? 's' : ''}:</span>
 					<div class="flex flex-wrap gap-1">
-						{#each collections.slice(0, 4) as col}
+						{#each collections.slice(0, 4) as col (col.name)}
 							<span class="inline-flex items-center gap-1 rounded-full bg-surface-100 px-2 py-0.5 text-xs text-surface-600 dark:bg-surface-700 dark:text-surface-300">
 								<iconify-icon icon={col.icon} width="12" aria-hidden="true"></iconify-icon>
 								{col.label}
@@ -162,7 +162,7 @@ Selecting a template auto-creates the collections using the installTemplateColle
 			onclick={handleInstall}
 			disabled={isSubmitting || !selectedPreset}
 			aria-label="Install selected template collections"
-		 class="dark:">
+		>
 			{#if isSubmitting}
 				<iconify-icon icon="mdi:loading" width="18" class="animate-spin" aria-hidden="true"></iconify-icon>
 				Installing...

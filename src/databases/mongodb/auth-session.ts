@@ -4,7 +4,12 @@
  */
 
 import type { Session } from "@src/databases/auth/types";
-import type { DatabaseId, DatabaseResult, ISODateString } from "@src/databases/db-interface";
+import type {
+  DatabaseId,
+  DatabaseResult,
+  ISODateString,
+  BaseQueryOptions,
+} from "@src/databases/db-interface";
 import mongoose, { Schema, type Model } from "mongoose";
 import { generateId, getOrCreateModel, convertMongoSessionToISO } from "./mongodb-utils";
 import { safeQuery } from "@src/utils/security/safe-query";
@@ -164,11 +169,24 @@ export class SessionAdapter {
     }
   }
 
+  /** Extract tenantId whether callers pass a raw id or BaseQueryOptions. */
+  private resolveTenantId(
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
+  ): DatabaseId | null | undefined {
+    if (optionsOrTenant == null) return optionsOrTenant as null | undefined;
+    if (typeof optionsOrTenant === "string") return optionsOrTenant as DatabaseId;
+    if (typeof optionsOrTenant === "object" && "tenantId" in (optionsOrTenant as object)) {
+      return (optionsOrTenant as BaseQueryOptions).tenantId as DatabaseId | null | undefined;
+    }
+    return undefined;
+  }
+
   async invalidateAllUserSessions(
     userId: DatabaseId,
-    tenantId?: DatabaseId | null,
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
   ): Promise<DatabaseResult<void>> {
     try {
+      const tenantId = this.resolveTenantId(optionsOrTenant);
       const filter: any = { user_id: userId };
       if (tenantId) filter.tenantId = tenantId;
       await this.SessionModel.deleteMany(filter);
@@ -184,14 +202,23 @@ export class SessionAdapter {
 
   async getActiveSessions(
     userId: DatabaseId,
-    tenantId?: DatabaseId | null,
+    optionsOrTenant?: BaseQueryOptions | DatabaseId | null,
   ): Promise<DatabaseResult<Session[]>> {
     try {
+      const tenantId = this.resolveTenantId(optionsOrTenant);
+      if (!userId) {
+        return { success: true, data: [] };
+      }
       const filter: any = { user_id: userId, expires: { $gt: new Date() } };
       if (tenantId) filter.tenantId = tenantId;
       const sessions = await this.SessionModel.find(filter).lean();
-      return { success: true, data: sessions as Session[] };
+      // Normalize lean docs so callers always get ISO-friendly session shapes
+      return {
+        success: true,
+        data: (sessions || []).map((s) => this.mapSession(s)) as Session[],
+      };
     } catch (err) {
+      logger.error("Failed to get active sessions", err);
       return {
         success: false,
         message: "Failed to get active sessions",
@@ -200,9 +227,9 @@ export class SessionAdapter {
     }
   }
 
-  async getAllActiveSessions(tenantId: string): Promise<DatabaseResult<Session[]>> {
+  async getAllActiveSessions(options?: BaseQueryOptions): Promise<DatabaseResult<Session[]>> {
     try {
-      const filter = safeQuery({ expires: { $gt: new Date() } } as any, tenantId, {
+      const filter = safeQuery({ expires: { $gt: new Date() } } as any, options?.tenantId, {
         includeDeleted: true,
       });
       const sessions = await this.SessionModel.find(filter).lean();

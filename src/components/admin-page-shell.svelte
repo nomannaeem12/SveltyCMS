@@ -17,19 +17,23 @@ Enforces the unified structural blueprint from style-guide-gui.mdx:
 - `highlight` (string): Partial title highlight.
 - `fullHeight` (boolean): Disable vertical scroll on shell (editor layouts).
 - `spaceY` ('4' | '6' | '8'): Vertical rhythm between sections.
+- `titleCompact` (boolean): Tighter PageTitle row with bottom border.
 - `animate` (boolean): Apply standard page entry fade (respects reduced motion).
+- `navColor` (string): Tailwind bg class for FloatingNav favorite spoke (default `bg-amber-500`).
 - `children` (Snippet): Page body content.
 - `actions` (Snippet): Trailing header actions for PageTitle.
 
 ### Features:
 - admin-theme-container shell with --admin-* token fallbacks
+- sticky PageTitle flush to top (no top padding gap)
 - integrates PageTitle with actions slot
 - optional adminFade entry transition
 - full Svelte 5 runes
 -->
 
-<script lang="ts">
+	<script lang="ts">
 	import PageTitle from '@components/page-title.svelte';
+	import type { NavFavoriteColor } from '@src/stores/floating-nav-store.svelte.ts';
 	import { adminFade } from '@utils/admin-transitions';
 
 	interface Props {
@@ -41,7 +45,10 @@ Enforces the unified structural blueprint from style-guide-gui.mdx:
 		highlight?: string;
 		fullHeight?: boolean;
 		spaceY?: '4' | '6' | '8';
+		titleCompact?: boolean;
 		animate?: boolean;
+		/** Tailwind bg class for FloatingNav favorite spoke — NAV_FAVORITE_COLORS literal (default `bg-amber-500`). */
+		navColor?: NavFavoriteColor;
 		children?: import('svelte').Snippet;
 		actions?: import('svelte').Snippet;
 	}
@@ -49,28 +56,29 @@ Enforces the unified structural blueprint from style-guide-gui.mdx:
 	let {
 		title,
 		icon,
-		description = '',
+		description,
 		showBackButton = false,
 		backUrl = '',
 		highlight = '',
 		fullHeight = false,
 		spaceY = '6',
+		titleCompact = false,
 		animate = true,
+		navColor,
 		children,
 		actions
 	}: Props = $props();
 
-	const spaceClass = $derived(
-		spaceY === '4' ? 'space-y-4' : spaceY === '8' ? 'space-y-8' : 'space-y-6'
-	);
+	const spaceClass = $derived(`space-y-${spaceY}`);
 
 </script>
 
 <div
-	class="admin-theme-container absolute inset-0 bg-surface-50 p-2 dark:bg-surface-950 {spaceClass} {fullHeight
+	class="admin-theme-container absolute inset-0 {fullHeight
 		? 'flex flex-col overflow-hidden'
 		: 'overflow-y-auto'}"
-	in:adminFade={animate ? { duration: 200 } : { duration: 0 }}
+	style="background-color: var(--admin-bg-page, var(--color-surface-50)); color: var(--admin-text-body, var(--color-surface-900));"
+	in:adminFade={animate ? { duration: 200 } : undefined}
 >
 	<PageTitle
 		name={title}
@@ -79,13 +87,15 @@ Enforces the unified structural blueprint from style-guide-gui.mdx:
 		{showBackButton}
 		{backUrl}
 		{highlight}
+		compact={titleCompact}
+		{navColor}
 	>
 		{#if actions}
 			{@render actions()}
 		{/if}
 	</PageTitle>
 
-	<div class={fullHeight ? 'flex min-h-0 flex-1 flex-col' : ''}>
+	<div class="px-2 pb-2 pt-4 {spaceClass} {fullHeight ? 'flex min-h-0 flex-1 flex-col' : ''}">
 		{@render children?.()}
 	</div>
 </div>

@@ -10,14 +10,22 @@ import { getDb } from "@src/databases/db";
 import type { Job, DatabaseId } from "@src/databases/db-interface";
 import { logger } from "@utils/logger";
 import { cleanupTempStore } from "@utils/temp-store";
+import { pubSub } from "@src/services/background/pub-sub";
+import { withSystemScope } from "@src/databases/system-tenant-scope";
 
-/** Lazy-loaded handler registry — avoids importing all job families at module load */
+// Static imports — background jobs run outside Vite's request-scoped module runner
+import { processMediaHandler } from "./media-jobs";
+import { webhookDeliveryHandler } from "./webhook-jobs";
+import { importDataHandler } from "./import-jobs";
+import { bulkTranslateHandler } from "./translation-jobs";
+import { scheduledPublishHandler } from "./scheduled-jobs";
+
 const HANDLER_IMPORTS: Record<string, () => Promise<JobHandler>> = {
-  "process-media": () => import("./media-jobs").then((m) => m.processMediaHandler),
-  "webhook-delivery": () => import("./webhook-jobs").then((m) => m.webhookDeliveryHandler),
-  "import-data": () => import("./import-jobs").then((m) => m.importDataHandler),
-  "bulk-translate": () => import("./translation-jobs").then((m) => m.bulkTranslateHandler),
-  "publish-scheduled": () => import("./scheduled-jobs").then((m) => m.scheduledPublishHandler),
+  "process-media": () => Promise.resolve(processMediaHandler),
+  "webhook-delivery": () => Promise.resolve(webhookDeliveryHandler),
+  "import-data": () => Promise.resolve(importDataHandler),
+  "bulk-translate": () => Promise.resolve(bulkTranslateHandler),
+  "publish-scheduled": () => Promise.resolve(scheduledPublishHandler),
 };
 
 import os from "node:os";
@@ -125,7 +133,10 @@ class JobQueueService {
         return;
       }
 
-      const readyJobsResult = await db.system.jobs.getNextReady(Math.min(batchSize, capacity));
+      const readyJobsResult = await db.system.jobs.getNextReady(
+        Math.min(batchSize, capacity),
+        withSystemScope("scheduler"),
+      );
       if (!readyJobsResult.success || !readyJobsResult.data || readyJobsResult.data.length === 0) {
         this.isProcessing = false;
         return;
@@ -135,15 +146,31 @@ class JobQueueService {
 
       // 2. Process jobs (don't await them all here to allow concurrency)
       for (const job of jobs) {
+        // status-transition jobs belong to the scheduler (see scheduler.ts) —
+        // never claim or fail them here, or the scheduler's work gets destroyed.
+        if (job.taskType === "status-transition") continue;
         this.currentRunning++;
         this.executeJob(job, db)
-          .catch((err) => logger.error(`[JobQueue] Critical error in job ${job._id}:`, err))
+          .catch((err) => {
+            // Vite 8 dev-mode: request-scoped module runner closes between ticks — non-fatal
+            if (err.message?.includes("module runner has been closed")) {
+              logger.debug(
+                `[JobQueue] Module runner closed (Vite 8 dev-mode HMR cycle), job will retry: ${job._id}`,
+              );
+            } else {
+              logger.error(`[JobQueue] Critical error in job ${job._id}:`, err);
+            }
+          })
           .finally(() => {
             this.currentRunning--;
           });
       }
-    } catch (error) {
-      logger.error("[JobQueue] Error during batch processing:", error);
+    } catch (error: any) {
+      if (error?.message?.includes("Vite module runner has been closed")) {
+        logger.debug("[JobQueue] Vite module runner closed during batch processing, skipping.");
+      } else {
+        logger.error("[JobQueue] Error during batch processing:", error);
+      }
     } finally {
       this.isProcessing = false;
     }
@@ -155,8 +182,15 @@ class JobQueueService {
   private async executeJob(job: Job, db: any) {
     let handler = this.handlers.get(job.taskType);
     if (!handler && this.handlerLoaders.has(job.taskType)) {
-      handler = await this.handlerLoaders.get(job.taskType)!();
-      if (handler) this.handlers.set(job.taskType, handler);
+      try {
+        handler = await this.handlerLoaders.get(job.taskType)!();
+        if (handler) this.handlers.set(job.taskType, handler);
+      } catch (err: any) {
+        if (err?.message?.includes("Vite module runner has been closed")) {
+          return;
+        }
+        throw err;
+      }
     }
 
     // Mark as running
@@ -177,7 +211,7 @@ class JobQueueService {
       },
     );
 
-    if (!claimResult.success) return;
+    if (!claimResult.success || !claimResult.data) return; // Not claimed (already picked up / failed by another consumer)
 
     if (!handler) {
       logger.warn(`[JobQueue] No handler found for task type: ${job.taskType}`);
@@ -218,7 +252,6 @@ class JobQueueService {
       // If it's a webhook failure, we might want to emit an event for the UI
       if (job.taskType === "webhook-delivery" && status === "failed") {
         try {
-          const { pubSub } = await import("@src/services/background/pub-sub");
           pubSub.publish("webhook:failed", {
             webhookId: (job.payload as any).webhook.id,
             deliveryId: job._id as string,
@@ -260,9 +293,15 @@ class JobQueueService {
         );
       }
 
-      // 3. Clean up temp store every 10 cycles
+      // 3. Clean up temp store every ~10 cycles
+      // cleanupTempStore is synchronous — never call .catch on its void return
+      // (that threw TypeError and crashed the process via uncaughtException).
       if (Math.random() > 0.9) {
-        cleanupTempStore().catch((err) => logger.error("[JobQueue] TempStore cleanup error", err));
+        try {
+          cleanupTempStore();
+        } catch (err) {
+          logger.error("[JobQueue] TempStore cleanup error", err);
+        }
       }
     }, intervalMs);
   }
@@ -280,3 +319,9 @@ class JobQueueService {
 }
 
 export const jobQueue = new JobQueueService();
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    jobQueue.stopPolling();
+  });
+}

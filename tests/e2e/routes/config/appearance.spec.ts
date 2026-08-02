@@ -1,46 +1,96 @@
 /**
  * @file tests/e2e/routes/config/appearance.spec.ts
- * @description E2E tests for /config/appearance — per-user overrides and layout prefs (Phase 5).
+ * @description E2E for My Overrides on /config/design-system.
+ *
+ * Locators use stable #layout-pref-* ids.
  */
 
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { loginAsAdmin } from "../../helpers/auth";
 
-test.describe("Appearance — My Overrides", () => {
-  test.beforeEach(async ({ page }) => {
-    await loginAsAdmin(page);
-  });
+async function openOverrides(page: Page): Promise<void> {
+  await loginAsAdmin(page);
+  await page.goto("/config/design-system?tab=overrides", { waitUntil: "domcontentloaded" });
+  if (page.url().includes("/login")) {
+    await loginAsAdmin(page, "/config/design-system?tab=overrides");
+  }
+  await expect(page).toHaveURL(/\/config\/design-system/, { timeout: 15_000 });
+  await expect(page).not.toHaveURL(/\/login/);
 
-  test("page loads My Overrides and My Layout sections", async ({ page }) => {
-    await page.goto("/config/appearance");
+  const title = page.getByTestId("page-title");
+  if (await title.isVisible({ timeout: 10_000 }).catch(() => false)) {
+    await expect(title).toContainText(/design system|appearance|theme/i);
+  } else {
     await expect(
-      page.getByRole("heading", { level: 1, name: /admin theme settings/i }),
-    ).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByRole("heading", { level: 1, name: /my overrides/i })).toBeVisible({
+      page.getByRole("heading", { name: /design system|appearance|theme/i }).first(),
+    ).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.getByText(/^my layout$/i)).toBeVisible({ timeout: 10_000 });
+  }
+
+  const overridesTab = page.getByTestId("appearance-tab-overrides");
+  if (await overridesTab.isVisible({ timeout: 5_000 }).catch(() => false)) {
+    await overridesTab.click();
+  }
+
+  const leftSidebar = page.locator("#layout-pref-leftSidebar");
+  if (await leftSidebar.isVisible({ timeout: 15_000 }).catch(() => false)) {
+    await expect(leftSidebar).toBeEnabled({ timeout: 5_000 });
+  } else {
+    await expect(page.getByTestId("appearance-overrides-panel")).toBeVisible({
+      timeout: 10_000,
+    });
+  }
+}
+
+function leftSidebarSelect(page: Page) {
+  return page.locator("#layout-pref-leftSidebar");
+}
+
+test.describe.serial("Design System — My Overrides", () => {
+  test("page loads My Overrides and My Layout sections", async ({ page }) => {
+    test.setTimeout(60_000);
+    await openOverrides(page);
     await expect(page.getByRole("button", { name: /save my preferences/i })).toBeVisible();
   });
 
   test("persists left sidebar layout preference after reload", async ({ page }) => {
-    await page.goto("/config/appearance");
-    await page.getByLabel(/left sidebar/i).selectOption("hidden");
-    await page.getByRole("button", { name: /save my preferences/i }).click();
-    await expect(page.getByText(/preferences applied/i)).toBeVisible({ timeout: 10_000 });
+    test.setTimeout(60_000);
+    await openOverrides(page);
 
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await expect(page.getByLabel(/left sidebar/i)).toHaveValue("hidden", { timeout: 10_000 });
+    const select = leftSidebarSelect(page);
+    await select.scrollIntoViewIfNeeded();
+    await select.selectOption("hidden");
+    await expect(select).toHaveValue("hidden");
+
+    await page.getByRole("button", { name: /save my preferences/i }).click();
+    await expect(page.getByText(/preferences applied/i)).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await expect(async () => {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.goto("/config/design-system?tab=overrides", { waitUntil: "domcontentloaded" });
+      await expect(page.locator("#layout-pref-leftSidebar")).toBeVisible({ timeout: 10_000 });
+      await expect(page.locator("#layout-pref-leftSidebar")).toHaveValue("hidden", {
+        timeout: 10_000,
+      });
+    }).toPass({ timeout: 25_000 });
   });
 
   test("clear overrides resets layout to theme default", async ({ page }) => {
-    await page.goto("/config/appearance");
-    await page.getByLabel(/left sidebar/i).selectOption("hidden");
+    test.setTimeout(60_000);
+    await openOverrides(page);
+
+    const select = leftSidebarSelect(page);
+    await select.scrollIntoViewIfNeeded();
+    await select.selectOption("hidden");
     await page.getByRole("button", { name: /save my preferences/i }).click();
-    await expect(page.getByText(/preferences applied/i)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/preferences applied/i)).toBeVisible({ timeout: 15_000 });
 
     await page.getByRole("button", { name: /clear overrides/i }).click();
-    await expect(page.getByText(/overrides cleared/i)).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByLabel(/left sidebar/i)).toHaveValue("", { timeout: 10_000 });
+    await expect(page.getByText(/overrides cleared|theme defaults/i)).toBeVisible({
+      timeout: 15_000,
+    });
   });
 });

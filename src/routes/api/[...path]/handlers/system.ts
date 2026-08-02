@@ -3,6 +3,7 @@
  * @description System, Settings, Widgets, and Utility handlers for the dispatcher.
  */
 
+import { logger } from "@utils/logger";
 import { AppError } from "@utils/error-handling";
 import { json, type RequestEvent } from "@sveltejs/kit";
 import type { LocalCMS } from "@src/services/sdk";
@@ -10,7 +11,8 @@ import type { DatabaseId } from "@src/content/types";
 import { rawResponse, successResponse } from "./base";
 import { webhookService } from "@src/services/background/webhook-service";
 import { settingsGroups } from "@src/routes/(app)/config/system-settings/settings-groups";
-import { getPrivateSettingSync } from "@src/services/core/settings-service";
+import { isMultiTenantEnabled } from "@utils/tenant";
+import { cacheService } from "@src/databases/cache/cache-service";
 
 export async function handleSystemRoutes(
   event: RequestEvent,
@@ -22,8 +24,29 @@ export async function handleSystemRoutes(
   switch (namespace) {
     case "widgets":
       return handleWidgetRoutes(event, cms, tenantId, segments);
-    case "system":
+    case "system": {
+      const action = segments[1];
+      if (action === "hot-collections" && event.request.method === "GET") {
+        const { getHotCollections } = await import("@src/services/intelligence/behavioral-learner");
+        const hot = getHotCollections(tenantId ?? "global", 20);
+        return successResponse(
+          event,
+          hot.map((c) => c.id),
+        );
+      }
+      if (action === "penalize-bounce" && event.request.method === "POST") {
+        const body = await event.request.json().catch(() => ({}));
+        const { fromPath, toPath } = body;
+        if (fromPath && toPath) {
+          const { penalizeTransition } =
+            await import("@src/services/intelligence/behavioral-learner");
+          penalizeTransition(tenantId ?? "global", fromPath, toPath);
+          return successResponse(event, { success: true });
+        }
+        return successResponse(event, { success: false, error: "Missing paths" }, 400);
+      }
       return handleSystemMgmtRoutes(event, cms, tenantId, segments);
+    }
     case "settings":
     case "system-settings":
       return handleSettingsRoutes(event, cms, tenantId, segments);
@@ -34,6 +57,8 @@ export async function handleSystemRoutes(
       return handleAiRoutes(event, cms, tenantId, segments);
     case "automations":
       return handleAutomationRoutes(event, cms, tenantId, segments);
+    case "workflows":
+      return handleWorkflowRoutes(event, cms, tenantId, segments);
     case "metrics":
       return successResponse(
         event,
@@ -53,6 +78,8 @@ export async function handleSystemRoutes(
       return handleHealthRoutes(event, cms, tenantId, segments);
     case "system-jobs":
       return handleSystemJobRoutes(event, cms, tenantId, segments);
+    case "plugin-settings":
+      return handlePluginSettingsRoutes(event, cms, tenantId, segments);
   }
 
   throw new AppError(`System endpoint /api/${segments.join("/")} not implemented`, 404);
@@ -193,6 +220,15 @@ export async function handleWebhookRoutes(
   const { request, locals } = event;
   const { user } = locals;
 
+  // 🛡️ SECURITY: Admin-only for all webhook operations
+  // Defense-in-depth: handler-level check independent of the middleware pipeline.
+  if (!user) {
+    throw new AppError("Authentication required", 401, "UNAUTHORIZED");
+  }
+  if (!user.isAdmin && user.role !== "admin" && user.role !== "super-admin") {
+    throw new AppError("Admin access required for webhook management", 403, "FORBIDDEN");
+  }
+
   const isDirect = segments[0] === "webhooks" || segments[0] === "system-webhooks";
   const webhookId = isDirect ? segments[1] : segments[2];
   const subAction = isDirect ? segments[2] : segments[3];
@@ -298,10 +334,20 @@ export async function handleSettingsRoutes(
       throw new AppError(`Settings group ${action} not found`, 404);
     }
 
-    const settings = await cms.system.settings.get(action || "all", {
-      tenantId: tenantId as any,
-    });
-    // Align with system.test.ts expectation: return { success: true, values: ... }
+    // Group settings are stored as a single key in preferences, not in KNOWN_PRIVATE_KEYS.
+    // Use direct preferences.get to retrieve arbitrary group keys.
+    let settings: unknown;
+    if (action && action !== "all" && action !== "general") {
+      const pref = await cms.db.system.preferences.get(action, {
+        scope: "system",
+        tenantId: tenantId as any,
+      });
+      settings = pref.success ? pref.data : {};
+    } else {
+      settings = await cms.system.settings.get(action || "all", {
+        tenantId: tenantId as any,
+      });
+    }
     return rawResponse(event, { success: true, values: settings || {} });
   }
 
@@ -485,7 +531,7 @@ export async function handleAiRoutes(
   segments: string[],
 ) {
   const { request, locals } = event;
-  if (getPrivateSettingSync("MULTI_TENANT") === true && !tenantId) {
+  if (isMultiTenantEnabled() && !tenantId) {
     throw new AppError("Tenant ID required", 400, "TENANT_REQUIRED");
   }
   const action = segments[1];
@@ -624,6 +670,90 @@ export async function handleAiRoutes(
 /**
  * --- AUTOMATION ---
  */
+/**
+ * --- WORKFLOWS (content lifecycle FSM definitions) ---
+ */
+export async function handleWorkflowRoutes(
+  event: RequestEvent,
+  _cms: LocalCMS,
+  tenantId: DatabaseId,
+  segments: string[],
+) {
+  const { request, locals, url } = event;
+  const { user } = locals;
+
+  // 🛡️ SECURITY: Admin for mutations; authenticated for GET
+  if (!["GET", "OPTIONS"].includes(request.method)) {
+    if (!user || (!user.isAdmin && user.role !== "admin" && user.role !== "super-admin")) {
+      throw new AppError("Admin access required for workflow management", 403, "FORBIDDEN");
+    }
+  } else if (!user) {
+    throw new AppError("Authentication required", 401, "UNAUTHORIZED");
+  }
+
+  if (isMultiTenantEnabled() && !tenantId) {
+    throw new AppError("Tenant ID required", 400, "TENANT_REQUIRED");
+  }
+
+  const { workflowService } = await import("@src/services/background/workflow-service");
+  const tid = tenantId ? String(tenantId) : undefined;
+
+  // PATCH = entry state transition (content ops, not definition CRUD)
+  if (request.method === "PATCH") {
+    const body = await request.json().catch(() => ({}));
+    const entryId = body.entryId as string | undefined;
+    const targetStateId = body.targetStateId as string | undefined;
+    if (!entryId || !targetStateId) {
+      throw new AppError("entryId and targetStateId are required", 400);
+    }
+    const roles = Array.isArray((user as any)?.roles) ? (user as any).roles : [];
+    const instance = await workflowService.transition(
+      entryId,
+      targetStateId,
+      user as any,
+      roles,
+      tid,
+      body.comment as string | undefined,
+    );
+    return successResponse(event, instance);
+  }
+
+  if (request.method === "GET") {
+    const collectionId = url.searchParams.get("collectionId") || segments[1];
+    const entryId = url.searchParams.get("entryId");
+
+    if (entryId) {
+      const instance = await workflowService.getWorkflowInstance(entryId, tid);
+      return successResponse(event, instance);
+    }
+
+    if (collectionId && collectionId !== "list") {
+      const def = await workflowService.getWorkflowForCollection(collectionId, tid);
+      return successResponse(event, def);
+    }
+
+    throw new AppError("collectionId or entryId query parameter required", 400);
+  }
+
+  if (request.method === "POST") {
+    const body = await request.json();
+    if (!body?.collectionId) {
+      throw new AppError("collectionId is required", 400);
+    }
+    const saved = await workflowService.saveWorkflow(body, user as any, tid);
+    return successResponse(event, saved, body._id ? 200 : 201);
+  }
+
+  if (request.method === "DELETE") {
+    const id = segments[1] || url.searchParams.get("id");
+    if (!id) throw new AppError("Workflow id required", 400);
+    await workflowService.deleteWorkflow(id, user as any, tid);
+    return successResponse(event, { success: true, deleted: id });
+  }
+
+  throw new AppError(`Method ${request.method} not allowed for workflows`, 405);
+}
+
 export async function handleAutomationRoutes(
   event: RequestEvent,
   cms: LocalCMS,
@@ -634,18 +764,20 @@ export async function handleAutomationRoutes(
   const { user } = locals;
 
   // 🛡️ SECURITY: Admin verification for automation management
-  if (!["GET", "OPTIONS"].includes(request.method)) {
-    if (!user || (!user.isAdmin && user.role !== "admin")) {
-      throw new AppError("Admin access required for automation management", 403, "FORBIDDEN");
-    }
+  // Defense-in-depth: handler-level check independent of the middleware pipeline.
+  if (!user) {
+    throw new AppError("Authentication required", 401, "UNAUTHORIZED");
+  }
+  if (!user.isAdmin && user.role !== "admin" && user.role !== "super-admin") {
+    throw new AppError("Admin access required for automation management", 403, "FORBIDDEN");
   }
 
   if (process.env.VERBOSE_TESTS === "true") {
-    console.log(
+    logger.debug(
       `[handleAutomationRoutes] Method: ${request.method}, segments: ${segments.join(",")}, tenantId: ${tenantId}`,
     );
   }
-  if (getPrivateSettingSync("MULTI_TENANT") === true && !tenantId) {
+  if (isMultiTenantEnabled() && !tenantId) {
     throw new AppError("Tenant ID required", 400, "TENANT_REQUIRED");
   }
   const id = segments[1]; // Corrected index: namespace is [0], id is [1]
@@ -725,6 +857,10 @@ export async function handleTelemetryRoutes(
       event,
       await cms.telemetry.checkUpdateStatus({ tenantId: _tenantId as any }),
     );
+  if (action === "diagnose") {
+    const { telemetryService } = await import("@src/services/observability/telemetry-service");
+    return successResponse(event, await telemetryService.diagnoseConnection());
+  }
   if (action === "report" && event.request.method === "POST") {
     return rawResponse(event, { status: "active", success: true });
   }
@@ -761,18 +897,11 @@ export async function handlePreferenceRoutes(
   };
 
   if (request.method === "GET") {
-    console.log(
-      `[Preference API] GET key: ${key}, scope: ${scope}, userId: ${options.userId}, tenantId: ${options.tenantId}`,
-    );
     const result = await cms.db.system.preferences.get(key, options);
     if (!result.success) {
       throw new AppError(result.message || "Failed to get preference", 500);
     }
-    console.log(
-      `[Preference API] GET Result: success=${result.success}, data=${JSON.stringify(result.data)}`,
-    );
     if (result.data === null) {
-      console.warn(`[Preference API] NOT FOUND: ${key}`);
       throw new AppError("Preference not found", 404);
     }
     return rawResponse(event, result.data);
@@ -780,14 +909,10 @@ export async function handlePreferenceRoutes(
 
   if (request.method === "POST" || request.method === "PUT") {
     const value = body.value !== undefined ? body.value : body;
-    console.log(
-      `[Preference API] SET key: ${key}, value: ${JSON.stringify(value)}, options: ${JSON.stringify(options)}`,
-    );
     const result = await cms.db.system.preferences.set(key, value, {
       ...options,
       category: body.category,
     });
-    console.log(`[Preference API] SET Result: success=${result.success}`);
     if (!result.success) {
       throw new AppError(result.message || "Failed to set preference", 500);
     }
@@ -963,6 +1088,8 @@ export async function handleHealthRoutes(
   }
 
   const isUp = await cms.db.isConnected();
+  const { getDatabaseResilience } = await import("@src/databases/database-resilience");
+  const metrics = getDatabaseResilience().getMetrics();
   const report = {
     status: isUp ? "healthy" : "degraded",
     database: isUp ? "connected" : "disconnected",
@@ -970,6 +1097,11 @@ export async function handleHealthRoutes(
     serverTime: new Date().toISOString(),
     uptime: process.uptime(),
     dbType: process.env.DB_TYPE || "unknown",
+    resilience: {
+      circuitState: metrics.circuitState,
+      totalRetries: metrics.totalRetries,
+      successfulReconnections: metrics.successfulReconnections,
+    },
   };
 
   const reportString = JSON.stringify({ success: true, data: report });
@@ -1066,13 +1198,14 @@ export async function handleExportRoutes(
   _segments: string[],
 ) {
   const { request } = event;
-  if (getPrivateSettingSync("MULTI_TENANT") === true && !tenantId) {
+  if (isMultiTenantEnabled() && !tenantId) {
     throw new AppError("Tenant ID required", 400, "TENANT_REQUIRED");
   }
   if (request.method === "POST") {
     const { type } = await request.json().catch(() => ({}));
     if (type === "users") {
       const result = await cms.auth.listUsers({ tenantId });
+      if (!result.success) throw new AppError(result.message || "Failed to list users", 500);
       return successResponse(event, result.data);
     }
     return successResponse(event, { success: true, message: "Export started" });
@@ -1090,7 +1223,7 @@ export async function handleImportRoutes(
   segments: string[],
 ) {
   const { request } = event;
-  if (getPrivateSettingSync("MULTI_TENANT") === true && !tenantId) {
+  if (isMultiTenantEnabled() && !tenantId) {
     throw new AppError("Tenant ID required", 400, "TENANT_REQUIRED");
   }
   const action = segments[1];
@@ -1111,6 +1244,14 @@ export async function handleImportRoutes(
 /**
  * --- SYSTEM VIRTUAL FOLDERS ---
  */
+// The mediagallery breadcrumb/folder-tree load uses a 5-min SWR cache
+// (`mediagallery:virtualFolders:<tenantId>`) keyed the same way here — must be
+// invalidated on any folder mutation or newly created/renamed/deleted folders
+// stay invisible client-side until the cache naturally expires.
+async function invalidateVirtualFolderCache(tenantId: DatabaseId) {
+  await cacheService.delete(`mediagallery:virtualFolders:${tenantId || "global"}`);
+}
+
 export async function handleSystemVirtualFolderRoutes(
   event: RequestEvent,
   cms: LocalCMS,
@@ -1119,8 +1260,10 @@ export async function handleSystemVirtualFolderRoutes(
 ) {
   const { request, url } = event;
 
+  const tenantOpts = { tenantId };
+
   if (request.method === "GET") {
-    const result = await cms.db.system.virtualFolder.getAll(tenantId);
+    const result = await cms.db.system.virtualFolder.getAll(tenantOpts);
     return successResponse(event, result);
   }
 
@@ -1136,7 +1279,7 @@ export async function handleSystemVirtualFolderRoutes(
     if (parent) {
       const parentResult = await cms.db.system.virtualFolder.getById(
         parent as DatabaseId,
-        tenantId,
+        tenantOpts,
       );
       if (!parentResult.success || !parentResult.data) {
         throw new AppError("Parent folder not found", 404);
@@ -1153,8 +1296,9 @@ export async function handleSystemVirtualFolderRoutes(
         order: 0,
         type: "folder",
       },
-      tenantId,
+      tenantOpts,
     );
+    await invalidateVirtualFolderCache(tenantId);
     return successResponse(event, result);
   }
 
@@ -1174,7 +1318,7 @@ export async function handleSystemVirtualFolderRoutes(
 
         const folderResult = await cms.db.system.virtualFolder.getById(
           folderId as DatabaseId,
-          tenantId,
+          tenantOpts,
         );
         if (!folderResult.success || !folderResult.data) {
           continue;
@@ -1184,7 +1328,7 @@ export async function handleSystemVirtualFolderRoutes(
         if (targetParentId) {
           const parentFolder = await cms.db.system.virtualFolder.getById(
             targetParentId as DatabaseId,
-            tenantId,
+            tenantOpts,
           );
           if (parentFolder.success && parentFolder.data) {
             newPath =
@@ -1201,12 +1345,13 @@ export async function handleSystemVirtualFolderRoutes(
             order: update.order,
             path: newPath,
           },
-          tenantId,
+          tenantOpts,
         );
 
         await updateFolderPathsRecursive(cms, folderId as DatabaseId, newPath, tenantId);
       }
 
+      await invalidateVirtualFolderCache(tenantId);
       return successResponse(event, { success: true });
     }
 
@@ -1217,7 +1362,7 @@ export async function handleSystemVirtualFolderRoutes(
 
     const folderResult = await cms.db.system.virtualFolder.getById(
       folderId as DatabaseId,
-      tenantId,
+      tenantOpts,
     );
     if (!folderResult.success || !folderResult.data) {
       throw new AppError("Folder not found", 404);
@@ -1227,7 +1372,7 @@ export async function handleSystemVirtualFolderRoutes(
     if (folderResult.data.parentId) {
       const parentFolder = await cms.db.system.virtualFolder.getById(
         folderResult.data.parentId as DatabaseId,
-        tenantId,
+        tenantOpts,
       );
       if (parentFolder.success && parentFolder.data) {
         parentPath = parentFolder.data.path;
@@ -1242,11 +1387,12 @@ export async function handleSystemVirtualFolderRoutes(
         name,
         path: newPath,
       },
-      tenantId,
+      tenantOpts,
     );
 
     await updateFolderPathsRecursive(cms, folderId as DatabaseId, newPath, tenantId);
 
+    await invalidateVirtualFolderCache(tenantId);
     return successResponse(event, result);
   }
 
@@ -1261,7 +1407,8 @@ export async function handleSystemVirtualFolderRoutes(
       throw new AppError("folderId is required for deletion", 400);
     }
 
-    const result = await cms.db.system.virtualFolder.delete(folderId as DatabaseId, tenantId);
+    const result = await cms.db.system.virtualFolder.delete(folderId as DatabaseId, tenantOpts);
+    await invalidateVirtualFolderCache(tenantId);
     return successResponse(event, result);
   }
 
@@ -1277,7 +1424,8 @@ async function updateFolderPathsRecursive(
   parentPath: string,
   tenantId: DatabaseId,
 ) {
-  const allFoldersResult = await cms.db.system.virtualFolder.getAll(tenantId);
+  const tenantOpts = { tenantId };
+  const allFoldersResult = await cms.db.system.virtualFolder.getAll(tenantOpts);
   if (!allFoldersResult.success || !allFoldersResult.data) {
     return;
   }
@@ -1290,10 +1438,94 @@ async function updateFolderPathsRecursive(
     for (const child of children) {
       const newChildPath =
         currentParentPath === "/" ? `/${child.name}` : `${currentParentPath}/${child.name}`;
-      await cms.db.system.virtualFolder.update(child._id, { path: newChildPath }, tenantId);
+      await cms.db.system.virtualFolder.update(child._id, { path: newChildPath }, tenantOpts);
       await updateChildren(child._id, newChildPath);
     }
   }
 
   await updateChildren(parentId, parentPath);
+}
+
+// ============================================================================
+// Plugin Settings Handler (encrypted, per-tenant, per-plugin)
+// ============================================================================
+
+import { pluginRegistry } from "@src/plugins/registry";
+import { validatePluginSettings } from "@src/plugins/settings-declaration";
+import { capabilityRegistry } from "@src/services/security/capability-registry";
+
+/**
+ * Handle /api/plugin-settings/:pluginId
+ * - GET: Return settings for a plugin (secrets masked)
+ * - PUT: Save settings for a plugin (validates against declaration, encrypts secrets)
+ */
+export async function handlePluginSettingsRoutes(
+  event: RequestEvent,
+  _cms: LocalCMS,
+  tenantId: DatabaseId,
+  segments: string[],
+) {
+  const { request, locals } = event;
+  const pluginId = segments[1];
+  const user = locals.user as any;
+  const roles = (locals.roles || []) as any[];
+
+  if (!pluginId) {
+    throw new AppError("pluginId is required in path", 400);
+  }
+
+  // Check plugin exists
+  const plugin = pluginRegistry.get(pluginId);
+  if (!plugin) {
+    throw new AppError(`Plugin "${pluginId}" not found`, 404);
+  }
+
+  // Check capability gate
+  if (!capabilityRegistry.canManagePluginSettings(user, roles, pluginId)) {
+    throw new AppError("Insufficient permissions to manage plugin settings", 403, "FORBIDDEN");
+  }
+
+  // If plugin has requiredCapabilities, check those too
+  if (plugin.settings?.requiredCapabilities) {
+    for (const cap of plugin.settings.requiredCapabilities) {
+      if (!capabilityRegistry.hasCapability(user, cap, roles)) {
+        throw new AppError(
+          `Plugin "${pluginId}" requires capability "${cap}" to manage its settings`,
+          403,
+          "FORBIDDEN",
+        );
+      }
+    }
+  }
+
+  const tenantIdStr = String(tenantId);
+
+  if (request.method === "GET") {
+    const settings = await pluginRegistry.getPluginSettings(pluginId, tenantIdStr);
+    return successResponse(event, { settings: settings || {} });
+  }
+
+  if (request.method === "PUT" || request.method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const submitted = body.settings || body;
+
+    // Validate against declaration if available
+    if (plugin.settings) {
+      const issues = validatePluginSettings(submitted, plugin.settings);
+      if (issues.length > 0) {
+        return successResponse(event, { error: "Validation failed", issues }, 400);
+      }
+    }
+
+    const saved = await pluginRegistry.savePluginSettings(pluginId, tenantIdStr, submitted);
+    if (!saved) {
+      throw new AppError("Failed to save plugin settings", 500);
+    }
+
+    // Return masked settings
+    const updated = await pluginRegistry.getPluginSettings(pluginId, tenantIdStr);
+    return successResponse(event, { settings: updated || {} });
+  }
+
+  throw new AppError(`Method ${request.method} not allowed for plugin-settings`, 405);
 }

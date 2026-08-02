@@ -19,7 +19,7 @@ export function generateCsrfToken(cookies: Cookies, isSecure: boolean): string {
 
   cookies.set(cookieName, token, {
     path: "/",
-    httpOnly: true,
+    httpOnly: false,
     secure: isSecure,
     sameSite: "strict",
     maxAge: 60 * 60 * 24, // 24 hours
@@ -86,6 +86,38 @@ export function validateCsrfForRequest(
   const safeMethods = ["GET", "HEAD", "OPTIONS"];
   if (safeMethods.includes(request.method)) {
     return { isValid: true };
+  }
+
+  // 🚀 SAME-ORIGIN FAST-PATH: SvelteKit's built-in CSRF already blocks cross-origin
+  // requests. The custom X-CSRF-Token check is an additional defense layer for
+  // cross-origin requests. Same-origin requests can skip the custom check.
+  const origin = request.headers.get("origin");
+  const host = request.headers.get("host");
+  if (origin && host) {
+    try {
+      const originUrl = new URL(origin);
+      if (originUrl.host === host) {
+        return { isValid: true };
+      }
+    } catch {
+      // Malformed origin — fall through to token check
+    }
+  }
+
+  // 🚀 REFERER FALLBACK: When Origin header is absent (e.g., some FormData/fetch
+  // combinations), check Referer against the Host.
+  if (!origin && host) {
+    const referer = request.headers.get("referer");
+    if (referer) {
+      try {
+        const refererUrl = new URL(referer);
+        if (refererUrl.host === host) {
+          return { isValid: true };
+        }
+      } catch {
+        // Malformed referer — fall through to token check
+      }
+    }
   }
 
   // Get token from header

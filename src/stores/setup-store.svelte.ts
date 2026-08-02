@@ -142,7 +142,7 @@ const initialSystemSettings: SystemSettings = {
   contentLanguages: ["en", "de"], // Will be populated from DB after seeding (reads from settings.json)
   mediaStorageType: "local",
   mediaFolder: "./mediaFolder",
-  preset: "blank",
+  preset: "website",
   passwordMinLength: 8,
   timezone: "UTC",
   useRedis: false,
@@ -564,7 +564,7 @@ function createSetupStore() {
         admin: wizard.adminUser,
         system: {
           ...wizard.systemSettings,
-          preset: wizard.systemSettings.preset || "blank",
+          preset: wizard.systemSettings.preset || "website",
           cfPurgeMode: wizard.systemSettings.cfPurgeMode || "tags",
         },
         emailSettings: {
@@ -609,18 +609,25 @@ function createSetupStore() {
         logger.debug("[SetupStore] Flash message set in sessionStorage");
       }
 
-      // Clear store state locally
-      const targetPath = (data as any).redirectPath || "/en/collections";
+      // Clear store state locally — prefer server redirectPath; never fall back to
+      // collectionbuilder (cold-boot 500). /login is always valid with a session.
+      const targetPath = (data as any).redirectPath || "/login";
 
-      // Success! Give the toast a moment and then redirect hard to ensure clean slate after restart
-      setTimeout(() => {
+      // Hard redirect immediately so E2E/CI do not race a delayed timer against
+      // waitForURL (toast is non-blocking). Keep a tiny yield for paint/sessionStorage.
+      const go = () => {
         if (onSuccess) {
           onSuccess(targetPath);
         } else {
           // Use hard redirect for the very final step to ensure system state is fully re-synced in browser
           window.location.href = targetPath;
         }
-      }, 500);
+      };
+      if (typeof queueMicrotask === "function") {
+        queueMicrotask(go);
+      } else {
+        setTimeout(go, 0);
+      }
 
       return true;
     } catch (e) {
@@ -683,7 +690,13 @@ function createSetupStore() {
       wizard.redisTestPassed = false;
       return false;
     } catch (e) {
-      const errorMsg = e instanceof Error ? e.message : "A server error occurred.";
+      // Surface real error — query() wrapper may throw without proper Error type
+      const errorMsg =
+        e instanceof Error
+          ? e.message
+          : typeof e === "string"
+            ? e
+            : (e as any)?.message || String(e) || "A server error occurred.";
       wizard.errorMessage = `Redis Error: ${errorMsg}`;
       wizard.redisTestPassed = false;
       return false;

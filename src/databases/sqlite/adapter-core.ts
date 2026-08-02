@@ -27,6 +27,11 @@ import { registerTableSchema } from "../core/relational-utils";
 import { SQLiteQueryBuilder } from "./sq-lite-query-builder";
 import { TransactionModule } from "./transaction-module";
 
+// Pre-register system table schemas for optimal row conversion
+for (const [tableName, columns] of Object.entries(helpers.SYSTEM_LITERAL_COLUMNS)) {
+  registerTableSchema(tableName, columns as string[]);
+}
+
 // --- Types ---
 export type SQLiteConfig = { connectionString?: string; readonly?: boolean };
 export type SQLiteClient = any;
@@ -104,7 +109,13 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
   }
 
   protected isMissingTableError(err: any): boolean {
-    return err?.code === "SQLITE_ERROR" && err?.message?.includes("no such table");
+    const direct = err?.code === "SQLITE_ERROR" || err?.code === "ERR_SQLITE_ERROR";
+    const viaCause = err?.cause?.code === "SQLITE_ERROR" || err?.cause?.code === "ERR_SQLITE_ERROR";
+    const hasMsg =
+      err?.message?.includes("no such table") || err?.cause?.message?.includes("no such table");
+    // Fallback: message-only match catches Drizzle/SQLite wrapper errors
+    // that lose the SQLITE_ERROR code in the chain
+    return hasMsg || direct || viaCause;
   }
 
   protected async executeDynamicSql(db: any, sqlQuery: SQL): Promise<any[]> {
@@ -119,10 +130,13 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
   ): Promise<T | null> {
     try {
       const tableName = getTableName(table);
-      const idStr = String(id).replace(/'/g, "''");
-      const tenantFilter = utils.buildRawTenantFilter(options, "sqlite");
-      const rawSql = `SELECT * FROM "${tableName}" WHERE "_id" = '${idStr}'${tenantFilter} LIMIT 1`;
-      const rawRows = this.prepareAndExecute(rawSql, "all");
+      // Bound parameters for _id + tenantId (no string interpolation of identifiers/values)
+      const { sql: tenantSql, params: tenantParams } = utils.buildRawTenantClause(
+        options,
+        "sqlite",
+      );
+      const rawSql = `SELECT * FROM "${tableName}" WHERE "_id" = ?${tenantSql} LIMIT 1`;
+      const rawRows = this.prepareAndExecute(rawSql, "all", String(id), ...tenantParams);
       if (rawRows && rawRows.length > 0) {
         return utils.convertDatesToISO(rawRows[0], { table: collection }) as T;
       }
@@ -182,8 +196,8 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
           let row: any = null;
           if (client.query) {
             row = client
-              .query(`SELECT data FROM content_nodes WHERE _id = '${cleanName}' LIMIT 1`)
-              .get();
+              .query(`SELECT data FROM content_nodes WHERE _id = ? LIMIT 1`)
+              .get(cleanName);
           } else if (client.prepare) {
             row = client
               .prepare(`SELECT data FROM content_nodes WHERE _id = ? LIMIT 1`)
@@ -349,7 +363,7 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
             } catch (err: any) {
               this._insertManyReturningSupported = false;
               if (process.env.BENCHMARK !== "true") {
-                logger.warn("[SQLite] insertMany returning fallback invoked due to error:", err);
+                logger.debug("[SQLite] insertMany returning fallback:", err.message);
               }
               await (query as any);
               return utils.convertArrayDatesToISO(batchValues as Record<string, any>[], {
@@ -783,7 +797,10 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
     conflictTarget: any[],
     options: BaseQueryOptions = {},
   ): Promise<void> {
-    const tableName = getTableName(table);
+    // Resolve string collection name to Drizzle table object
+    const resolvedTable = typeof table === "string" ? this.getTable(table) : table;
+    if (!resolvedTable) throw new Error(`Table not found: ${table}`);
+    const tableName = getTableName(resolvedTable);
     if (process.env.BENCHMARK_DEBUG === "true" || process.env.BENCHMARK === "true") {
       logger.info(
         `[upsertNative] Table: ${tableName}, ID: ${values._id}, source: ${values.source}, tenant: ${values.tenantId}`,
@@ -796,9 +813,13 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
           col && typeof col === "object" && "name" in col ? `"${col.name}"` : `"${String(col)}"`,
         );
         const rawTarget = sql.raw(rawNames.join(", "));
-        await (db.insert(table).values(values) as any).onConflictDoUpdate({
+        // Strip undefined values — Drizzle SQLite insert crashes on undefined column values
+        const cleanValues = Object.fromEntries(
+          Object.entries(values).filter(([, v]) => v !== undefined),
+        );
+        await (db.insert(resolvedTable).values(cleanValues) as any).onConflictDoUpdate({
           target: rawTarget,
-          set: values,
+          set: cleanValues,
         });
       },
       "UPSERT_NATIVE_FAILED",
@@ -827,16 +848,29 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
         if (!idCol) throw new Error("ID column not found");
 
         const now = new Date();
-        const tenantFilter = utils.buildRawTenantFilter(options, "sqlite");
+        const { sql: tenantSql, params: tenantParams } = utils.buildRawTenantClause(
+          options,
+          "sqlite",
+        );
         const dataCol = this.getColumn(table, "data");
         const idStr = String(id);
+        // Identifiers may be embedded; values (_id, amount, tenantId) are always bound.
+        const safeField = utils.assertSafeSqlIdentifier(field);
+        const amountNum = utils.assertFiniteAmount(amount);
 
+        // Bind amount as a parameter (not only id/tenant) for full value safety.
         const updateReturning = dataCol
-          ? `UPDATE "${tableName}" SET "data" = json_set(coalesce("data", '{}'), '$.${field}', coalesce(json_extract(coalesce("data", '{}'), '$.${field}'), 0) + ${amount}), "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = '${idStr}'${tenantFilter} RETURNING *`
-          : `UPDATE "${tableName}" SET "${field}" = coalesce("${field}", 0) + ${amount}, "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = '${idStr}'${tenantFilter} RETURNING *`;
+          ? `UPDATE "${tableName}" SET "data" = json_set(coalesce("data", '{}'), '$.${safeField}', coalesce(json_extract(coalesce("data", '{}'), '$.${safeField}'), 0) + ?), "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = ?${tenantSql} RETURNING *`
+          : `UPDATE "${tableName}" SET "${safeField}" = coalesce("${safeField}", 0) + ?, "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = ?${tenantSql} RETURNING *`;
 
         try {
-          const rows = this.prepareAndExecute(updateReturning, "all");
+          const rows = this.prepareAndExecute(
+            updateReturning,
+            "all",
+            amountNum,
+            idStr,
+            ...tenantParams,
+          );
           if (Array.isArray(rows) && rows.length > 0) {
             return utils.convertDatesToISO(rows[0], {
               table: collection,
@@ -847,14 +881,16 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
         }
 
         const updateSql = dataCol
-          ? `UPDATE "${tableName}" SET "data" = json_set(coalesce("data", '{}'), '$.${field}', coalesce(json_extract(coalesce("data", '{}'), '$.${field}'), 0) + ${amount}), "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = '${idStr}'${tenantFilter}`
-          : `UPDATE "${tableName}" SET "${field}" = coalesce("${field}", 0) + ${amount}, "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = '${idStr}'${tenantFilter}`;
+          ? `UPDATE "${tableName}" SET "data" = json_set(coalesce("data", '{}'), '$.${safeField}', coalesce(json_extract(coalesce("data", '{}'), '$.${safeField}'), 0) + ?), "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = ?${tenantSql}`
+          : `UPDATE "${tableName}" SET "${safeField}" = coalesce("${safeField}", 0) + ?, "updatedAt" = ${now.getTime()} WHERE "${idCol.name}" = ?${tenantSql}`;
 
-        this.prepareAndExecute(updateSql, "run");
+        this.prepareAndExecute(updateSql, "run", amountNum, idStr, ...tenantParams);
 
         const selectRows = this.prepareAndExecute(
-          `SELECT * FROM "${tableName}" WHERE "${idCol.name}" = '${idStr}'${tenantFilter} LIMIT 1`,
+          `SELECT * FROM "${tableName}" WHERE "${idCol.name}" = ?${tenantSql} LIMIT 1`,
           "all",
+          idStr,
+          ...tenantParams,
         );
         if (!Array.isArray(selectRows) || selectRows.length === 0) {
           throw new Error(`Entry not found after increment: ${idStr}`);
@@ -887,7 +923,7 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
 
         const ddl = `CREATE TABLE IF NOT EXISTS "${physicalName}" ("_id" TEXT PRIMARY KEY, "tenantId" TEXT, "status" TEXT DEFAULT 'draft', "isDeleted" INTEGER DEFAULT 0, "createdAt" INTEGER, "updatedAt" INTEGER, "data" TEXT);`;
         if (debugMode && !isBenchSuite)
-          console.log(`[DB Provision] [SQLITE] Executing DDL for ${physicalName}`);
+          logger.debug(`[DB Provision] [SQLITE] Executing DDL for ${physicalName}`);
         await this.raw.execute(ddl);
 
         const columns = [
@@ -934,20 +970,29 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
           ...allColumnsToEnsure.map((c) => c.name),
         ]);
 
+        // Collect which dynamic columns are actually present after ALTER TABLE.
+        // This avoids noisy CREATE INDEX errors when a column couldn't be added
+        // (e.g. under node:sqlite proxy driver where ALTER TABLE may silently fail).
+        const addedColumns = new Set<string>();
         for (const col of allColumnsToEnsure) {
           try {
+            // Defense-in-depth: schema-defined column names are interpolated as identifiers
+            const safeColName = utils.assertSafeSqlIdentifier(col.name, "column");
             const tableInfo = await this.raw.execute(`PRAGMA table_info("${physicalName}")`);
-            const exists = tableInfo.some((c: any) => c.name === col.name);
-            if (!exists)
+            const exists = tableInfo.some((c: any) => c.name === safeColName);
+            if (!exists) {
               await this.raw.execute(
-                `ALTER TABLE "${physicalName}" ADD COLUMN "${col.name}" ${col.type}`,
+                `ALTER TABLE "${physicalName}" ADD COLUMN "${safeColName}" ${col.type}`,
               );
+            }
+            addedColumns.add(safeColName);
           } catch {
-            /* safe */
+            /* safe — column may already exist or ALTER TABLE unsupported */
           }
         }
 
         for (const col of dynamicCols) {
+          if (!addedColumns.has(col.name)) continue;
           try {
             const indexName = `${physicalName}_${col.name}_idx`;
             await this.raw.execute(
@@ -973,7 +1018,8 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
 
   private async createDriver(dbPath: string) {
     const versions = (process as any)?.versions || {};
-    const isBun = typeof Bun !== "undefined";
+    // Use process.versions.bun instead of typeof Bun — avoids TS "Cannot find name 'Bun'"
+    const isBun = !!(versions as any).bun;
     const nodeVersion = versions.node;
 
     let normalizedPath = dbPath.replace(/\\/g, "/");
@@ -994,7 +1040,8 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
 
     if (isBun) {
       try {
-        const { Database } = await import("bun:sqlite");
+        // Use Function constructor to prevent TypeScript from resolving bun:sqlite
+        const { Database } = await new Function('return import("bun:sqlite")')();
         let sqlite: any;
         let lastErr: any;
         for (let i = 0; i < 10; i++) {
@@ -1113,10 +1160,10 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
     safeExec("PRAGMA synchronous=NORMAL");
     safeExec("PRAGMA foreign_keys=ON");
     safeExec("PRAGMA page_size=8192");
-    safeExec("PRAGMA busy_timeout=30000");
+    safeExec("PRAGMA busy_timeout=5000");
     safeExec("PRAGMA temp_store=MEMORY");
     safeExec("PRAGMA mmap_size=536870912");
-    safeExec("PRAGMA cache_size=-128000");
+    safeExec("PRAGMA cache_size=-20000");
     safeExec("PRAGMA wal_autocheckpoint=1000");
   }
 
@@ -1128,8 +1175,23 @@ export abstract class SQLiteAdapterCore extends SqlAdapterCore implements ISqlAd
 
     if (!dbPath) {
       const { isSetupComplete } = await import("@utils/setup-check-fast");
+      const isTestHarness =
+        process.env.TEST_MODE === "true" ||
+        process.env.VITEST === "true" ||
+        process.env.BUN_TEST === "true" ||
+        process.env.BENCHMARK === "true";
+      const dbName = (config as any).DB_NAME;
+      const isTestDb =
+        isTestHarness || (dbName && (dbName.includes("test") || dbName.includes("benchmark")));
+      const defaultDbFolder = isTestDb ? "config/test-database" : "config/database";
+
       dbPath =
-        process.env.DB_PATH || (isSetupComplete() ? "config/database/sveltycms.db" : ":memory:");
+        process.env.DB_PATH ||
+        (dbName
+          ? `${defaultDbFolder}/${dbName}`
+          : isSetupComplete()
+            ? `${defaultDbFolder}/sveltycms.db`
+            : ":memory:");
     }
 
     if (dbPath.includes("://")) {

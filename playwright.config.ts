@@ -1,6 +1,19 @@
 /**
  * @file playwright.config.ts
  * @description Playwright test configuration for SveltyCMS
+ *
+ * Simplified 4-project architecture:
+ * - wizard:     Setup wizard on clean slate (serial, port 5174 fallback)
+ * - firstuser:  Signup + OAuth before auth seeding (serial)
+ * - auth-setup: Seed users + login test + save auth state (serial)
+ * - chromium:   All CMS routes — fully parallel, sharded in CI
+ *
+ * Projects run in dependency order. In CI, e2e-prep runs wizard →
+ * firstuser → auth-setup sequentially, then chromium is sharded N ways.
+ *
+ * Local default (CI-parity): `bun run test:e2e` → scripts/run-e2e-ci.ts
+ *   (preview server :4173, COMPILE_ALL_ADAPTERS build, wizard → auth-setup → chromium)
+ * Dev-server shortcut: `bun run test:e2e:dev` (Vite :5173) — not CI-identical.
  */
 
 import { defineConfig, devices } from "@playwright/test";
@@ -30,17 +43,12 @@ if (!TEST_API_SECRET) {
 // Ensure workers inherit the secret so they can authenticate testing endpoints
 process.env.TEST_API_SECRET = TEST_API_SECRET;
 
-// See https://playwright.dev/docs/test-configuration.
 export default defineConfig({
   testDir: "./tests/e2e",
   testMatch: "**/*.{test,spec,spect}.ts",
-  /* Maximum time one test can run for. */
-  // timeout: 60 * 1000,
+  outputDir: "./tests/test-results",
+  timeout: 90_000,
   expect: {
-    /**
-     * Maximum time expect() should wait for the condition to be met.
-     * For example in `await expect(locator).toBeVisible();`
-     */
     timeout: 10 * 1000,
     toHaveScreenshot: {
       animations: "disabled",
@@ -49,223 +57,95 @@ export default defineConfig({
     },
   },
   snapshotPathTemplate: "{testDir}/{testFileDir}/{testFileName}-snapshots/{arg}-{projectName}{ext}",
-  /* Run tests in files in parallel */
   fullyParallel: true,
-  /* Fail the build on CI if you accidentally left test.only in the source code. */
   forbidOnly: !!process.env.CI,
-  /* Retry on CI only */
   retries: process.env.CI ? 1 : 0,
-  /*
-   * ✨ Database-per-Worker Strategy:
-   * Enable parallelism. Each worker will use a unique SQLite file
-   * (e.g. cms_worker1.db) triggered by the x-test-worker-index header.
-   */
-  workers: process.env.CI ? 4 : undefined,
-  /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: [
-    ["html", { outputFolder: "tests/playwright-report", open: "never" }],
-    [process.env.CI ? "github" : "list"],
-  ],
+  workers: process.env.PLAYWRIGHT_WORKERS ? Number.parseInt(process.env.PLAYWRIGHT_WORKERS, 10) : 4,
+  reporter: process.env.CI
+    ? [
+        ["list"],
+        ["github"], // inline annotations on the PR check
+        ["html", { outputFolder: "tests/playwright-report", open: "never" }],
+        // Machine-readable for scripts/ci-report-playwright.ts → GITHUB_STEP_SUMMARY
+        ["json", { outputFile: "tests/playwright-results.json" }],
+      ]
+    : [["list"], ["html", { outputFolder: "tests/playwright-report", open: "never" }]],
 
-  /* Set environment variables for tests */
   use: {
-    /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: process.env.PLAYWRIGHT_TEST_BASE_URL || "http://127.0.0.1:4173",
-
-    /* Tag Playwright-originated API calls without bypassing normal browser navigation. */
+    // Default: Vite dev server (port 5173). CI sets PLAYWRIGHT_TEST_BASE_URL.
+    baseURL: process.env.PLAYWRIGHT_TEST_BASE_URL || "http://127.0.0.1:5173",
     extraHTTPHeaders: {
       "x-test-mode": "true",
       "x-test-worker-index": process.env.TEST_WORKER_INDEX || "0",
       "x-test-secret": TEST_API_SECRET || "",
     },
-
     launchOptions: {
       slowMo: Number.parseInt(process.env.SLOW_MO || "0", 10),
     },
-    // Explicitly set PWDEBUG for local runs
-    // Set environment variables in your test runner or webServer configuration if needed
-
-    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: "on-first-retry",
     video: "retain-on-failure",
-
-    /* Bypass CSP in tests to allow MongoDB connections */
     bypassCSP: true,
   },
 
-  /* Global Setup for artifact/secret synchronization */
+  // Auto-start Vite dev server when running in isolation (no PLAYWRIGHT_TEST_BASE_URL set)
+  webServer: process.env.PLAYWRIGHT_TEST_BASE_URL
+    ? undefined
+    : {
+        command: "bun run dev",
+        port: 5173,
+        timeout: 120_000,
+        reuseExistingServer: true,
+        env: { PLAYWRIGHT_TEST: "1", TEST_MODE: "true" },
+      },
+
   globalSetup: "./tests/e2e/global.setup.ts",
 
-  /* Configure projects for staged CI Matrix */
   projects: [
     {
       name: "wizard",
-      // Use glob (not RegExp) for reliable matching across platforms/CI/local.
-      // Matches the reorganized location under routes/.
+      use: { baseURL: process.env.PLAYWRIGHT_TEST_BASE_URL || "http://127.0.0.1:5173" },
       testMatch: "routes/setup/setup-wizard.spec.ts",
-      // Force sequential to avoid race conditions during database provisioning
       workers: 1,
+    },
+    {
+      name: "firstuser",
+      testMatch: ["**/login/signup.spec.ts"],
+      workers: 1,
+    },
+    // OAuth tests require a real IdP — run manually when configured
+    // bun x playwright test tests/e2e/routes/login/oauth.spec.ts --project=firstuser
+    {
+      name: "oauth",
+      testMatch: ["**/login/oauth.spec.ts"],
+      workers: 1,
+      // Only included in CI when OAUTH_ENABLED=true
+      ...(process.env.CI === "true" && process.env.OAUTH_ENABLED !== "true"
+        ? { testIgnore: ["**/*.spec.ts"] }
+        : {}),
     },
     {
       name: "auth-setup",
       testMatch: [/auth\.setup\.ts/, /routes\/login\/login\.spec\.ts/],
-      // No dependency on "wizard": in CI the wizard runs once in its own job.
-      // In local dev, run `playwright test --project=wizard` first manually if needed.
-      // Force sequential to avoid race conditions during auth bootstrapping
+      dependencies: ["firstuser"],
       workers: 1,
     },
     {
-      name: "signup",
-      testMatch: [/routes\/user\/account-smoke\.spec\.ts/],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "content",
-      testMatch: [/routes\/collection-builder\/content-smoke\.spec\.ts/],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "system",
-      testMatch: [
-        /routes\/system\/settings\.spec\.ts/,
-        /routes\/config\/access-management\.spec\.ts/,
-        /routes\/config\/webhooks\.spec\.ts/,
-        /routes\/config\/automations\.spec\.ts/,
-        /routes\/config\/data-management\.spec\.ts/,
-        /routes\/config\/operations\.spec\.ts/,
-        /routes\/admin\/tenants\.spec\.ts/,
+      name: "chromium",
+      testIgnore: [
+        "**/setup/setup-wizard.spec.ts",
+        "**/auth.setup.ts",
+        "**/routes/login/login.spec.ts",
+        "**/routes/login/signup.spec.ts",
+        "**/routes/login/oauth.spec.ts",
       ],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "a11y",
-      testMatch: /routes\/login\/accessibility\.spec\.ts/,
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "branding",
-      testMatch: /routes\/login\/branding\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
-        headless: true,
-        viewport: { width: 1280, height: 720 },
+        headless: !!process.env.CI,
+        ...(existsSync(join(authDir, "admin.json"))
+          ? { storageState: join(authDir, "admin.json") }
+          : {}),
       },
-      dependencies: ["auth-setup"],
-      workers: 1,
-    },
-    {
-      name: "visual-regression",
-      testMatch: /routes\/admin-theme\/visual-regression\.spec\.ts/,
-      use: {
-        ...devices["Desktop Chrome"],
-        headless: true,
-        viewport: { width: 1280, height: 720 },
-      },
-      dependencies: ["auth-setup"],
-      workers: 1,
-    },
-    {
-      name: "rbac",
-      testMatch: /routes\/system\/rbac\.spec\.ts/,
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "language",
-      testMatch: /routes\/system\/language\.spec\.ts/,
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "users",
-      // Globs instead of RegExp to avoid "arguments are regular expressions" collection errors.
-      testMatch: ["**/user/profile.spec.ts", "**/user/management.spec.ts"],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "builder",
-      // Globs for reliability.
-      testMatch: [
-        "**/collection-builder/builder.spec.ts",
-        "**/collection-builder/collection.spec.ts",
-        "**/collection-builder/journey.spec.ts",
-      ],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "permissions",
-      testMatch: /routes\/system\/permissions\.spec\.ts/,
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "firstuser",
-      // Globs (safer than RegExp for CLI collection; avoids $/* escaping warnings in errors).
-      testMatch: ["**/login/signup.spec.ts", "**/login/oauth.spec.ts"],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      // No dependency on auth-setup — these hit login/signup pages directly
-      workers: 1,
-    },
-    {
-      name: "config-routes",
-      testMatch: [
-        "**/routes/config/access-management.spec.ts",
-        "**/routes/config/webhooks.spec.ts",
-        "**/routes/config/automations.spec.ts",
-        "**/routes/config/data-management.spec.ts",
-        "**/routes/config/operations.spec.ts",
-      ],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "admin",
-      testMatch: "**/routes/admin/tenants.spec.ts",
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "dashboard",
-      testMatch: "**/routes/dashboard/dashboard.spec.ts",
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "appearance",
-      testMatch: ["**/routes/config/appearance.spec.ts", "**/routes/config/design-system.spec.ts"],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
-    },
-    {
-      name: "media",
-      testMatch: [
-        "**/routes/mediagallery/mediagallery.spec.ts",
-        "**/routes/mediagallery/image-editor.spec.ts",
-      ],
-      use: { ...devices["Desktop Chrome"], headless: !!process.env.CI },
-      dependencies: ["auth-setup"],
+      dependencies: process.env.SKIP_E2E_DEPS === "true" ? [] : ["auth-setup"],
     },
   ],
-
-  /* Run preview server before starting the tests (local dev only; CI starts the server manually) */
-  ...(process.env.CI
-    ? {}
-    : {
-        webServer: {
-          command: `cross-env TEST_MODE=true STRICT_SETUP_CHECK=true TEST_API_SECRET=${TEST_API_SECRET} node build/index.js`,
-          port: 4173,
-          timeout: 300_000,
-          reuseExistingServer: true,
-          env: {
-            HOST: "127.0.0.1",
-            PORT: "4173",
-          },
-        },
-      }),
 });

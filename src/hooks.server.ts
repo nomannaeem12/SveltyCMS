@@ -15,6 +15,8 @@ import { metricsService } from "@src/services/observability/metrics-service";
 import type { Handle } from "@sveltejs/kit";
 import { sequence } from "@sveltejs/kit/hooks";
 import { logger } from "@utils/logger";
+// 🔐 ENTERPRISE: chained audit file sink (logs/app.log) — activates once per boot.
+import "@utils/logger.server";
 import { building } from "$app/environment";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -32,7 +34,7 @@ if (typeof (globalThis as any).__dirname === "undefined") {
   (globalThis as any).__dirname = dirname((globalThis as any).__filename);
 }
 
-import { isSetupComplete } from "@utils/setup-check-fast";
+import { isSetupComplete } from "./utils/setup-check-fast";
 import { resetIdCounters } from "@utils/id-generator";
 
 // 🚀 ZERO-RESTART ARCHITECTURE:
@@ -49,11 +51,11 @@ if (typeof (globalThis as any).__SVELTY_NODE_ID__ === "undefined") {
 }
 
 import { handleTurboPipeline } from "./hooks/handle-turbo-pipeline.server";
-import { handleTurboGet } from "./hooks/handle-turbo-get";
+import { handleTurboGet, turboAuthCache } from "./hooks/handle-turbo-get";
 import { handleCompression } from "./hooks/handle-compression";
 import { applyAllSecurityHeaders } from "./hooks/handle-security-headers";
 
-import { getTestSecret } from "@src/utils/setup-check";
+import { getTestSecret } from "@utils/server/setup-check";
 
 // 🚀 HYPER-TURBO BYPASS (Enterprise)
 // In benchmark mode, injects a system admin user for non-auth requests
@@ -104,6 +106,7 @@ const handleHyperTurbo: Handle = async ({ event, resolve }) => {
 const passThrough: Handle = ({ event, resolve }) => resolve(event);
 
 let handleSecurity: Handle = passThrough,
+  handleRateLimit: Handle = passThrough,
   handleUserPreferences: Handle = passThrough,
   handleAuthentication: Handle = passThrough,
   handleAuthorization: Handle = passThrough,
@@ -114,7 +117,9 @@ let handleSecurity: Handle = passThrough,
   handleTokenResolution: Handle = passThrough,
   handleRedirects: Handle = passThrough,
   handleSystemState: Handle = passThrough,
-  handleTestIsolation: Handle = passThrough;
+  handleTestIsolation: Handle = passThrough,
+  handleContentNegotiation: Handle = passThrough,
+  handleAeoHeaders: Handle = passThrough;
 
 // ✨ ENTERPRISE: Lazy-loaded handle variables for dynamic mode switching
 let fullMiddlewareInitialized = false;
@@ -124,6 +129,8 @@ async function ensureFullMiddleware() {
 
   const security = await import("./hooks/handle-security");
   handleSecurity = security.handleSecurity;
+  const rateLimit = await import("./hooks/handle-rate-limit");
+  handleRateLimit = rateLimit.handleRateLimit;
   const preferences = await import("./hooks/handle-user-preferences");
   handleUserPreferences = preferences.handleUserPreferences;
   const auth = await import("./hooks/handle-authentication");
@@ -146,6 +153,10 @@ async function ensureFullMiddleware() {
   handleSystemState = state.handleSystemState;
   const isolation = await import("./hooks/handle-test-isolation");
   handleTestIsolation = isolation.handleTestIsolation;
+  const contentNeg = await import("./hooks/handle-content-negotiation");
+  handleContentNegotiation = contentNeg.handleContentNegotiation;
+  const aeo = await import("./hooks/handle-aeo-headers");
+  handleAeoHeaders = aeo.handleAeoHeaders;
 
   fullMiddlewareInitialized = true;
 }
@@ -195,6 +206,7 @@ if (!building) {
             import("@src/services/observability/telemetry-service"),
             import("@src/services/scheduler"),
             import("@src/services/intelligence/behavioral-learner"),
+            import("@src/services/outbox"),
           ])
             .then(
               ([
@@ -204,12 +216,15 @@ if (!building) {
                 { telemetryService },
                 scheduler,
                 { startBehavioralEngine },
+                { outboxService },
               ]) => {
                 jobQueue.startPolling();
                 automationService.init();
                 watchdog.start();
                 scheduler.startScheduler();
                 startBehavioralEngine();
+                // Transactional outbox — deliver pending events (webhooks fan-out)
+                outboxService.startPolling(5_000);
 
                 // Telemetry check
                 const globalWithTelemetry = globalThis as typeof globalThis & {
@@ -238,6 +253,7 @@ if (!building) {
             )
             .catch((err) => logger.error("[System] Parallel initialization failed:", err));
         } else {
+          // Benchmark: isolate the request path from pollers/watchdog.
           logger.info("🛡️ Background Services DISABLED (Benchmark Mode)");
           // 🚀 COLD START OPTIMIZATION: Pre-warm the heaviest dispatchers
           Promise.all([
@@ -270,41 +286,109 @@ if (!building) {
 // ✨ ENTERPRISE: Graceful Shutdown Registry
 let inFlightRequests = 0;
 
+type ShutdownGlobal = typeof globalThis & {
+  __SVELTY_SHUTTING_DOWN__?: boolean;
+  __SVELTY_SIGNAL_HANDLERS_INSTALLED__?: boolean;
+};
+
+function isViteRunnerClosedError(reason: unknown): boolean {
+  const msg =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : reason && typeof reason === "object" && "message" in reason
+          ? String((reason as { message: unknown }).message)
+          : String(reason ?? "");
+  return /module runner has been closed|vite.*closed|server is closed/i.test(msg);
+}
+
 if (!building) {
-  const handleSignal = async (signal: string) => {
-    logger.info(`Received ${signal}. Starting graceful shutdown...`);
-    const shutdownTimeout = setTimeout(() => {
-      logger.error(`Graceful shutdown timed out after 10s. Force exiting.`);
-      process.exit(1);
-    }, 10000);
+  const g = globalThis as ShutdownGlobal;
 
-    // Drain period
-    while (inFlightRequests > 0) {
-      logger.info(`Waiting for ${inFlightRequests} in-flight requests to drain...`);
-      await new Promise((r) => setTimeout(r, 1000));
-    }
+  // HMR re-evaluates hooks.server.ts — only install process listeners once per process
+  if (!g.__SVELTY_SIGNAL_HANDLERS_INSTALLED__) {
+    g.__SVELTY_SIGNAL_HANDLERS_INSTALLED__ = true;
 
-    const { shutdownSystem } = await import("@src/databases/db");
-    await shutdownSystem();
-    clearTimeout(shutdownTimeout);
-    logger.info("✅ All systems finalized. Exit.");
-    process.exit(0);
-  };
+    const handleSignal = async (signal: string) => {
+      // Re-entrancy: double Ctrl+C / stacked HMR listeners must not re-enter
+      if (g.__SVELTY_SHUTTING_DOWN__) return;
+      g.__SVELTY_SHUTTING_DOWN__ = true;
 
-  process.on("SIGTERM", () => handleSignal("SIGTERM"));
-  process.on("SIGINT", () => handleSignal("SIGINT"));
+      logger.info(`Received ${signal}. Starting graceful shutdown...`);
+      const shutdownTimeout = setTimeout(() => {
+        logger.error(`Graceful shutdown timed out after 10s. Force exiting.`);
+        process.exit(1);
+      }, 10000);
 
-  // ✨ ENTERPRISE: Diagnostic Error Catching
-  process.on("uncaughtException", (err) => {
-    logger.error("FATAL: Uncaught Exception:", err);
-    process.stderr.write(`FATAL: Uncaught Exception: ${err}\n`);
-    process.exit(255);
-  });
+      try {
+        // Drain period (bounded — don't hang forever if counters desync)
+        const drainDeadline = Date.now() + 5_000;
+        while (inFlightRequests > 0 && Date.now() < drainDeadline) {
+          logger.info(`Waiting for ${inFlightRequests} in-flight requests to drain...`);
+          await new Promise((r) => setTimeout(r, 250));
+        }
 
-  process.on("unhandledRejection", (reason) => {
-    logger.error("FATAL: Unhandled Rejection:", reason);
-    process.stderr.write(`FATAL: Unhandled Rejection: ${reason}\n`);
-  });
+        // In Vite dev, process exit often closes the SSR module runner *before* this
+        // dynamic import runs → "Vite module runner has been closed". Swallow that;
+        // OS process exit still tears down sockets/DB handles.
+        try {
+          const { shutdownSystem } = await import("@src/databases/db");
+          await shutdownSystem();
+        } catch (err) {
+          if (isViteRunnerClosedError(err)) {
+            logger.debug(
+              "Graceful DB shutdown skipped — Vite SSR runner already closed (normal on Ctrl+C in dev).",
+            );
+          } else {
+            logger.error("Error during graceful DB shutdown:", err);
+          }
+        }
+
+        clearTimeout(shutdownTimeout);
+        logger.info("✅ All systems finalized. Exit.");
+      } catch (err) {
+        clearTimeout(shutdownTimeout);
+        if (!isViteRunnerClosedError(err)) {
+          logger.error("Graceful shutdown failed:", err);
+        }
+      } finally {
+        process.exit(0);
+      }
+    };
+
+    // Fire-and-forget with .catch so rejections never surface as unhandled
+    process.on("SIGTERM", () => {
+      void handleSignal("SIGTERM").catch(() => process.exit(0));
+    });
+    process.on("SIGINT", () => {
+      void handleSignal("SIGINT").catch(() => process.exit(0));
+    });
+
+    // ✨ ENTERPRISE: Diagnostic Error Catching
+    process.on("uncaughtException", (err) => {
+      // Expected race while Vite tears down on Ctrl+C — don't FATAL-spam
+      if (g.__SVELTY_SHUTTING_DOWN__ && isViteRunnerClosedError(err)) return;
+      if (isViteRunnerClosedError(err)) {
+        logger.debug("Ignored Vite module-runner exception during process teardown.");
+        return;
+      }
+      logger.error("FATAL: Uncaught Exception:", err);
+      process.stderr.write(`FATAL: Uncaught Exception: ${err}\n`);
+      process.exit(255);
+    });
+
+    process.on("unhandledRejection", (reason) => {
+      if (g.__SVELTY_SHUTTING_DOWN__ && isViteRunnerClosedError(reason)) return;
+      // Signal order can reject before our flag is set
+      if (isViteRunnerClosedError(reason)) {
+        logger.debug("Ignored Vite module-runner rejection during process teardown.");
+        return;
+      }
+      logger.error("FATAL: Unhandled Rejection:", reason);
+      process.stderr.write(`FATAL: Unhandled Rejection: ${reason}\n`);
+    });
+  }
 }
 
 // Helper to dynamically wrap SvelteKit middleware inside a high-resolution tracing span
@@ -376,13 +460,16 @@ const getPipeline = () => {
         wrapHandle("turbo-pipeline", () => handleTurboPipeline),
         wrapHandle("test-isolation", () => handleTestIsolation),
         wrapHandle("security", () => handleSecurity),
+        wrapHandle("rate-limit", () => handleRateLimit),
         wrapHandle("system-state", () => handleSystemState),
         // 🚀 Turbo GET: Right after security gates but BEFORE auth/authz.
         // Serves pre-encoded cached responses with pre-computed session auth,
         // bypassing handleAuthentication, handleAuthorization, and CSRF.
         wrapHandle("turbo-get", () => handleTurboGet),
         wrapHandle("redirects", () => handleRedirects),
+        wrapHandle("content-negotiation", () => handleContentNegotiation),
         wrapHandle("compression", () => handleCompression),
+        wrapHandle("aeo-headers", () => handleAeoHeaders),
         wrapHandle("user-preferences", () => handleUserPreferences),
         wrapHandle("authentication", () => handleAuthentication),
         wrapHandle("authorization", () => handleAuthorization),
@@ -506,6 +593,19 @@ export const handle: Handle = async ({ event, resolve }) => {
     try {
       const pipeline = getPipeline();
       return await pipeline({ event, resolve });
+    } catch (err: any) {
+      if (!isRedirect(err)) {
+        logger.error(`[Guard] Unhandled error in middleware chain:`, err);
+        const errorResponse = handleApiError(err, event);
+        applyAllSecurityHeaders(
+          errorResponse.headers,
+          event.url.protocol === "https:",
+          event.request.headers.get("Origin"),
+          event.url.pathname,
+        );
+        return errorResponse;
+      }
+      throw err;
     } finally {
       inFlightRequests--;
     }
@@ -596,6 +696,19 @@ export const handleError = async ({ error, event, status }: any) => {
 
 // --- Utility Functions for External Use ---
 export const getHealthMetrics = () => metricsService.getReport();
+
+/**
+ * Invalidate all turbo-auth cache entries for a specific user.
+ * Called when roles change or the user is blocked/deleted/unblocked
+ * so privilege changes take effect immediately without waiting for TTL expiry.
+ */
+export function invalidateTurboAuthForUser(userId: string) {
+  for (const [key, ctx] of turboAuthCache.entries()) {
+    if (ctx.user?._id === userId || ctx.user?.id === userId) {
+      turboAuthCache.delete(key);
+    }
+  }
+}
 
 import { TokenRegistry } from "@src/services/token/engine";
 

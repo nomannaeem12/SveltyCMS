@@ -1,269 +1,105 @@
 /**
- * @file tests/benchmark./modules/benchmark-reporting.ts
- * @description Public facade for the benchmark intelligence pipeline.
+ * @file tests/benchmarks/modules/benchmark-reporting.ts
+ * @description Benchmark reporting facade — gates MDX writes on BENCHMARK_RECORD=1.
  *
- * ### Contract
+ * ### Surgical run contract (`BENCHMARK_RECORD=1 bun test …`)
+ * 1. `exportResult()` → `history.jsonl` (debug) + `finalizeReport()` → `history.sqlite`
+ * 2. `pushTableToMdx()` → **one** LEDGER tag via `writeTruthTable()`
+ * 3. `appendSummaryToMdx()` → **one** summary inside the same LEDGER tag
+ * 4. `finalizeReport()` → per-test ledger + **Current Run Summary** + **Historical Trends** (separate SUMMARY slots)
+ * 5. **Never** touch `EXECUTIVE` or call `updateDatabaseSpecificReports()` — matrix owns those
  *
- * ```typescript
- * await reportBenchmark(result, {
- *   source: "single-test",
- *   mode: "partial",
- *   testFile: "tests/benchmarks/auth-performance.test.ts",
- *   phase: "warm",
- * });
- * ```
- *
- * ### Record Modes
- *
- * | Mode      | Console | SQLite | MDX Write |
- * |-----------|:-------:|:------:|:---------:|
- * | `none`    | ✅      | ❌     | ❌        |
- * | `history` | ✅      | ✅     | ❌        |
- * | `partial` | ✅      | ✅     | ✅ (one section + watermark) |
- * | `full`    | ✅      | ✅     | ✅ (all sections) |
- *
- * ### Internals
- * - normalize → persist (SQLite, WAL, transactions)
- * - analyze → trend + root cause + budgets
- * - update → MDX section + executive summary (with file lock)
+ * ### Rule C — Current Run vs Historical Trends
+ * - `SUMMARY_RUN_OVERLAY_*` — this invocation only (`buildRunSummaryTable`)
+ * - `SUMMARY_HISTORY_*` — sparkline trends from `history.sqlite` (`buildHistoryArchiveTable`)
  */
-import {
-  persistRun,
-  detectCommitSha,
-  detectBranch,
-  detectOS,
-  detectRuntime,
-  type HistoryEntry,
-} from "./benchmark-history";
-import { runAnalysis } from "./benchmark-analysis";
-import {
-  writeTruthTable,
-  writeSummary,
-  writeTrendAndInsight,
-  writeExecutiveSummary,
-  getDocPath,
-} from "./benchmark-mdx";
-import { buildExecutiveSummary, formatSummaryAsMdx } from "./benchmark-summary";
-import { crossCorrelate } from "./benchmark-cross-correlate";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  persistRun,
+  loadHistory,
+  loadDistinctTestIds,
+  type HistoryEntry,
+} from "./benchmark-history";
+import { analyzeTrend, classifyRootCause, checkBudgets } from "./benchmark-analysis";
+import {
+  buildCollapsedLedgerTagInner,
+  buildExecutiveReport,
+  buildTestRollupEntriesFromRun,
+  formatTestInsightNote,
+  isSpecificInsight,
+} from "./benchmark-executive";
+import {
+  discoverTagInLedger,
+  extractTagInner,
+  findLedgerTagBounds,
+  getDocPath,
+  getDocPathForDb,
+  getSectionForTag,
+  patchBenchmarkZones,
+  shortLabelToTag,
+  upsertLedgerSection,
+  writeMdxDocument,
+  writeTruthTable,
+  writeSummaryHistoryArchive,
+  writeSummaryRunOverlay,
+} from "./benchmark-mdx";
 
-// ─────────────────────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────────────────────
+/** Canonical history store — full tables live here, not in MDX. */
+export const HISTORY_SQLITE_PATH = "tests/benchmarks/results/history.sqlite";
+
+const SPARKLINE_CHARS = [
+  "\u2581",
+  "\u2582",
+  "\u2583",
+  "\u2584",
+  "\u2585",
+  "\u2586",
+  "\u2587",
+  "\u2588",
+] as const;
+const SPARKLINE_WIDTH = 7;
+
+/** Unicode block sparkline from a numeric series (last `width` samples). */
+export function renderSparkline(values: number[], width = SPARKLINE_WIDTH): string {
+  if (values.length === 0) return "\u2014";
+  const slice = values.slice(-width);
+  const min = Math.min(...slice);
+  const max = Math.max(...slice);
+  const range = max - min || 1;
+  return slice
+    .map((v) => {
+      const idx = Math.round(((v - min) / range) * (SPARKLINE_CHARS.length - 1));
+      return SPARKLINE_CHARS[Math.max(0, Math.min(SPARKLINE_CHARS.length - 1, idx))];
+    })
+    .join("");
+}
 
 export type BenchmarkRecordMode = "none" | "history" | "partial" | "full";
 
 export interface BenchmarkReportOptions {
-  /** Which runner produced this result */
-  source: "single-test" | "matrix";
-  /** Recording mode — controls persistence + MDX mutation */
-  mode: BenchmarkRecordMode;
-  /** Path to the test file (e.g. "tests/benchmarks/auth-performance.test.ts") */
+  source?: "single-test" | "matrix";
   testFile: string;
-  /** Stable test identifier (e.g. "auth-performance") */
-  testId?: string;
-  /** Short label for MDX tag matching (e.g. "Auth Trace") */
-  shortLabel?: string;
-  /** Execution phase: cold start, warm request, or mixed workload */
-  phase?: "cold" | "warm" | "mixed";
-  /** Scenario name for multi-scenario benchmarks */
-  scenario?: string;
-  /** Unique run ID to prevent duplicate history rows on retry */
-  runId?: string;
-  /** Git commit SHA (auto-detected if omitted) */
-  commitSha?: string;
-  /** Git branch (auto-detected if omitted) */
-  branch?: string;
+  testId: string;
+  phase: "cold" | "warm" | "mixed";
+  runId: string;
+  mode: BenchmarkRecordMode;
+  dbType?: string;
+  redisEnabled?: boolean;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Config
-// ─────────────────────────────────────────────────────────────
+// State tracked across pushTableToMdx calls for deduplication
+let _lastTag: string | null = null;
+let _lastTestFile = "unknown";
+void _lastTag;
+void _lastTestFile; // read by future multi-file dedup logic
 
 function getDbType(): string {
-  return typeof process !== "undefined" ? process.env.DB_TYPE || "sqlite" : "sqlite";
+  return process.env.DB_TYPE || "sqlite";
 }
 
-function isRedisEnabled(): boolean {
-  return process.env.REDIS_ENABLED === "1" || process.env.REDIS_ENABLED === "true";
-}
-
-function slugify(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/(^_|_$)/g, "");
-}
-
-// ─────────────────────────────────────────────────────────────
-// Test Metadata Registry (educational context)
-// ─────────────────────────────────────────────────────────────
-
-interface TestMeta {
-  proves: string;
-  codePaths: string[];
-  impact: string;
-}
-
-const META_REGISTRY: Record<string, TestMeta> = {};
-
-export function registerTestMeta(
-  testFile: string,
-  proves: string,
-  codePaths: string[],
-  impact: string,
-) {
-  META_REGISTRY[slugify(testFile)] = { proves, codePaths, impact };
-}
-
-export function getTestMeta(testFile: string): TestMeta {
-  const key = slugify(testFile);
-  const registered = META_REGISTRY[key];
-  if (registered) return registered;
-
-  // Fallback: try to read @description from the test file
-  let proves = "";
-  try {
-    const c = fs.readFileSync(path.resolve(process.cwd(), testFile), "utf-8");
-    const dm = c.match(/@description\s+(.+)/i);
-    if (dm) proves = dm[1].trim();
-  } catch {
-    /* best-effort */
-  }
-
-  return { proves, codePaths: [], impact: "" };
-}
-
-// ─────────────────────────────────────────────────────────────
-// Main API
-// ─────────────────────────────────────────────────────────────
-
-let _trendEmitted = false;
-
-export function resetTrendGuard(): void {
-  _trendEmitted = false;
-}
-
-/**
- * Report a benchmark result through the full intelligence pipeline.
- *
- * Called by both single-test runner (`bun test`) and the full matrix runner.
- * The `mode` parameter controls what gets persisted and mutated.
- */
-export async function reportBenchmark(
-  result: {
-    name: string;
-    avgMs: number;
-    p50Ms?: number;
-    p95Ms?: number;
-    p99Ms?: number;
-    minMs?: number;
-    maxMs?: number;
-    rps: number;
-    cv?: number;
-    ci95MarginMs?: number;
-    memoryHeapMb?: number;
-    memoryRssMb?: number;
-    errorCount?: number;
-    status?: string;
-  },
-  options: BenchmarkReportOptions,
-): Promise<void> {
-  // ── Guard: prevent duplicate trend emission per test run ──
-  if (_trendEmitted && options.mode !== "none") return;
-  if (options.mode !== "none") _trendEmitted = true;
-
-  const dbType = getDbType();
-  const redisEnabled = isRedisEnabled();
-  const phase = options.phase || "warm";
-  const testId = options.testId || path.basename(options.testFile, path.extname(options.testFile));
-  const meta = getTestMeta(options.testFile);
-
-  // ── Step 1: Persist to SQLite (if recording) ──
-  if (options.mode !== "none") {
-    const entry: HistoryEntry = {
-      testId,
-      testFile: options.testFile,
-      dbType,
-      redisEnabled,
-      phase,
-      scenario: options.scenario || "",
-      commitSha: options.commitSha || detectCommitSha(),
-      branch: options.branch || detectBranch(),
-      os: detectOS(),
-      runtime: detectRuntime(),
-      avgMs: result.avgMs,
-      p50Ms: result.p50Ms || 0,
-      p95Ms: result.p95Ms || 0,
-      p99Ms: result.p99Ms || 0,
-      p99_9Ms: 0,
-      minMs: result.minMs || 0,
-      maxMs: result.maxMs || 0,
-      rps: result.rps,
-      cv: result.cv || 0,
-      ci95MarginMs: result.ci95MarginMs || 0,
-      memoryHeapMb: result.memoryHeapMb,
-      memoryRssMb: result.memoryRssMb,
-      errorCount: result.errorCount || 0,
-      status: result.status || "SUCCESS",
-      runId: options.runId,
-      extra: { runId: options.runId },
-    };
-    persistRun(entry);
-  }
-
-  // ── Step 2: Analyze trends ──
-  const isSingleTest = options.source === "single-test";
-  const analysis = runAnalysis(
-    {
-      name: result.name,
-      avgMs: result.avgMs,
-      p95Ms: result.p95Ms || 0,
-      rps: result.rps,
-    },
-    testId,
-    options.testFile,
-    dbType,
-    redisEnabled,
-    phase,
-    isSingleTest,
-    meta.codePaths,
-  );
-
-  // ── Cross-test correlation for single-test runs ──
-  if (isSingleTest && Math.abs(analysis.trend.deltaPct) > 5) {
-    const correlation = crossCorrelate(testId, dbType, analysis.trend.deltaPct);
-    if (correlation.isConfirmed) {
-      // Upgrade insight with correlation evidence
-      analysis.rootCause.insight += "  \n**Cross-correlation**: " + correlation.explanation;
-      analysis.rootCause.confidence = "confirmed";
-      analysis.rootCause.isSuspected = false;
-    }
-  }
-
-  // ── Step 3: Update MDX (if recording mode allows) ──
-  if (options.mode === "partial" || options.mode === "full") {
-    // Write trend label + insight to MDX section
-    writeTrendAndInsight(
-      analysis.trend.label,
-      analysis.rootCause.insight,
-      options.testFile,
-      null,
-      options.shortLabel,
-    );
-
-    // Write executive summary
-    const isPartial = options.mode === "partial";
-    writeExecutiveSummary(result.name, analysis.trend.label, isPartial);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Gate
-// ─────────────────────────────────────────────────────────────
-
-function shouldRecord(): boolean {
+/** Gates all MDX mutations — console-only unless recording. */
+export function shouldRecord(): boolean {
   return (
     process.env.BENCHMARK_RECORD === "1" ||
     process.env.BENCHMARK_MATRIX === "1" ||
@@ -271,13 +107,9 @@ function shouldRecord(): boolean {
   );
 }
 
-// ─────────────────────────────────────────────────────────────
-// Compatibility bridges for benchmark-utils.ts
-// These adapt the old API (title + shortLabel) to the new modules (testFile)
-// ─────────────────────────────────────────────────────────────
-
-let _lastTag: string | null = null;
-let _lastTestFile = "unknown";
+function isMatrixRun(): boolean {
+  return process.env.BENCHMARK_MATRIX === "1";
+}
 
 function discoverTestFile(): string {
   try {
@@ -285,20 +117,7 @@ function discoverTestFile(): string {
     const stack = err.stack || "";
     for (const line of stack.split("\n")) {
       const n = line.replace(/\\/g, "/");
-      // Must be a test file, not an infrastructure module
-      if (
-        n.includes("tests/benchmarks/") &&
-        !n.includes("tests/benchmarks/modules/") &&
-        !n.includes("benchmark-utils") &&
-        !n.includes("benchmark-reporting") &&
-        !n.includes("benchmark-mdx") &&
-        !n.includes("benchmark-analysis") &&
-        !n.includes("benchmark-history") &&
-        !n.includes("benchmark-summary") &&
-        !n.includes("benchmark-cross-correlate") &&
-        !n.includes("benchmark-meta") &&
-        !n.includes("benchmark-intelligence")
-      ) {
+      if (n.includes("tests/benchmarks/") && !n.includes("modules/")) {
         const m = n.match(/tests\/benchmarks\/([\w.-]+)/i);
         if (m) {
           return `tests/benchmarks/${m[1].split(":")[0].split("?")[0]}`;
@@ -311,10 +130,61 @@ function discoverTestFile(): string {
   return "unknown";
 }
 
-/**
- * Bridge: called by benchmark-utils.ts printTruthTable()
- * Gated — only writes MDX when BENCHMARK_RECORD=1 or BENCHMARK_MATRIX=1.
- */
+function normalizeTestFile(testFile: string): string {
+  if (!testFile || testFile === "unknown") return testFile;
+  if (testFile.includes("/") || testFile.includes("\\")) return testFile.replace(/\\/g, "/");
+  const base = testFile.replace(/\.test\.(ts|js)$/i, "");
+  return `tests/benchmarks/${base}.test.ts`;
+}
+
+function inferPhase(testFile: string, explicit?: string): "cold" | "warm" | "mixed" {
+  if (explicit) return explicit as "cold" | "warm" | "mixed";
+  const lower = testFile.toLowerCase();
+  if (lower.includes("cold-start") || lower.includes("setup-proxy")) return "cold";
+  return "warm";
+}
+
+/** Persist a passing run to history.sqlite (canonical trend store). */
+export async function reportBenchmark(
+  result: {
+    name: string;
+    avgMs: number;
+    p95Ms?: number;
+    rps?: number;
+    errorCount?: number;
+    status?: string;
+  },
+  options: BenchmarkReportOptions,
+): Promise<void> {
+  const dbType = options.dbType || getDbType();
+  const redisEnabled = options.redisEnabled ?? process.env.USE_REDIS === "true";
+  const phase = inferPhase(options.testFile, options.phase);
+  const testId =
+    options.testId || path.basename(options.testFile, ".test.ts").replace(/\.test$/, "");
+
+  const isPassing =
+    (result.status === "SUCCESS" || result.status === undefined) && (result.errorCount || 0) === 0;
+
+  if (isPassing && options.mode !== "none") {
+    const entry: HistoryEntry = {
+      runId: options.runId,
+      runMode: isMatrixRun() ? "matrix" : "standalone",
+      testId,
+      dbType,
+      redisEnabled,
+      phase,
+      metric: result.name,
+      avgMs: result.avgMs,
+      p95Ms: result.p95Ms || 0,
+      rps: result.rps || 0,
+      errorCount: result.errorCount || 0,
+      status: "SUCCESS",
+    };
+    persistRun(entry);
+  }
+}
+
+/** Bridge: `printTruthTable()` → LEDGER tag only. */
 export function pushTableToMdx(_title: string, table: string, shortLabel?: string): void {
   if (!shouldRecord()) return;
   const testFile = discoverTestFile();
@@ -322,132 +192,627 @@ export function pushTableToMdx(_title: string, table: string, shortLabel?: strin
   _lastTag = writeTruthTable(table, testFile, shortLabel);
 }
 
-/**
- * Bridge: called by benchmark-utils.ts printSummaryTable()
- * Gated — only writes MDX when BENCHMARK_RECORD=1 or BENCHMARK_MATRIX=1.
- */
-export function appendSummaryToMdx(summaryTable: string, shortLabel?: string): void {
-  if (!shouldRecord()) return;
-  writeSummary(summaryTable, _lastTestFile, _lastTag, shortLabel);
+/** @deprecated Run summary lives in collapsed truth table — no duplicate ASCII box. */
+export function appendSummaryToMdx(_summaryTable: string, _shortLabel?: string): void {
+  /* no-op */
 }
 
-/**
- * Compatibility wrapper — called by benchmark-utils.ts exportResult().
- * Uses the old history.jsonl + new SQLite pipeline.
- */
-export async function computeAndApplyTrend(
-  result: any,
-  shortLabel?: string,
-  mode: "cold" | "warm" | "mixed" = "warm",
-): Promise<void> {
-  // Discover test file from env or call stack (legacy behavior)
-  let testFile = process.env.BENCH_FILE || "unknown";
-
-  if (testFile === "unknown") {
-    try {
-      const err = new Error();
-      const stack = err.stack || "";
-      for (const line of stack.split("\n")) {
-        const n = line.replace(/\\/g, "/");
-        // Must be a test file, not an infrastructure module
-        if (
-          n.includes("tests/benchmarks/") &&
-          !n.includes("tests/benchmarks/modules/") &&
-          !n.includes("benchmark-utils") &&
-          !n.includes("benchmark-reporting") &&
-          !n.includes("benchmark-mdx") &&
-          !n.includes("benchmark-analysis") &&
-          !n.includes("benchmark-history") &&
-          !n.includes("benchmark-summary") &&
-          !n.includes("benchmark-cross-correlate") &&
-          !n.includes("benchmark-meta") &&
-          !n.includes("benchmark-intelligence")
-        ) {
-          const m = n.match(/tests\/benchmarks\/([\w.-]+)/i);
-          if (m) {
-            testFile = `tests/benchmarks/${m[1].split(":")[0].split("?")[0]}`;
-            break;
-          }
-        }
-      }
-    } catch {
-      /* best-effort */
-    }
-  }
-
-  // Determine mode from environment
-  const recordMode: BenchmarkRecordMode =
-    process.env.BENCHMARK_MATRIX === "1"
-      ? "full"
-      : process.env.BENCHMARK_RECORD === "1"
-        ? "partial"
-        : process.env.BENCHMARK_HISTORY_ONLY === "1"
-          ? "history"
-          : "none";
-
-  return reportBenchmark(result, {
-    source: process.env.BENCHMARK_MATRIX === "1" ? "matrix" : "single-test",
-    mode: recordMode,
-    testFile,
-    shortLabel,
-    phase: mode,
-  });
+/** @deprecated Trends are batched in finalizeReport(). */
+export async function computeAndApplyTrend(_result: unknown, _shortLabel?: string): Promise<void> {
+  /* no-op */
 }
 
-// ─────────────────────────────────────────────────────────────
-// 6. Ranked Executive Summary (called by matrix runner)
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Build and write a ranked executive summary to the MDX report.
- * Called by the matrix runner after all benchmarks complete.
- *
- * Reads all tracked tests from history.sqlite across all databases,
- * computes cross-test correlation, and writes ranked results.
- */
-export function buildAndWriteExecutiveSummary(
-  trackedTests: Array<{
-    testId: string;
-    dbType: string;
-    phase: string;
-    redisEnabled: boolean;
-  }>,
-  isPartial: boolean,
+function buildSpecificInsight(
+  rootCause: ReturnType<typeof classifyRootCause>,
+  codePaths: string[],
 ): string {
-  if (!shouldRecord()) return "";
+  const raw = rootCause.insight.trim();
+  if (!raw || !isSpecificInsight(raw)) return "";
+  return formatTestInsightNote(raw, codePaths);
+}
 
-  const summary = buildExecutiveSummary(trackedTests, isPartial);
-  const mdx = formatSummaryAsMdx(summary);
+const SEVERITY_ICON: Record<string, string> = {
+  critical: "\u{1F534}",
+  regression: "\u{1F534}",
+  warning: "\u{1F7E1}",
+  watch: "\u{1F7E1}",
+  stable: "\u{1F7E2}",
+};
 
-  // Write to the MDX report
-  try {
-    const docPath = getDocPath();
-    if (!fs.existsSync(docPath)) return mdx;
+const SEVERITY_RANK: Record<string, number> = {
+  "\u{1F534}": 3,
+  "\u{1F7E1}": 2,
+  "\u{1F7E2}": 1,
+  "\u{26AA}": 0,
+};
 
-    let doc = fs.readFileSync(docPath, "utf8");
-    const marker = "## \u{1F4CA} Executive Summary";
-    if (!doc.includes(marker)) return mdx;
+export interface JsonlRunEntry {
+  runId?: string;
+  runMode?: string;
+  testFile: string;
+  metric: string;
+  layer?: string;
+  avgMs: number;
+  p95Ms?: number;
+  rps?: number;
+  cv?: number;
+  timestamp?: string;
+  phase?: string;
+  db?: string;
+  redis?: boolean;
+  status?: string;
+  wallClockMs?: number;
+}
 
-    // Replace everything between Executive Summary and the next ## heading
-    const nextHeading = doc.indexOf("## ", doc.indexOf(marker) + marker.length);
-    if (nextHeading > 0) {
-      doc =
-        doc.slice(0, doc.indexOf("\n", doc.indexOf(marker)) + 1) +
-        "\n" +
-        mdx +
-        "\n\n" +
-        doc.slice(nextHeading);
-    } else {
-      doc = doc.slice(0, doc.indexOf("\n", doc.indexOf(marker)) + 1) + "\n" + mdx + "\n";
-    }
+function formatTestLabel(testFile: string): string {
+  const base = normalizeTestFile(testFile)
+    .replace(/^tests\/benchmarks\//, "")
+    .replace(/\.test\.ts$/i, "");
+  return base.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
-    // Atomic write
-    const tmpPath = docPath + ".tmp." + Date.now();
-    fs.writeFileSync(tmpPath, doc, "utf8");
-    fs.renameSync(tmpPath, docPath);
-  } catch {
-    /* best-effort */
+function trendIcon(trend: ReturnType<typeof analyzeTrend>): string {
+  if (trend.severity === "critical" || trend.severity === "regression") return "\u{1F534}";
+  return SEVERITY_ICON[trend.severity] || "\u{26AA}";
+}
+
+function testFileToId(testFile: string): string {
+  return normalizeTestFile(testFile)
+    .replace(/^tests\/benchmarks\//, "")
+    .replace(/\.test\.ts$/i, "");
+}
+
+/** Normalize invoked test identifiers from `exportResult()` / `_reportedFiles`. */
+export function normalizeInvokedTestIds(invokedTestFiles: Iterable<string>): Set<string> {
+  const invoked = new Set<string>();
+  for (const file of invokedTestFiles) {
+    invoked.add(testFileToId(file));
+    invoked.add(file.replace(/\.test\.ts$/i, "").replace(/^tests\/benchmarks\//, ""));
+  }
+  return invoked;
+}
+
+/**
+ * C: Current Run includes only tests that executed in THIS invocation.
+ * Stale `history.jsonl` lines for the same `runId` are excluded when `invoked` is set.
+ */
+export function filterInvocationRunEntries(
+  runEntries: JsonlRunEntry[],
+  invokedTestFiles?: Iterable<string>,
+): JsonlRunEntry[] {
+  if (!invokedTestFiles) return runEntries;
+  const invoked = normalizeInvokedTestIds(invokedTestFiles);
+  return runEntries.filter((e) => invoked.has(testFileToId(e.testFile)));
+}
+
+function groupRunEntries(entries: JsonlRunEntry[]): JsonlRunEntry[] {
+  const byKey = new Map<string, JsonlRunEntry>();
+  for (const entry of entries) {
+    byKey.set(`${entry.testFile}:${entry.metric}`, entry);
+  }
+  return [...byKey.values()];
+}
+
+interface RunSummaryRow {
+  test: string;
+  metric: string;
+  avgMs: number;
+  p95Ms: number;
+  rps: number;
+  icon: string;
+  detail: string;
+  sortRank: number;
+}
+
+function buildRunSummaryRows(
+  runEntries: JsonlRunEntry[],
+  db: string,
+  redis: boolean,
+): RunSummaryRow[] {
+  const rows: RunSummaryRow[] = [];
+
+  for (const entry of groupRunEntries(runEntries)) {
+    const testFile = normalizeTestFile(entry.testFile);
+    const testId = testFile.replace(/^tests\/benchmarks\//, "").replace(/\.test\.ts$/i, "");
+    const phase = inferPhase(testFile, entry.phase);
+    // Metric-keyed history — never trend BULK INSERT against INSERT
+    const history = loadHistory(testId, db, redis, phase, entry.metric);
+    const prior = history.slice(0, -1);
+    const trend = analyzeTrend(
+      {
+        name: entry.metric,
+        avgMs: entry.avgMs,
+        p95Ms: entry.p95Ms || 0,
+        rps: entry.rps || 0,
+      },
+      prior.length > 0 ? prior : history,
+      testId,
+      db,
+      redis,
+      phase,
+    );
+    const icon = trendIcon(trend);
+    rows.push({
+      test: formatTestLabel(entry.testFile),
+      metric: entry.metric,
+      avgMs: entry.avgMs,
+      p95Ms: entry.p95Ms || 0,
+      rps: entry.rps || 0,
+      icon,
+      detail: trend.label,
+      sortRank: SEVERITY_RANK[icon] ?? 0,
+    });
   }
 
-  return mdx;
+  return rows.sort((a, b) => b.sortRank - a.sortRank || a.test.localeCompare(b.test));
+}
+
+/**
+ * Generate ONE summary table aggregating ALL tests from the current run.
+ * Scoped to `runEntries` only — not full history.sqlite.
+ */
+export function buildRunSummaryTable(
+  runEntries: JsonlRunEntry[],
+  ctx: {
+    runId: string;
+    runMode: string;
+    db: string;
+    redis: boolean;
+    invokedTestFiles?: Iterable<string>;
+  },
+): string {
+  const scoped = filterInvocationRunEntries(runEntries, ctx.invokedTestFiles);
+
+  if (scoped.length === 0) {
+    return "\n### Current Run Summary\n\n> \u23F3 No tests recorded in this invocation.\n";
+  }
+
+  const rows = buildRunSummaryRows(scoped, ctx.db, ctx.redis);
+  const displayTs =
+    scoped
+      .map((e) => (e.timestamp || "").replace("T", " ").slice(0, 19))
+      .filter(Boolean)
+      .sort()
+      .at(-1) || new Date().toISOString().replace("T", " ").slice(0, 19);
+  const dateLabel = displayTs.slice(0, 10);
+
+  const dbLabel = ctx.redis ? `${ctx.db}-redis` : ctx.db;
+  const uniqueTests = new Set(scoped.map((e) => testFileToId(e.testFile))).size;
+
+  let summary = `\n### Current Run Summary (${dateLabel})\n\n`;
+  summary += "> **Scope:** Only tests that ran in THIS invocation.\n\n";
+  if (ctx.runMode !== "matrix") {
+    summary += "> \u26A0\uFE0F Executive PASS/FAIL reflects the last full matrix run.\n\n";
+  }
+
+  summary += `**Run ID:** \`${ctx.runId}\` · **Tests invoked:** ${uniqueTests} · **Metrics:** ${rows.length} · **DB:** ${dbLabel}\n\n`;
+  summary += `| Test | Metric | Avg (ms) | p95 (ms) | RPS | Trend | Detail |\n`;
+  summary += `|------|--------|----------|----------|-----|-------|--------|\n`;
+
+  for (const row of rows) {
+    const detail = row.detail.replace(/\|/g, "\\|");
+    summary += `| ${row.test} | ${row.metric} | ${row.avgMs.toFixed(3)} | ${row.p95Ms.toFixed(3)} | ${Math.round(row.rps)} | ${row.icon} | ${detail} |\n`;
+  }
+  summary += "\n";
+
+  return summary;
+}
+
+/** Write the current-run aggregate into the Current Run SUMMARY slot only. */
+export function writeRunSummary(
+  runEntries: JsonlRunEntry[],
+  ctx: {
+    runId: string;
+    runMode: string;
+    db: string;
+    redis: boolean;
+    invokedTestFiles?: Iterable<string>;
+  },
+  docPath?: string,
+): void {
+  if (!shouldRecord()) return;
+  writeSummaryRunOverlay(buildRunSummaryTable(runEntries, ctx), docPath);
+}
+
+interface HistorySparklineRow {
+  name: string;
+  icon: string;
+  sparkline: string;
+  latestMs: number;
+  runs: number;
+  sortRank: number;
+}
+
+function historySqliteDetailLink(dbType: string, redis: boolean): string {
+  const redisFlag = redis ? 1 : 0;
+  return [
+    `**Detail:** [\`${HISTORY_SQLITE_PATH}\`](../../../${HISTORY_SQLITE_PATH})`,
+    `\`SELECT test_id, phase, avg_ms, p95_ms, rps, timestamp FROM runs WHERE db_type='${dbType}' AND redis=${redisFlag} ORDER BY timestamp DESC\``,
+  ].join(" · ");
+}
+
+/**
+ * Build Historical Trends sparklines from `history.sqlite` (compact — no full tables in MDX).
+ * Never mixed with Current Run Summary content.
+ */
+export function buildHistoryArchiveTable(dbLabel?: string): string {
+  const raw = dbLabel || getDbType();
+  const dbType = raw.replace("-redis", "").replace("_redis", "");
+  const redisEnabled = raw.includes("redis");
+  const testIds = loadDistinctTestIds(dbType);
+  const dateLabel = new Date().toISOString().slice(0, 10);
+  if (testIds.length === 0) {
+    return `\n### Historical Trends (${dateLabel})\n\n> \u23F3 No history recorded yet.\n`;
+  }
+
+  const rows: HistorySparklineRow[] = [];
+
+  for (const testId of testIds) {
+    for (const phase of ["warm", "cold", "mixed"] as const) {
+      const history = loadHistory(testId, dbType, redisEnabled, phase);
+      if (history.length === 0) continue;
+
+      const samples = history.map((h) => h.avgMs);
+      const current = history[history.length - 1]!;
+      const prior = history.slice(0, -1);
+      const trend = analyzeTrend(
+        { name: testId, avgMs: current.avgMs, p95Ms: current.p95Ms, rps: current.rps },
+        prior.length > 0 ? prior : history,
+        testId,
+        dbType,
+        redisEnabled,
+        phase,
+      );
+
+      const icon =
+        trend.severity === "critical" || trend.severity === "regression"
+          ? "\u{1F534}"
+          : SEVERITY_ICON[trend.severity] || "\u{26AA}";
+
+      rows.push({
+        name: `${testId.replace(/-/g, " ").toUpperCase()} (${phase})`,
+        icon,
+        sparkline: renderSparkline(samples),
+        latestMs: current.avgMs,
+        runs: history.length,
+        sortRank: SEVERITY_RANK[icon] ?? 0,
+      });
+    }
+  }
+
+  const dbDisplay = redisEnabled ? `${dbType}-redis` : dbType;
+  const sorted = rows.sort((a, b) => b.sortRank - a.sortRank || a.name.localeCompare(b.name));
+
+  let summary = `\n### Historical Trends (${dateLabel})\n\n`;
+  summary +=
+    "> **Scope:** Sparklines only — full run tables live in `history.sqlite` (link below). Runs = sparkline bar count.\n\n";
+  summary += `${historySqliteDetailLink(dbType, redisEnabled)}\n\n`;
+  summary += `**Series:** ${sorted.length} · **DB:** ${dbDisplay}\n\n`;
+  const colW = SPARKLINE_WIDTH + 2;
+  summary += `| Metric | Trend | Sparkline (last ${SPARKLINE_WIDTH}) | Latest |\n`;
+  summary += `|--------|-------|${"-".repeat(colW)}|--------|\n`;
+
+  for (const row of sorted) {
+    const name = row.name.replace(/\|/g, "\\|");
+    summary += `| ${name} | ${row.icon} | \`${row.sparkline}\` | ${row.latestMs.toFixed(3)}ms |\n`;
+  }
+  summary += "\n";
+
+  return summary;
+}
+
+function countApplicableScripts(dbKey: string): number {
+  try {
+    const { BENCHMARK_SCRIPTS } =
+      require("../../../scripts/benchmark-matrix/benchmark-scripts") as {
+        BENCHMARK_SCRIPTS: Array<{ strategy: string; shortLabel: string }>;
+      };
+    const isSql =
+      dbKey.includes("sqlite") || dbKey.includes("postgres") || dbKey.includes("mariadb");
+    return BENCHMARK_SCRIPTS.filter(
+      (s) =>
+        s.strategy === "all" ||
+        (s.strategy === "sql" && isSql) ||
+        (s.strategy === "once" && dbKey.replace("-redis", "").replace("_redis", "") === "sqlite"),
+    ).length;
+  } catch {
+    return 58;
+  }
+}
+
+function writePartialExecutive(
+  runEntries: JsonlRunEntry[],
+  ctx: {
+    runId: string;
+    db: string;
+    redis: boolean;
+    invokedTestFiles?: Iterable<string>;
+  },
+  docPath: string,
+): void {
+  const scoped = filterInvocationRunEntries(runEntries, ctx.invokedTestFiles);
+  if (scoped.length === 0 || !fs.existsSync(docPath)) return;
+
+  const doc = fs.readFileSync(docPath, "utf8");
+  const tagResolver = (testFile: string, shortLabel?: string) =>
+    discoverTagInLedger(doc, testFile, shortLabel);
+
+  const rollupRows = groupRunEntries(scoped).map((entry) => {
+    const testFile = normalizeTestFile(entry.testFile);
+    const tag = tagResolver(testFile, entry.layer) ?? "";
+    return {
+      testFile,
+      metric: entry.metric,
+      avgMs: entry.avgMs,
+      p95Ms: entry.p95Ms,
+      rps: entry.rps,
+      layer: entry.layer,
+      section: tag ? getSectionForTag(tag) : undefined,
+    };
+  });
+
+  const testEntries = buildTestRollupEntriesFromRun(rollupRows, ctx.db, ctx.redis, tagResolver);
+  const uniqueTests = new Set(scoped.map((e) => testFileToId(e.testFile))).size;
+  const timestamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const dbDisplay = ctx.redis ? `${ctx.db}-redis` : ctx.db;
+
+  const latencyRows = testEntries.map((e) => ({
+    scenario: e.label,
+    latency: e.avgMs > 0 ? `${e.avgMs.toFixed(3)}ms` : "\u23F3 pending",
+    trend: e.trendLabel,
+    budget: e.budgetLabel,
+    result: e.icon,
+  }));
+
+  const executiveBody = buildExecutiveReport({
+    dbLabel: dbDisplay,
+    timestamp,
+    status: "SUCCESS",
+    isPartial: true,
+    recorded: uniqueTests,
+    total: countApplicableScripts(ctx.redis ? `${ctx.db}-redis` : ctx.db),
+    skipped: Math.max(
+      0,
+      countApplicableScripts(ctx.redis ? `${ctx.db}-redis` : ctx.db) - uniqueTests,
+    ),
+    hostLine: process.env.BUN_VERSION ? `Bun ${process.env.BUN_VERSION}` : "standalone run",
+    latencyRows,
+    testEntries,
+    mermaidPoints: [],
+  });
+
+  const updated = patchBenchmarkZones(doc, { executive: executiveBody });
+  writeMdxDocument(docPath, updated);
+}
+
+function writeCollapsedLedgerEntry(opts: {
+  testFile: string;
+  shortLabel?: string;
+  trendLabel: string;
+  insight: string;
+  avgMs: number;
+  deltaPct: number;
+  icon: string;
+}): void {
+  const docPath = getDocPath();
+  if (!fs.existsSync(docPath)) return;
+
+  let doc = fs.readFileSync(docPath, "utf8");
+  const tag =
+    (opts.shortLabel ? shortLabelToTag(opts.shortLabel) : null) ||
+    discoverTagInLedger(doc, opts.testFile, opts.shortLabel);
+  if (!tag) return;
+
+  const bounds = findLedgerTagBounds(doc, tag);
+  let truth = "> \u23F3 Pending";
+  if (bounds) {
+    const block = doc.slice(bounds.start, bounds.end + bounds.endMarker.length);
+    const inner = extractTagInner(block, tag);
+    const truthMatch = inner.match(
+      /<!-- LEDGER_TRUTH_START -->\s*([\s\S]*?)\s*<!-- LEDGER_TRUTH_END -->/,
+    );
+    if (truthMatch?.[1]?.trim()) truth = truthMatch[1].trim();
+  }
+
+  const label =
+    opts.shortLabel ||
+    path
+      .basename(opts.testFile)
+      .replace(/\.test\.ts$/i, "")
+      .replace(/-/g, " ");
+  const collapsed = buildCollapsedLedgerTagInner({
+    tag,
+    label,
+    testPath: normalizeTestFile(opts.testFile),
+    avgMs: opts.avgMs,
+    icon: opts.icon,
+    deltaPct: opts.deltaPct,
+    trendLabel: opts.trendLabel,
+    insight: opts.insight,
+    truth,
+  });
+  doc = upsertLedgerSection(doc, tag, collapsed);
+  writeMdxDocument(docPath, doc);
+}
+
+/** Write Historical Archive slot only — does not touch Current Run overlay. */
+export function writeHistoryArchive(dbLabel?: string, docPath?: string): void {
+  if (!shouldRecord()) return;
+  const resolvedPath = docPath ?? getDocPathForDb(dbLabel || getDbType());
+  writeSummaryHistoryArchive(buildHistoryArchiveTable(dbLabel), resolvedPath);
+}
+
+/** Refresh Historical Archive from `history.sqlite` (matrix / manual refresh). */
+export function rebuildSummaryFromHistory(dbLabel?: string, docPath?: string): void {
+  writeHistoryArchive(dbLabel, docPath);
+}
+
+/**
+ * Finalize a benchmark run — surgical path updates LEDGER + SUMMARY only.
+ * Matrix path delegates to `generateFinalReport()` (owns EXECUTIVE).
+ */
+export interface FinalizeReportOptions {
+  /** Test files/ids that executed in this invocation (`exportResult` / `_reportedFiles`). */
+  invokedTestFiles?: Iterable<string>;
+}
+
+export async function finalizeReport(
+  runId: string,
+  options: FinalizeReportOptions = {},
+): Promise<void> {
+  if (isMatrixRun()) {
+    try {
+      const { generateFinalReport } =
+        await import("../../../scripts/benchmark-matrix/reporting").catch(() => ({
+          generateFinalReport: null,
+        }));
+      if (generateFinalReport) await generateFinalReport();
+    } catch {
+      /* matrix reporting optional */
+    }
+    return;
+  }
+
+  const historyPath = path.resolve(process.cwd(), "tests/benchmarks/results/history.jsonl");
+  if (!fs.existsSync(historyPath)) return;
+
+  try {
+    const raw = fs.readFileSync(historyPath, "utf8").trim().split("\n").filter(Boolean);
+    const allEntries = raw.map((line) => JSON.parse(line));
+    const runEntries = filterInvocationRunEntries(
+      allEntries.filter((e) => e.runId === runId),
+      options.invokedTestFiles,
+    );
+    if (runEntries.length === 0) return;
+
+    const runMode = runEntries[0].runMode || "standalone";
+    const db = runEntries[0].db || getDbType();
+    const redis = runEntries[0].redis ?? false;
+    // dbLabel constructed when needed for history writes
+
+    const groups = new Map<string, any[]>();
+    for (const entry of runEntries) {
+      const key = `${entry.testFile}:${entry.metric}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(entry);
+    }
+
+    const previousSameMode = allEntries.filter((e) => e.runMode === runMode && e.runId !== runId);
+
+    for (const [_key, entries] of groups) {
+      const current = entries[entries.length - 1];
+      const testFile = normalizeTestFile(current.testFile);
+      const testId = testFile.replace(/^tests\/benchmarks\//, "").replace(/\.test\.ts$/, "");
+      const phase = inferPhase(testFile, current.phase);
+      const shortLabel = current.layer || undefined;
+
+      persistRun({
+        runId,
+        runMode,
+        testId,
+        dbType: db,
+        redisEnabled: redis,
+        phase,
+        metric: current.metric,
+        avgMs: current.avgMs,
+        p95Ms: current.p95Ms || 0,
+        rps: current.rps || 0,
+        errorCount: 0,
+        status: "SUCCESS",
+      });
+
+      if (!shouldRecord()) continue;
+
+      // Prefer same-mode jsonl series for this exact metric (docs contract).
+      // Fall back to metric-keyed sqlite history.
+      const prevJsonl = previousSameMode.filter((e) => {
+        const ef = normalizeTestFile(e.testFile);
+        const et =
+          ef.replace(/^tests\/benchmarks\//, "").replace(/\.test\.ts$/i, "") === testId ||
+          e.testFile === current.testFile ||
+          e.testFile === testId;
+        return et && e.metric === current.metric && (e.db || db) === db;
+      });
+      const jsonlPrior = prevJsonl.slice(-7).map((e) => ({
+        avgMs: e.avgMs,
+        p95Ms: e.p95Ms || 0,
+        rps: e.rps || 0,
+        runMode: e.runMode,
+      }));
+      const sqliteHistory = loadHistory(testId, db, redis, phase, current.metric);
+      const sqlitePrior = sqliteHistory.slice(0, -1);
+      const prior = jsonlPrior.length > 0 ? jsonlPrior : sqlitePrior;
+      const trend = analyzeTrend(
+        {
+          name: current.metric,
+          avgMs: current.avgMs,
+          p95Ms: current.p95Ms || 0,
+          rps: current.rps || 0,
+        },
+        prior,
+        testId,
+        db,
+        redis,
+        phase,
+      );
+
+      const rootCause = classifyRootCause(
+        trend.deltaPct,
+        trend.p95DeltaPct,
+        trend.rpsDeltaPct,
+        runMode === "standalone",
+        trend.sampleSize,
+      );
+
+      // Budget violations already checked via PER_DIMENSION_BUDGETS in benchmark-mdx
+      checkBudgets(db, {
+        [`${phase}_avg`]: current.avgMs,
+        [`${phase}_p95`]: current.p95Ms || 0,
+      });
+
+      const insight = buildSpecificInsight(rootCause, []);
+      const ts = (current.timestamp || new Date().toISOString()).replace("T", " ").slice(0, 19);
+      const trendLabel = `${trend.label} (${ts})`;
+      const icon = trendIcon(trend);
+
+      writeCollapsedLedgerEntry({
+        testFile,
+        shortLabel,
+        trendLabel,
+        insight,
+        avgMs: current.avgMs,
+        deltaPct: trend.deltaPct,
+        icon,
+      });
+    }
+
+    if (shouldRecord()) {
+      const docPath = getDocPathForDb(redis ? `${db}-redis` : db);
+      writeRunSummary(
+        runEntries,
+        { runId, runMode, db, redis, invokedTestFiles: options.invokedTestFiles },
+        docPath,
+      );
+      writeHistoryArchive(redis ? `${db}-redis` : db, docPath);
+      writePartialExecutive(
+        runEntries,
+        { runId, db, redis, invokedTestFiles: options.invokedTestFiles },
+        docPath,
+      );
+    }
+
+    const totalTime = runEntries.reduce((s, e) => Math.max(s, e.wallClockMs || 0), 0);
+    const avgMetric = runEntries.reduce((s, e) => s + e.avgMs, 0) / runEntries.length;
+    console.log(
+      `\n  [${runMode.toUpperCase()}] ${runEntries.length} metrics recorded · avg ${avgMetric.toFixed(2)}ms · ${(totalTime / 1000).toFixed(1)}s wall clock`,
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  finalizeReport error: ${msg}`);
+  }
+}
+
+export function resetTrendGuard(): void {
+  _lastTag = null;
+  _lastTestFile = "unknown";
 }

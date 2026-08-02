@@ -19,6 +19,9 @@ import type { RequestEvent } from "@sveltejs/kit";
 
 import { createYoga, createSchema } from "graphql-yoga";
 import { NoSchemaIntrospectionCustomRule } from "graphql";
+import { useGraphQlJit } from "@envelop/graphql-jit";
+import { cacheService } from "@src/databases/cache/cache-service";
+import { CacheCategory } from "@src/databases/cache/types";
 import { pubSub } from "@src/services/background/pub-sub";
 import { createDepthLimitRule, createMaxAliasesRule } from "./rules";
 import { registerCollections, collectionsResolvers } from "./resolvers/collections";
@@ -27,17 +30,26 @@ import { analyzeQueryCost, formatCostError } from "./cost-analyzer";
 // GraphQL validation plugin: enforces query depth (max 7), alias count (max 15),
 // and blocks schema introspection in production environments
 const isProduction = process.env.NODE_ENV === "production";
-const isBenchmark = process.env.BENCHMARK_MODE === "true" || process.env.BENCHMARK === "true";
 
 const depthLimitRule = createDepthLimitRule(8);
 const maxAliasesRule = createMaxAliasesRule(15);
 
 const securityValidationPlugin = {
+  onParse({ params }: any) {
+    // Cost-budget queries at parse time — no request.clone() needed
+    const query = params?.source || params?.query;
+    if (typeof query === "string") {
+      const analysis = analyzeQueryCost(query);
+      if (!analysis.allowed) {
+        throw new AppError(formatCostError(analysis.cost, 1000), 400, "QUERY_TOO_EXPENSIVE");
+      }
+    }
+  },
   onValidate({ addValidationRule }: { addValidationRule: (rule: any) => void }) {
     addValidationRule(depthLimitRule);
     addValidationRule(maxAliasesRule);
     // 🛡️ Explicit introspection block in production (belt-and-suspenders with Yoga's default)
-    if ((isProduction && !isBenchmark) || process.env.BLOCK_GRAPHQL_INTROSPECTION === "true") {
+    if (isProduction || process.env.BLOCK_GRAPHQL_INTROSPECTION === "true") {
       addValidationRule(NoSchemaIntrospectionCustomRule);
     }
   },
@@ -46,12 +58,36 @@ import { mediaResolvers, mediaTypeDefs } from "./resolvers/media";
 import { systemResolvers, systemTypeDefs } from "./resolvers/system";
 import { userResolvers, userTypeDefs } from "./resolvers/users";
 import { seoResolvers, seoTypeDefs } from "./resolvers/seo";
+import {
+  virtualCollectionsMutationFields,
+  virtualCollectionsMutationResolvers,
+  virtualCollectionsQueryFields,
+  virtualCollectionsResolvers,
+  virtualCollectionsTypeDefs,
+} from "./resolvers/virtual-collections";
+import {
+  dataOperationsMutationFields,
+  dataOperationsMutationResolvers,
+  dataOperationsQueryFields,
+  dataOperationsQueryResolvers,
+  dataOperationsTypeDefs,
+  JSONScalar,
+} from "./resolvers/data-operations";
 import { createLoaders } from "./loaders";
 import { LocalCMS } from "@src/services/sdk";
 
 import { apiHandler } from "@utils/api-handler";
 import { AppError } from "@utils/error-handling";
 import { logger } from "@utils/logger";
+
+function hashStr(s: string): string {
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    hash = ((hash << 5) - hash + c) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
 
 import { registerPermission } from "@src/databases/auth/permissions";
 import { PermissionAction, PermissionType } from "@src/databases/auth/types";
@@ -84,6 +120,8 @@ async function createGraphQLSchema(dbAdapter: any, tenantId?: string | null) {
     ${mediaTypeDefs()}
     ${seoTypeDefs}
     ${collectionTypeDefs}
+    ${virtualCollectionsTypeDefs}
+    ${dataOperationsTypeDefs}
 
     type Query {
       _empty: String
@@ -96,6 +134,8 @@ async function createGraphQLSchema(dbAdapter: any, tenantId?: string | null) {
       mediaRemote(pagination: PaginationInput): [MediaRemote]
       mediaFolders: [MediaFolder]
       ${queryFields.join("\n      ")}
+      ${virtualCollectionsQueryFields}
+      ${dataOperationsQueryFields}
     }
 
     input PaginationInput {
@@ -105,6 +145,8 @@ async function createGraphQLSchema(dbAdapter: any, tenantId?: string | null) {
 
     type Mutation {
       _empty: String
+      ${virtualCollectionsMutationFields}
+      ${dataOperationsMutationFields}
     }
 
     type Subscription {
@@ -119,16 +161,21 @@ async function createGraphQLSchema(dbAdapter: any, tenantId?: string | null) {
   `;
 
   const resolvers = {
+    JSON: JSONScalar,
     Query: {
       ...userResolvers(dbAdapter),
       ...systemResolvers.Query,
       ...collectionResolversMap.Query,
       ...mediaResolvers(dbAdapter),
       ...seoResolvers.Query,
+      ...virtualCollectionsResolvers(dbAdapter, tenantId),
+      ...dataOperationsQueryResolvers(dbAdapter, tenantId),
     },
     Mutation: {
       ...(systemResolvers as any).Mutation,
       ...(collectionResolversMap as any).Mutation,
+      ...virtualCollectionsMutationResolvers(dbAdapter, tenantId),
+      ...dataOperationsMutationResolvers(dbAdapter, tenantId),
     },
     Subscription: {
       contentStructureUpdated: {
@@ -174,17 +221,14 @@ export async function _getYogaApp(dbAdapter: any, tenantId?: string | null) {
         const { typeDefs, resolvers } = await createGraphQLSchema(dbAdapter, tenantId);
         const schema = createSchema({ typeDefs, resolvers });
 
-        const plugins: any[] = [securityValidationPlugin];
-        if (process.env.USE_GRAPHQL_JIT === "true" || process.env.BENCHMARK === "true") {
-          const { useGraphQlJit } = await import("@envelop/graphql-jit");
-          plugins.push(useGraphQlJit());
-        }
+        const plugins: any[] = [securityValidationPlugin, useGraphQlJit()];
 
         const app = createYoga({
           schema: schema as any,
           graphqlEndpoint: "/api/graphql",
           landingPage: true,
           cors: false,
+          batching: { limit: 10 },
           plugins,
           context: async (serverContext: any) => {
             let _loaders: any = undefined;
@@ -262,33 +306,33 @@ async function handleRequest(event: RequestEvent) {
     | "draft"
     | "all";
 
-  // 🚀 QUERY COST ANALYSIS: Reject over-budget queries before execution
-  if (request.method === "POST") {
-    try {
-      const clonedRequest = request.clone();
-      const body = await clonedRequest.json().catch(() => null);
-      if (body && typeof body.query === "string") {
-        const analysis = analyzeQueryCost(body.query);
-        if (!analysis.allowed) {
-          return new Response(
-            JSON.stringify({
-              errors: [{ message: formatCostError(analysis.cost, 1000) }],
-            }),
-            {
-              status: 400,
-              headers: { "Content-Type": "application/json" },
-            },
-          );
-        }
-      }
-    } catch {
-      // If body parsing fails, let Yoga handle the error downstream
-    }
-  }
-
   let _loaders: any = null;
 
   try {
+    // ── Response cache: clone request to read body, original stays intact for Yoga ──
+    const cacheReq = request.clone();
+    const bodyText = await cacheReq.text().catch(() => "");
+    let body: any = {};
+    try {
+      body = JSON.parse(bodyText);
+    } catch {}
+    const query = body?.query || "";
+    const variables = body?.variables || {};
+
+    if (query && request.method === "POST") {
+      const cacheKey = `gql:resp:${hashStr(String(query) + JSON.stringify(variables))}:${locals.tenantId || "global"}:${locals.user?.role || "anon"}`;
+      const cached = cacheService.getSync<{ body: string; status: number }>(
+        cacheKey,
+        locals.tenantId as string,
+      );
+      if (cached?.body) {
+        return new Response(cached.body, {
+          status: cached.status || 200,
+          headers: { "Content-Type": "application/json", "X-Cache": "HIT" },
+        });
+      }
+    }
+
     const yogaApp = await _getYogaApp(adapter, locals.tenantId);
     const yogaResponse = await yogaApp.handleRequest(request, {
       user: locals.user,
@@ -307,7 +351,23 @@ async function handleRequest(event: RequestEvent) {
       publicationFilter,
     });
 
-    return new Response(yogaResponse.body, {
+    const responseBody = await yogaResponse.text();
+
+    // Cache successful query responses (same key as lookup)
+    if (query && request.method === "POST" && yogaResponse.status === 200) {
+      const cacheKey = `gql:resp:${hashStr(String(query) + JSON.stringify(variables))}:${locals.tenantId || "global"}:${locals.user?.role || "anon"}`;
+      try {
+        await cacheService.set(
+          cacheKey,
+          { body: responseBody, status: yogaResponse.status },
+          30,
+          locals.tenantId as string,
+          CacheCategory.API,
+        );
+      } catch {}
+    }
+
+    return new Response(responseBody, {
       status: yogaResponse.status,
       statusText: yogaResponse.statusText,
       headers: yogaResponse.headers,

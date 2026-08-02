@@ -8,26 +8,32 @@
  * NOTE: TypeScript errors for 'bun:test' module are expected - it's a runtime module.
  */
 
-import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSchemaProxy } from "../../../src/databases/core/schema-proxy";
 
+// 🟢 Apply the v8 shim before any MongoDB/Bson imports
+// This must happen before the dynamic import of MongoDBAdapter below.
+import "../../../src/utils/v8-shim";
+
 // 🚀  Aggressively mock SvelteKit and Store environment for standalone adapter tests
-mock.module("$app/environment", () => ({
+vi.mock("$app/environment", () => ({
   browser: false,
   dev: false,
   building: false,
   version: "1.0.0",
 }));
-mock.module("@src/stores/screen-size-store.svelte", () => ({
+vi.mock("@src/stores/screen-size-store.svelte", () => ({
   screenSize: { isMobile: false, isTablet: false, isDesktop: true },
 }));
-mock.module("@src/stores/toast.svelte", () => ({ toast: { show: () => {} } }));
-mock.module("@src/stores/store.svelte", () => ({
+vi.mock("@src/stores/toast.svelte", () => ({ toast: { show: () => {} } }));
+vi.mock("@src/stores/store.svelte", () => ({
   appStore: { isMobile: false },
   app: { isMobile: false },
 }));
-mock.module("@src/stores/widget-store.svelte", () => ({ widgets: { initialize: () => {} } }));
-mock.module("svelte", () => ({
+vi.mock("@src/stores/widget-store.svelte", () => ({
+  widgets: { initialize: () => {} },
+}));
+vi.mock("svelte", () => ({
   mount: () => ({}),
   unmount: () => ({}),
 }));
@@ -137,22 +143,59 @@ describe("Database Interface Contract Tests", () => {
           privateConfig.database?.port ||
           "27017";
 
-        let connectionString = `mongodb://${host}:${port}/${dbName}`;
+        // Defensive guard in case port is set to another DB's default
+        const finalPort =
+          port === 3306 || port === "3306" || port === 5432 || port === "5432" ? "27017" : port;
 
-        if (user && pass) {
-          const authSource = encodeURIComponent(
-            process.env.DB_AUTH_SOURCE ||
-              privateConfig.DB_AUTH_SOURCE ||
-              databaseConfig.authSource ||
-              dbName,
+        const buildUri = (authSrc?: string) => {
+          if (user && pass) {
+            const source = encodeURIComponent(authSrc || dbName);
+            return `mongodb://${encodeURIComponent(user)}:${encodeURIComponent(
+              pass,
+            )}@${host}:${finalPort}/${dbName}?authSource=${source}`;
+          }
+          return `mongodb://${host}:${finalPort}/${dbName}`;
+        };
+
+        const primaryUri = buildUri(
+          process.env.DB_AUTH_SOURCE ||
+            privateConfig.DB_AUTH_SOURCE ||
+            databaseConfig.authSource ||
+            dbName,
+        );
+
+        let result = await (db as any).connect(primaryUri, {
+          serverSelectionTimeoutMS: 8000,
+          connectTimeoutMS: 8000,
+        });
+
+        if (!result?.success && user && pass) {
+          console.warn(
+            "DB Interface Test: MongoDB primary auth failed. Trying admin authSource fallback...",
           );
-
-          connectionString = `mongodb://${encodeURIComponent(user)}:${encodeURIComponent(
-            pass,
-          )}@${host}:${port}/${dbName}?authSource=${authSource}`;
+          await db.disconnect().catch(() => {});
+          const adminUri = buildUri("admin");
+          result = await (db as any).connect(adminUri, {
+            serverSelectionTimeoutMS: 8000,
+            connectTimeoutMS: 8000,
+          });
         }
 
-        await (db as any).connect(connectionString);
+        if (!result?.success && !user && !pass) {
+          console.warn("DB Interface Test: MongoDB unauthenticated connection fallback...");
+          await db.disconnect().catch(() => {});
+          const noAuthUri = buildUri(undefined)
+            .replace(/\/\/[^:@/]+:[^@/]+@/, "//")
+            .replace(/\?authSource=.*/, "");
+          result = await (db as any).connect(noAuthUri, {
+            serverSelectionTimeoutMS: 8000,
+            connectTimeoutMS: 8000,
+          });
+        }
+
+        if (!result?.success) {
+          throw new Error(`Failed to connect to MongoDB: ${result?.message || "unknown error"}`);
+        }
       } else if (currentDbType === "mariadb") {
         const port =
           process.env.DB_PORT ||
@@ -542,16 +585,12 @@ describe("Database Interface Contract Tests", () => {
     it("should handle full Auth user lifecycle", async () => {
       if (!db?.auth) return;
 
-      if (currentDbType === "mongodb") {
-        console.warn("Skipping generic auth lifecycle in db-interface for MongoDB adapter.");
-        return;
-      }
-
       const createRes = await db.auth.createUser({
         email: testUserEmail,
         username: "contract_user",
         password: "Password123!",
         isAdmin: false,
+        role: "user",
         tenantId: TEST_TENANT,
       });
 
@@ -561,7 +600,9 @@ describe("Database Interface Contract Tests", () => {
       expect(createRes.data.email).toBe(testUserEmail);
       testUserId = createRes.data._id;
 
-      const fetchRes = await db.auth.getUserById(testUserId, { tenantId: TEST_TENANT });
+      const fetchRes = await db.auth.getUserById(testUserId, {
+        tenantId: TEST_TENANT,
+      });
       expect(fetchRes.success).toBe(true);
       if (!fetchRes.success) throw new Error("Fetch user failed");
 
@@ -599,10 +640,14 @@ describe("Database Interface Contract Tests", () => {
 
       expect(emailRes.data?.firstName).toBe("Contract");
 
-      const deleteRes = await db.auth.deleteUser(testUserId, { tenantId: TEST_TENANT });
+      const deleteRes = await db.auth.deleteUser(testUserId, {
+        tenantId: TEST_TENANT,
+      });
       expect(deleteRes.success).toBe(true);
 
-      const verifyRes = await db.auth.getUserById(testUserId, { tenantId: TEST_TENANT });
+      const verifyRes = await db.auth.getUserById(testUserId, {
+        tenantId: TEST_TENANT,
+      });
       expect(verifyRes.success).toBe(true);
       if (!verifyRes.success) throw new Error("Verify deletion failed");
 
@@ -611,11 +656,6 @@ describe("Database Interface Contract Tests", () => {
 
     it("should handle standardized CRUD round-trips using system_preferences", async () => {
       if (!db?.crud) return;
-
-      if (currentDbType === "mongodb") {
-        console.warn("Skipping generic CRUD round-trip in db-interface for MongoDB adapter.");
-        return;
-      }
 
       const collection = "system_preferences";
       const testId = `pref-${Date.now()}` as any;
@@ -707,11 +747,6 @@ describe("Database Interface Contract Tests", () => {
 
     it("should enforce strict multi-tenant isolation", async () => {
       if (!db?.crud) return;
-
-      if (currentDbType === "mongodb") {
-        console.warn("Skipping multi-tenant isolation check in db-interface for MongoDB adapter.");
-        return;
-      }
 
       const collection = "system_preferences";
       const testId = `tenant-pref-${Date.now()}` as any;

@@ -5,22 +5,24 @@
 
 // Auth - getAllPermissions is lightweight, no heavy queries needed
 import { getAllPermissions } from "@src/databases/auth/permissions";
-import { error, redirect } from "@sveltejs/kit";
+import { error } from "@sveltejs/kit";
 // System Logger - Ensure logger is optimized for performance in production (e.g., disabled debug logs)
 import { logger } from "@utils/logger";
+import { getAuthenticatedUser } from "@utils/page-guards.server";
 import type { PageServerLoad } from "./$types";
 
 export const load: PageServerLoad = async ({ locals }) => {
   try {
-    const { user, roles: tenantRoles = [], tenantId, isAdmin: localsIsAdmin } = locals;
+    const user = getAuthenticatedUser(locals);
+    const { roles: tenantRoles = [], tenantId } = locals;
+    const localsIsAdmin = !!(
+      locals.isAdmin ||
+      (user as any)?.isAdmin ||
+      user.role === "admin" ||
+      user.role === "super-admin"
+    );
 
-    // User authentication and permission checks already done by handleAuthorization hook
-    if (!user) {
-      logger.warn("User not authenticated, redirecting to login");
-      throw redirect(302, "/login");
-    }
-
-    // Check if user is admin — admins use localsIsAdmin from hook
+    // Check if user is admin — prefer hook flag, fall back to role string
     if (!localsIsAdmin) {
       // For non-admins, check specific permission
       // You can add more granular permission checks here if needed

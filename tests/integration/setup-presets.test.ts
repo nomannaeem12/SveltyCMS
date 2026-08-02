@@ -1,62 +1,66 @@
-import { describe, expect, it, mock } from "bun:test";
+import { afterAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-
-// Mock compilation
-mock.module("@utils/compilation/compile", () => ({
-  compileCollections: async () => ({
-    collections: [],
-    errors: [],
-  }),
-}));
+import { writePresetCollectionFiles } from "@src/routes/setup/preset-collections.server";
+import { PRESETS } from "@src/routes/setup/presets";
 
 describe("Setup Presets Integration", () => {
-  const presetDir = path.resolve("src/presets/test_preset");
-  const configDir = path.resolve("config/collections");
-  const testFile = "TestCollection.ts";
+  const tenantId = "test-setup-presets";
+  const configDir = path.resolve("config", tenantId, "collections");
+  const compiledDir = path.resolve(".compiledCollections", tenantId);
+  const liveCollectionsDir = path.resolve("config", "collections");
 
-  // Helper to simulate the copy logic from +page.server.ts
-  async function installPreset(presetName: string) {
-    const fsPromises = fs.promises;
-    const presetSource = path.resolve(process.cwd(), "src", "presets", presetName);
-    const target = path.resolve(process.cwd(), "config", "collections");
+  afterAll(() => {
+    fs.rmSync(path.resolve("config", tenantId), { recursive: true, force: true });
+    fs.rmSync(compiledDir, { recursive: true, force: true });
+  });
 
-    await fsPromises.mkdir(target, { recursive: true });
-
-    // Check if preset dir exists
-    try {
-      await fsPromises.access(presetSource);
-      const files = await fsPromises.readdir(presetSource);
-
-      for (const file of files) {
-        if (file.endsWith(".ts")) {
-          await fsPromises.copyFile(path.join(presetSource, file), path.join(target, file));
-        }
-      }
-      return true;
-    } catch {
-      return false;
-    }
+  function liveRootSnapshot(): string[] {
+    if (!fs.existsSync(liveCollectionsDir)) return [];
+    return fs.readdirSync(liveCollectionsDir).sort();
   }
 
-  it("should copy preset files to config/collections", async () => {
-    // Setup mock preset
-    if (!fs.existsSync(presetDir)) {
-      fs.mkdirSync(presetDir, { recursive: true });
+  it("writes blog preset files to an isolated tenant path with lowercase slugs", async () => {
+    const blog = PRESETS.find((p) => p.id === "blog");
+    expect(blog?.collections?.length).toBeGreaterThan(0);
+
+    const beforeLiveRoot = liveRootSnapshot();
+    await writePresetCollectionFiles(blog!.collections!, { tenantId });
+
+    for (const collection of blog!.collections!) {
+      const targetFile = path.join(configDir, `${collection.name}.ts`);
+      expect(fs.existsSync(targetFile)).toBe(true);
+      const content = fs.readFileSync(targetFile, "utf-8");
+      expect(content).toContain(`_id: "${collection.name}"`);
+      // The `@src/widgets` barrel no longer exists — generated files must not
+      // reference it (dead import stripped by the compile transformer).
+      expect(content).not.toContain('import { widgets } from "@src/widgets"');
+
+      const compiledFile = path.join(compiledDir, `${collection.name}.js`);
+      expect(fs.existsSync(compiledFile)).toBe(true);
     }
-    fs.writeFileSync(path.join(presetDir, testFile), "export default {};");
 
-    const success = await installPreset("test_preset");
-    expect(success).toBe(true);
+    expect(liveRootSnapshot()).toEqual(beforeLiveRoot);
+  });
 
-    const targetFile = path.join(configDir, testFile);
+  it("writes website preset files with livePreview and editable-website plugin", async () => {
+    const website = PRESETS.find((p) => p.id === "website");
+    expect(website?.collections?.length).toBeGreaterThan(0);
+    expect(website?.recommended).toBe(true);
+
+    const beforeLiveRoot = liveRootSnapshot();
+    await writePresetCollectionFiles(website!.collections!, { tenantId });
+
+    const pages = website!.collections!.find((c) => c.name === "pages");
+    expect(pages?.livePreview).toBe("/{slug}?lang={lang}");
+    expect(pages?.plugins).toContain("editable-website");
+
+    const targetFile = path.join(configDir, "pages.ts");
     expect(fs.existsSync(targetFile)).toBe(true);
-    expect(fs.readFileSync(targetFile, "utf-8")).toBe("export default {};");
+    const content = fs.readFileSync(targetFile, "utf-8");
+    expect(content).toContain('livePreview: "/{slug}?lang={lang}"');
+    expect(content).toContain('plugins: ["editable-website"]');
 
-    // Cleanup
-    fs.rmSync(presetDir, { recursive: true, force: true });
-    if (fs.existsSync(targetFile)) {
-      fs.unlinkSync(targetFile);
-    }
+    expect(liveRootSnapshot()).toEqual(beforeLiveRoot);
   });
 });

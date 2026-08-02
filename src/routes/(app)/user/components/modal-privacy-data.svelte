@@ -10,12 +10,16 @@
 	import { modalState } from '@utils/modal.svelte';
 	import { showConfirm } from '@utils/modal.svelte';
 	import { page } from '$app/state';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 
 	// Props
 	interface Props {
-		user: any;
+		user?: any;
 	}
-	const { user }: Props = $props();
+	const { user: userProp }: Props = $props();
+	// Fall back to the page-level user when the prop is absent — the modal can be
+	// opened before the route data hydrates (CSR), leaving the prop undefined.
+	const user = $derived(userProp ?? (page.data.user as any) ?? {});
 
 	// Get data from page store for additional context
 	const { totalUsers, isAdmin } = page.data;
@@ -25,7 +29,7 @@
 		try {
 			const res = await fetch('/api/gdpr', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({ action: 'export', userId: user._id })
 			});
 			const result = await res.json();
@@ -57,7 +61,7 @@
 				try {
 					const res = await fetch('/api/gdpr', {
 						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
+						headers: clientJsonHeaders(),
 						body: JSON.stringify({
 							action: 'anonymize',
 							userId: user._id,
@@ -70,10 +74,7 @@
 						// Force logout by calling API with POST
 						await fetch('/api/user/logout', {
 							method: 'POST',
-							headers: {
-								'Content-Type': 'application/json',
-								'X-CSRF-Token': page.data.csrfToken
-							}
+							headers: clientJsonHeaders()
 						});
 						window.location.href = '/login';
 					} else {
@@ -99,7 +100,7 @@
 	<div class="grid grid-cols-1 gap-4 focus:outline-none">
 		<!-- Export Data -->
 		<div
-			class="card p-5 bg-surface-50 dark:bg-surface-900/40 border border-surface-200 dark:border-surface-700 hover:border-tertiary-500 dark:border-primary-500/50 transition-colors"
+			class="card p-5 bg-surface-50 dark:bg-surface-900/40 border border-surface-200 dark:border-surface-700 hover:border-tertiary-500 dark:hover:border-primary-500/50 transition-colors"
 		>
 			<div class="flex items-start gap-4">
 				<div class="p-3 rounded bg-secondary-500/10 text-secondary-500">

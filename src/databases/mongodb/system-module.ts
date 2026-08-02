@@ -47,22 +47,28 @@ export class MongoSystemModule extends DatabaseModule<MongoAdapterCore> implemen
         getById: (id: DatabaseId) => tenantRepo.findOne({ _id: id } as any),
         update: (id: DatabaseId, d: any) => tenantRepo.update(id, d),
         delete: (id: DatabaseId) => tenantRepo.delete(id),
-        list: (o: any) => tenantRepo.findMany(o?.filter || {}, o),
+        list: (o: any) =>
+          tenantRepo.findMany(o?.filter || {}, { ...o, systemScope: o?.systemScope }),
       },
       jobs: {
         create: (j: any) => jobRepo.insert(j),
         getById: (id: DatabaseId) => jobRepo.findOne({ _id: id } as any),
-        getNextReady: (limit: number, tenantId?: string) =>
+        getNextReady: (limit: number, options?: any) =>
           jobRepo.findMany(
             {
               status: "pending",
               nextRunAt: { $lte: new Date().toISOString() },
             } as any,
-            { limit, tenantId } as any,
+            {
+              limit,
+              tenantId: options?.tenantId,
+              bypassTenantCheck: options?.bypassTenantCheck,
+              systemScope: options?.systemScope,
+            } as any,
           ),
         list: (o: any) => jobRepo.findMany(o?.filter || {}, o),
         count: (f: any) => jobRepo.count(f),
-        update: (id: DatabaseId, d: any) => jobRepo.update(id, d),
+        update: (id: DatabaseId, d: any, o?: any) => jobRepo.update(id, d, o),
         delete: (id: DatabaseId) => jobRepo.delete(id),
         cleanup: async (olderThan: Date) => {
           const res = await jobRepo.deleteMany(
@@ -171,21 +177,33 @@ export class MongoSystemModule extends DatabaseModule<MongoAdapterCore> implemen
   };
 
   themes = {
-    setupThemeModels: async () => (await this._getMethods()).themes.setupThemeModels(),
-    getActive: async () => (await this._getMethods()).themes.getActive(),
-    setDefault: async (themeId: DatabaseId) =>
-      (await this._getMethods()).themes.setDefault(themeId),
-    install: async (theme: any) => (await this._getMethods()).themes.install(theme),
-    uninstall: async (themeId: DatabaseId) => (await this._getMethods()).themes.uninstall(themeId),
-    update: async (themeId: DatabaseId, theme: any) =>
-      (await this._getMethods()).themes.update(themeId, theme),
-    getAllThemes: async () =>
-      (await this._getMethods()).themes.getAllThemes().then((r: any) => r.data),
-    storeThemes: async (themes: any[]) => (await this._getMethods()).themes.storeThemes(themes),
-    ensure: async (theme: any) =>
-      (await this._getMethods()).themes.ensure(theme).then((r: any) => r.data),
-    getDefaultTheme: async (tenantId?: any) =>
-      (await this._getMethods()).themes.getDefaultTheme(tenantId),
+    setupThemeModels: async (options?: any) =>
+      (await this._getMethods()).themes.setupThemeModels(options),
+    getActive: async (options?: any) => (await this._getMethods()).themes.getActive(options),
+    setDefault: async (themeId: DatabaseId, options?: any) =>
+      (await this._getMethods()).themes.setDefault(themeId, options),
+    install: async (theme: any, options?: any) =>
+      (await this._getMethods()).themes.install(theme, options),
+    uninstall: async (themeId: DatabaseId, options?: any) =>
+      (await this._getMethods()).themes.uninstall(themeId, options),
+    update: async (themeId: DatabaseId, theme: any, options?: any) =>
+      (await this._getMethods()).themes.update(themeId, theme, options),
+    getAllThemes: async (options?: any) => {
+      const r = await (await this._getMethods()).themes.getAllThemes(options);
+      return Array.isArray(r) ? r : ((r as any)?.data ?? r);
+    },
+    storeThemes: async (themes: any[], options?: any) =>
+      (await this._getMethods()).themes.storeThemes(themes, options),
+    ensure: async (theme: any, options?: any) => {
+      const r = await (await this._getMethods()).themes.ensure(theme, options);
+      return (r as any)?.data !== undefined ? (r as any).data : r;
+    },
+    getDefaultTheme: async (options?: any) =>
+      (await this._getMethods()).themes.getDefaultTheme(
+        options && typeof options === "object" && !Array.isArray(options)
+          ? options
+          : { tenantId: options },
+      ),
   };
 
   widgets = {
@@ -204,11 +222,12 @@ export class MongoSystemModule extends DatabaseModule<MongoAdapterCore> implemen
   jobs = {
     create: async (job: any) => (await this._getMethods()).jobs.create(job),
     getById: async (id: DatabaseId) => (await this._getMethods()).jobs.getById(id),
-    getNextReady: async (limit?: number, tenantId?: any) =>
-      (await this._getMethods()).jobs.getNextReady(limit, tenantId),
+    getNextReady: async (limit?: number, options?: any) =>
+      (await this._getMethods()).jobs.getNextReady(limit, options),
     list: async (options?: any) => (await this._getMethods()).jobs.list(options),
     count: async (filter?: any) => (await this._getMethods()).jobs.count(filter),
-    update: async (id: DatabaseId, data: any) => (await this._getMethods()).jobs.update(id, data),
+    update: async (id: DatabaseId, data: any, options?: any) =>
+      (await this._getMethods()).jobs.update(id, data, options),
     delete: async (id: DatabaseId) => (await this._getMethods()).jobs.delete(id),
     cleanup: async (olderThan: Date) => (await this._getMethods()).jobs.cleanup(olderThan),
   };
@@ -244,6 +263,10 @@ export class MongoSystemModule extends DatabaseModule<MongoAdapterCore> implemen
       (await this._getMethods()).websiteTokens.getByName(name, tenantId),
     getByToken: async (token: string, tenantId?: any) =>
       (await this._getMethods()).websiteTokens.getByToken(token, tenantId),
+    getByTokenHash: async (tokenHash: string, tenantId?: any) =>
+      (await this._getMethods()).websiteTokens.getByTokenHash(tokenHash, tenantId),
+    getById: async (id: DatabaseId, tenantId?: any) =>
+      (await this._getMethods()).websiteTokens.getById(id, tenantId),
     delete: async (id: DatabaseId, tenantId?: any) =>
       (await this._getMethods()).websiteTokens.delete(id, tenantId),
   };

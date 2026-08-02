@@ -1,70 +1,63 @@
 #!/usr/bin/env sh
 # =============================================================================
-# SveltyCMS Pre-Commit Quality Gate — CI parity (format → lint → check →
-# unit → build → integration)
-# =============================================================================
-# Matches the CI pipeline. Only run what changed since the last commit.
-# E2E tests are deferred to pre-push (too slow for every commit).
+# SveltyCMS Pre-Commit — Format → Lint → Unit → SBOM Sync (~40s)
 #
-# Skip with: git commit --no-verify
+# Pre-push runs build + SQLite integration.
+# POLICY: --no-verify is blocked. Use 'bun run scripts/git-safe.ts commit'.
 # =============================================================================
-set -e
+set -u
+[ "${CI:-false}" = "true" ] && exit 0
 
-if [ "${CI:-false}" = "true" ]; then
-    echo "⏩ CI environment detected. Bypassing pre-commit gates."
-    exit 0
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/lib.sh"
+
+header "Pre-Commit"
+require_bun
+
+TOTAL=5; OK=0
+
+# Step 1 — Database safety
+if run "🛡️  Database safety" $RUN_CMD scripts/check-test-db-safety.ts; then
+  OK=$((OK + 1))
 fi
 
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║           SveltyCMS Pre-Commit Quality Gate                  ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "▶️  Format"
-bun run format
-
-# Re-stage files modified by formatter
-staged_after_fix=$(git diff --cached --name-only --diff-filter=ACMR || true)
-if [ -n "$staged_after_fix" ]; then
-    printf '%s\n' "$staged_after_fix" | while IFS= read -r file; do
-        if [ -f "$file" ]; then git add "$file"; fi
-    done
+# Step 2 — Format + lint
+if run "🔍  Format + lint" $RUN_CMD check; then
+  OK=$((OK + 1))
+else
+  $RUN_CMD format > /dev/null 2>&1
+  git add -u 2>/dev/null || true
+  if run "🔍  Re-checking after format" $RUN_CMD check; then
+    warn "Files auto-formatted and staged."
+    OK=$((OK + 1))
+  else
+    warn "Lint errors remain after formatting."
+  fi
 fi
 
-if ! git diff --exit-code --quiet; then
-    echo "❌ Working tree is dirty after formatting. Re-stage and try again."
-    exit 1
+# Step 3 — Lint-staged
+if run "⚡  Lint-staged" $RUN_CMD gate:fast; then
+  OK=$((OK + 1))
 fi
-echo "   ✓ Format passed."
-echo ""
 
-echo "▶️  Lint"
-bun run lint
-echo "   ✓ Lint passed."
-echo ""
+# Step 4 — Unit tests (skip if only docs changed)
+if has_changes '\.(md|mdx)$' && ! has_changes '\.(ts|js|svelte)$'; then
+	  warn "Only docs changed — skipping unit tests"
+	  TOTAL=$((TOTAL - 1))
+	elif run "🧪  Unit tests" $RUN_CMD test:unit; then
+  OK=$((OK + 1))
+fi
 
-echo "▶️  Type Check"
-bun run check
-echo "   ✓ Type check passed."
-echo ""
+# Step 5 — SBOM sync (keeps sbom.json in lockstep with bun.lock)
+if has_changes 'bun\.lock|package\.json'; then
+  if run "📦  SBOM sync" $RUN_CMD audit:sbom; then
+    git add sbom.json 2>/dev/null || true
+    info "sbom.json regenerated from updated lockfile and staged."
+    OK=$((OK + 1))
+  fi
+else
+  warn "No dependency changes — SBOM already up to date"
+  TOTAL=$((TOTAL - 1))
+fi
 
-echo "▶️  Unit Tests"
-bun run test:unit
-echo "   ✓ Unit tests passed."
-echo ""
-
-echo "▶️  Build"
-bun run build
-echo "   ✓ Build passed."
-echo ""
-
-echo "▶️  Integration Tests (SQLite)"
-bun run scripts/run-integration-tests.ts --db=sqlite --no-build
-echo "   ✓ Integration tests passed."
-echo ""
-
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  ✅ All CI gates passed. Run 'git push' for E2E validation.  ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
-echo ""
+summary "$OK" "$TOTAL"

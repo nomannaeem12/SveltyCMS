@@ -1,42 +1,51 @@
 /**
- * @file tests/playwright/language.spec.ts
- * @description Playwright end-to-end test for changing the system language in SveltyCMS.
- *   - Logs in as admin
- *   - Iterates through language options (EN, FR, DE, ES)
- *   - Selects each language from the dropdown and waits for UI update
+ * @file tests/e2e/routes/system/language.spec.ts
+ * @description System language selector — hard assert chrome (no soft-skip).
  */
 import { expect, test } from "@playwright/test";
 import { ensureSidebarVisible, loginAsAdmin } from "../../helpers/auth";
+import { dismissCookieConsent, seedCookieConsent } from "../../helpers/cookie-consent";
 
 test.describe("System Language Change", () => {
-  test.setTimeout(60_000); // 1 min
+  test.setTimeout(60_000);
 
-  test("Login and change system language between EN and DE", async ({ page }) => {
-    // 1. Login
+  test("change system language between EN and DE", async ({ page }) => {
+    await seedCookieConsent(page);
     await loginAsAdmin(page, /\/(admin|Collections|collectionbuilder|dashboard)/);
-
-    // 2. On mobile viewports, open sidebar to access language selector
     await ensureSidebarVisible(page);
+    await dismissCookieConsent(page);
 
-    // 3. Find language selector — uses data-testid or select element
-    const languageSelector = page.getByTestId("language-selector");
-    const isVisible = await languageSelector.isVisible({ timeout: 3000 }).catch(() => false);
+    const languageSelector = page
+      .getByTestId("language-selector")
+      .or(page.getByTestId("language-selector-trigger"))
+      .or(page.getByLabel(/language|locale|sprache/i))
+      .or(page.locator('select[name*="lang" i], select[id*="lang" i]'))
+      .first();
 
-    if (!isVisible) {
-      // Language selector not found — UI may have changed. Login still verified.
-      console.log("⚠ Language selector not found in current UI, skipping language change test.");
-      return;
-    }
+    await expect(
+      languageSelector,
+      "Language selector is core chrome — must be present when sidebar is open",
+    ).toBeVisible({ timeout: 15_000 });
 
-    // 4. Loop through available language options (en, de)
-    const languages = ["en", "de"];
-
-    for (const lang of languages) {
-      await languageSelector.selectOption(lang);
-      await page.waitForTimeout(1000);
-      const selectedValue = await languageSelector.inputValue();
-      expect(selectedValue).toBe(lang);
-      console.log(`✓ Language selector set to: ${lang.toUpperCase()}`);
+    const tag = await languageSelector.evaluate((el) => el.tagName.toLowerCase());
+    if (tag === "select") {
+      for (const lang of ["en", "de"]) {
+        await languageSelector.selectOption(lang);
+        await expect(languageSelector).toHaveValue(lang, { timeout: 5_000 });
+      }
+    } else {
+      // Button/menu style: open and pick DE then EN if options exist.
+      // force:true avoids residual cookie-banner intercepts.
+      await languageSelector.click({ force: true });
+      const de = page.getByRole("option", { name: /deutsch|german|^de$/i }).first();
+      if (await de.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await de.click({ force: true });
+      }
+      await languageSelector.click({ force: true });
+      const en = page.getByRole("option", { name: /english|^en$/i }).first();
+      if (await en.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await en.click({ force: true });
+      }
     }
   });
 });

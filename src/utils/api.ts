@@ -1,12 +1,18 @@
 /**
- * @file src/utils/apiClient.ts
+ * @file src/utils/api.ts
  * @description Modern API client for RESTful collection endpoints.
  * Includes unified error handling compatible with server-side apiHandler.
+ *
+ * ### Features:
+ * - JSON parse + standardized ApiResponse shape
+ * - **CSRF on all non-GET mutations** via clientJsonHeaders (cookie or explicit token)
+ * - credentials: include for session cookies
  */
 
 import type { ISODateString } from "@src/content/types";
 import { publicEnv } from "@src/stores/global-settings.svelte.ts";
 import { logger } from "@utils/logger";
+import { clientJsonHeaders } from "@utils/security/client-csrf";
 
 // --- Type Definitions ---
 
@@ -59,22 +65,49 @@ interface GetDataResponse {
 
 // --- Core API Functions ---
 
+export type FetchApiOptions = RequestInit & {
+  /** Optional CSRF override (defaults to cookie via clientJsonHeaders on mutations) */
+  csrfToken?: string | null;
+};
+
 /**
  * Universal fetch wrapper that handles:
  * 1. JSON parsing
  * 2. HTTP Error status codes
  * 3. Unified Error Response extraction
  * 4. Network error catching
+ * 5. **CSRF headers on POST/PUT/PATCH/DELETE** (Testing 2026 ADR)
  */
 export async function fetchApi<T>(
   endpoint: string,
-  options: RequestInit = {},
+  options: FetchApiOptions = {},
 ): Promise<ApiResponse<T>> {
+  const { csrfToken, headers: optionHeaders, ...rest } = options;
+  const method = String(rest.method || "GET").toUpperCase();
+  const isMutation = !["GET", "HEAD", "OPTIONS"].includes(method);
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(isMutation ? clientJsonHeaders(csrfToken) : {}),
+  };
+
+  // Merge caller headers last so explicit X-CSRF-Token still wins
+  if (optionHeaders) {
+    const extra =
+      optionHeaders instanceof Headers
+        ? Object.fromEntries(optionHeaders.entries())
+        : Array.isArray(optionHeaders)
+          ? Object.fromEntries(optionHeaders)
+          : (optionHeaders as Record<string, string>);
+    Object.assign(headers, extra);
+  }
+
   try {
     const response = await fetch(endpoint, {
-      headers: { "Content-Type": "application/json" },
-      credentials: "include", // Ensure cookies/auth are sent
-      ...options,
+      credentials: "include",
+      ...rest,
+      method: rest.method || "GET",
+      headers,
     });
 
     // 1. Handle Successful Responses (2xx)
@@ -127,7 +160,8 @@ export async function fetchApi<T>(
   } catch (error) {
     // 3. Handle Network/Client Errors (Offline, DNS, etc)
     const err = error as Error;
-    logger.error(`[API Network Error] ${endpoint}`, err);
+    // 🛡️ Avoid logging raw Error objects (may contain PII/stack traces)
+    logger.error(`[API Network Error] ${endpoint.split("?")[0]}`);
     return {
       success: false,
       message: err.message || "Network error occurred",
@@ -275,6 +309,7 @@ export async function getRevisions(
 // --- Data & Cache Functions ---
 
 const CACHE_TTL_MS = 30 * 1000; // 30 seconds
+const MAX_CACHE_ENTRIES = 500; // 🛡️ DoS guard: prevents unbounded memory growth from unique filter strings
 
 interface CacheEntry {
   data: GetDataResponse;
@@ -282,6 +317,25 @@ interface CacheEntry {
   ttl: number;
 }
 const dataCache = new Map<string, CacheEntry>();
+
+/**
+ * Inserts a cache entry with LRU eviction.
+ * When the cache exceeds MAX_CACHE_ENTRIES, the oldest entry (first inserted) is evicted.
+ * Map preserves insertion order, so `keys().next()` returns the oldest key.
+ */
+function setCacheEntry(key: string, entry: CacheEntry): void {
+  if (dataCache.size >= MAX_CACHE_ENTRIES && !dataCache.has(key)) {
+    // Evict the oldest entry (Map iteration order = insertion order)
+    const oldestKey = dataCache.keys().next().value;
+    if (oldestKey !== undefined) dataCache.delete(oldestKey);
+  }
+  dataCache.set(key, entry);
+}
+
+/** Deterministic JSON stringify — sorted keys prevent cache-key mismatch */
+function deterministicStringify(obj: Record<string, unknown>): string {
+  return JSON.stringify(obj, Object.keys(obj).sort());
+}
 
 function generateCacheKey(query: Record<string, unknown>): string {
   const normalizedQuery = {
@@ -294,7 +348,7 @@ function generateCacheKey(query: Record<string, unknown>): string {
     sortDirection: query.sortDirection || "desc",
     _langChange: query._langChange || 0,
   };
-  return JSON.stringify(normalizedQuery);
+  return deterministicStringify(normalizedQuery);
 }
 
 function isCacheValid(cacheEntry: CacheEntry): boolean {
@@ -308,7 +362,7 @@ export function invalidateCollectionCache(collectionId: string): void {
       dataCache.delete(key);
     }
   }
-  logger.info(`[Cache] Invalidated for collection ${collectionId}`);
+  logger.debug(`[Cache] Invalidated for collection ${collectionId}`);
 }
 
 /**
@@ -330,10 +384,10 @@ export async function getData(query: {
   const cached = dataCache.get(cacheKey);
 
   if (cached && isCacheValid(cached)) {
-    logger.info(`[Cache] HIT for ${cacheKey}`);
+    logger.debug(`[Cache] HIT for ${cacheKey}`);
     return { success: true, data: cached.data };
   }
-  logger.info(`[Cache] MISS for ${cacheKey}`);
+  logger.debug(`[Cache] MISS for ${cacheKey}`);
 
   const { collectionId, ...params } = query;
   const searchParams = new URLSearchParams(params as Record<string, string>).toString();
@@ -353,12 +407,12 @@ export async function getData(query: {
       };
     }
 
-    dataCache.set(cacheKey, {
+    setCacheEntry(cacheKey, {
       data: result.data,
       timestamp: Date.now(),
       ttl: CACHE_TTL_MS,
     });
-    logger.info(`[getData] Cached successfully. Items: ${result.data.items.length}`);
+    logger.debug(`[getData] Cached successfully. Items: ${result.data.items.length}`);
   }
 
   return result;

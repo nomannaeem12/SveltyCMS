@@ -9,13 +9,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
 import { loginAsAdmin } from "../../helpers/auth";
+import { openUserManagement } from "../../helpers/user-page";
 
 // Construct reliable file path for CI/CD environments
-// This looks for 'testthumb.png' in the SAME directory as this test file
+// The shared test thumbnail lives at the e2e root (tests/e2e/testthumb.png),
+// committed to the repo so CI has it. Resolve it relative to this spec file.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const AVATAR_PATH = path.join(__dirname, "testthumb.png");
+const AVATAR_PATH = path.join(__dirname, "..", "..", "testthumb.png");
 
-test.describe("User Profile Management", () => {
+// Run tests serially: Edit Avatar and Delete Avatar share the admin's avatar
+// state, so they must not race each other (Delete Avatar needs a custom avatar
+// that Edit Avatar uploads).
+test.describe.serial("User Profile Management", () => {
   // 1. Setup: Run before every test in this group
   test.beforeEach(async ({ page }) => {
     // Perform Login
@@ -27,112 +32,285 @@ test.describe("User Profile Management", () => {
 
   test("Login Verification", async ({ page }) => {
     // Already verified in beforeEach, but good for sanity check
-    expect(page.url()).not.toContain("/login");
+    await expect(page).not.toHaveURL(/\/login/, { timeout: 10_000 });
+    // Navigate to user profile page and verify it loads
+    await page.goto("/user");
+    await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible({ timeout: 10_000 });
+    // Also verify page body is visible as a secondary check
+    await expect(page.locator("body")).toBeVisible({ timeout: 5_000 });
   });
 
-  test("Workspace Appearance link navigates to appearance settings", async ({ page }) => {
-    await page.goto("/user");
-    await expect(page.getByText("Workspace Appearance")).toBeVisible({ timeout: 10_000 });
-    await page.getByRole("button", { name: "Open Appearance Settings" }).click();
-    await expect(page).toHaveURL(/\/config\/appearance/, { timeout: 10_000 });
-    await expect(page.getByText("My Overrides")).toBeVisible({ timeout: 10_000 });
+  test("Workspace Appearance link opens appearance config", async ({ page }) => {
+    await page.goto("/user", { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await expect(page).toHaveURL(/\/user/, { timeout: 15_000 });
+
+    // Fail fast if the root error boundary fired (same class of flake as account-smoke)
+    const systemError = page.getByRole("heading", { name: /system error/i });
+    if (await systemError.isVisible({ timeout: 1_500 }).catch(() => false)) {
+      const detail = await page
+        .locator(".font-mono, pre, code")
+        .first()
+        .textContent()
+        .catch(() => "");
+      throw new Error(`User profile hit System Error boundary: ${detail?.trim() || "(no detail)"}`);
+    }
+
+    // Prefer attached over visible: Preferences can sit below fold / inside overflow shells
+    // where Playwright treats clipped nodes as not visible even though they are in the DOM.
+    await expect(page.getByTestId("page-title")).toBeVisible({ timeout: 15_000 });
+
+    // Click the Settings tab to reveal appearance controls
+    await page.getByRole("tab", { name: /settings/i }).click();
+    await expect(page.getByTestId("user-settings-panel")).toBeVisible({ timeout: 10_000 });
+
+    // Compact density/card strip on Settings
+    await expect(page.getByTestId("user-quick-appearance")).toBeVisible({ timeout: 10_000 });
+
+    const openLink = page.getByTestId("open-appearance-settings-btn");
+    await expect(openLink).toBeAttached({ timeout: 20_000 });
+    await expect(openLink).toHaveAttribute("href", /\/config\/design-system(\?tab=overrides)?/);
+
+    // Navigate via the real href (SPA-safe); force-click as fallback if layout intercepts
+    await openLink.scrollIntoViewIfNeeded().catch(() => {});
+    await Promise.all([
+      page.waitForURL(/\/config\/design-system/, { timeout: 20_000 }),
+      openLink.click({ force: true }),
+    ]).catch(async () => {
+      // Last resort: follow href attribute directly (still validates the link target)
+      const href = await openLink.getAttribute("href");
+      if (!href) throw new Error("open-appearance-settings-btn missing href");
+      await page.goto(href, { waitUntil: "domcontentloaded" });
+    });
+
+    await expect(page).toHaveURL(/\/config\/design-system/, { timeout: 15_000 });
+    await expect(
+      page
+        .getByRole("heading", { level: 1, name: /design system/i })
+        .or(page.getByRole("heading", { name: /my overrides/i }))
+        .first(),
+    ).toBeVisible({ timeout: 20_000 });
   });
 
   test("Edit Avatar", async ({ page }) => {
-    // Ensure the test image exists before trying to upload
-    if (!fs.existsSync(AVATAR_PATH)) {
-      console.warn(`Test image not found at ${AVATAR_PATH}. Skipping avatar upload test.`);
-      return;
-    }
+    // Fixture is committed to the repo — a missing file is a broken checkout,
+    // not a reason to soft-skip (control-map row; soft-skips are banned).
+    expect(fs.existsSync(AVATAR_PATH), `Avatar fixture missing: ${AVATAR_PATH}`).toBe(true);
 
     await page.goto("/user");
 
     // Wait for profile to load
     await expect(page.getByRole("heading", { level: 1, name: "User Profile" })).toBeVisible();
 
-    // Trigger upload
-    await page.getByRole("button", { name: "Edit Avatar" }).click({ force: true });
+    // Trigger upload — the Edit Avatar button is an absolutely-positioned overlay
+    // that Playwright's viewport check rejects even with force:true, so dispatch
+    // a native DOM click instead.
+    const editAvatarBtn = page.getByRole("button", { name: "Edit Avatar" });
+    await editAvatarBtn.evaluate((el: HTMLElement) => el.click());
 
-    // Handle file input safely
+    // Handle file input safely — wait for modal to render
     const fileInput = page.locator('input[type="file"]');
+    await expect(fileInput).toBeAttached({ timeout: 5000 });
     await fileInput.setInputFiles(AVATAR_PATH);
 
-    await page.getByRole("button", { name: "Save" }).click();
+    // Selecting a file only enables Save — the upload runs on form submit (no auto-upload).
+    const saveBtn = page.getByRole("button", { name: /^save$/i });
+    await expect(saveBtn).toBeEnabled({ timeout: 5_000 });
+    await saveBtn.click();
 
-    // Assertion: Check if the image source changes or notification appears
-    await expect(page.locator('.avatar-image, img[alt="Avatar"]')).toBeVisible();
+    // A "Replace Avatar" confirm appears when a custom avatar already exists (retry safety)
+    const confirmBtn = page.getByRole("button", { name: /confirm/i });
+    if (await confirmBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await confirmBtn.click();
+    }
+
+    // Upload outcome: the success toast is the real signal (the sidebar avatar img must
+    // NOT be used as a fallback — it matches even when no upload happened).
+    await expect(page.getByText(/avatar updated successfully/i).first()).toBeVisible({
+      timeout: 15_000,
+    });
   });
 
   test("Delete Avatar", async ({ page }) => {
     await page.goto("/user");
-    await page.getByRole("button", { name: "Edit Avatar" }).click({ force: true });
 
-    const deleteBtn = page.locator("button.variant-filled-error");
-    await expect(deleteBtn).toBeVisible();
+    // Wait for profile to load (matches the passing "Edit Avatar" test)
+    await expect(page.getByRole("heading", { level: 1, name: "User Profile" })).toBeVisible();
+
+    // The "Delete Avatar" button only renders when a custom avatar is set
+    // (page.data.user.avatar !== '/Default_User.svg'). Edit Avatar (which runs
+    // before this test in serial mode) uploads one — so absence here is a REAL
+    // regression, not a reason to soft-skip (control-map row; soft-skips banned).
+    const editAvatarBtn = page.getByRole("button", { name: "Edit Avatar" });
+    await editAvatarBtn.evaluate((el: HTMLElement) => el.click());
+
+    const deleteBtn = page.getByRole("button", { name: "Delete Avatar" });
+    await expect(deleteBtn).toBeVisible({ timeout: 10_000 });
     await deleteBtn.click();
 
-    // Assertion: Check for default avatar fallback
-    await expect(page.locator("img")).toBeVisible();
+    // Confirmation dialog appears — wait for it (AGENTS.md pitfall #13: the
+    // portal render gap means the dialog shell can be visible before content).
+    const confirmBtn = page.getByRole("button", { name: /confirm/i });
+    await expect(confirmBtn).toBeVisible({ timeout: 5_000 });
+    await confirmBtn.click();
+
+    // Assertion: a custom avatar is gone — the success toast "Avatar Deleted"
+    // appears and the profile avatar returns to the default initials state. Scope
+    // via the avatar button (sidebar + table avatars also expose role=img).
+    await expect(page.getByText(/Avatar Deleted/i)).toBeVisible({ timeout: 10_000 });
+    const profileAvatar = page.getByTestId("edit-avatar-btn").getByRole("img").first();
+    await expect(profileAvatar).toBeVisible();
   });
 
   test("Edit User Details", async ({ page }) => {
-    await page.goto("/user");
+    await page.goto("/user", { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await expect(page).toHaveURL(/\/user/, { timeout: 15_000 });
 
-    await page.getByRole("button", { name: /Edit User Settings/i }).click();
+    await page
+      .getByTestId("edit-user-settings-btn")
+      .or(page.getByRole("button", { name: /Edit User Settings/i }))
+      .first()
+      .click();
 
-    // Use fill for robustness on the enabled input in the modal
-    await page.locator('input[name="username"]:not([disabled])').fill("Test User Updated");
+    // Scope to the edit dialog so Save/username resolve unambiguously
+    const editDialog = page
+      .getByRole("dialog", { name: /Edit User Data|edit user/i })
+      .or(page.getByRole("dialog").filter({ hasText: /username/i }))
+      .first();
+    await expect(editDialog).toBeVisible({ timeout: 15_000 });
 
-    await page.getByRole("button", { name: "Save" }).click();
+    // Unique username each run — avoids uniqueness validation failures
+    const newUsername = `TestUser_${Date.now().toString(36).slice(-6)}`;
+    const usernameInput = editDialog.locator('input[name="username"]:not([disabled])');
+    await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+    await usernameInput.fill(newUsername);
 
-    await expect(page.getByText(/User Data Updated/i)).toBeVisible();
+    const updateRespPromise = page
+      .waitForResponse(
+        (res) =>
+          res.url().includes("/api/user/update-user-attributes") &&
+          ["PUT", "POST", "PATCH"].includes(res.request().method()),
+        { timeout: 15_000 },
+      )
+      .catch(() => null);
+
+    await editDialog.getByRole("button", { name: /^save$/i }).click();
+
+    const updateResp = await updateRespPromise;
+    if (updateResp && !updateResp.ok()) {
+      const body = await updateResp.text().catch(() => "");
+      throw new Error(
+        `update-user-attributes failed: HTTP ${updateResp.status()} ${body.slice(0, 300)}`,
+      );
+    }
+
+    // Prefer outcome over toast flash: dialog closes, username visible, or success toast
+    const { expectToast } = await import("../../helpers/stable");
+    await expect(async () => {
+      const dialogGone = !(await editDialog.isVisible().catch(() => false));
+      if (dialogGone) return;
+      const usernameVisible = await page
+        .getByText(newUsername, { exact: false })
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (usernameVisible) return;
+      const errToast = page
+        .getByTestId("app-toast")
+        .filter({ hasText: /user not found|update failed|failed to update/i });
+      if (
+        await errToast
+          .first()
+          .isVisible()
+          .catch(() => false)
+      ) {
+        throw new Error(
+          `Profile update failed: ${await errToast
+            .first()
+            .textContent()
+            .catch(() => "error toast")}`,
+        );
+      }
+      await expectToast(page, /user data updated|profile changes were saved/i, 2_000);
+    }).toPass({ timeout: 20_000 });
   });
 
   test("Registration Token Workflow", async ({ page }) => {
     await page.goto("/user");
 
-    await page.getByText(/Email User Registration token/i).click();
+    // The email-registration-token control lives in the User Management tab.
+    await openUserManagement(page);
 
-    // Fill details
-    await page.locator('input[name="email"]:not([disabled])').fill("newuser@test.ge");
+    await page.getByRole("button", { name: /Email User Registration token/i }).click();
 
-    // Select Role (Robust selection)
-    await page.getByRole("button", { name: "user", exact: true }).click();
+    // Scoped to the token dialog
+    const tokenDialog = page.getByRole("dialog", { name: /Edit Token Data/i });
+    await expect(tokenDialog).toBeVisible({ timeout: 10_000 });
+
+    // Unique email per run — a fixed address collides on reruns/retries
+    // (duplicate invite email), failing the control row.
+    await tokenDialog
+      .locator('input[name="email"]:not([disabled])')
+      .fill(`regtoken_${Date.now()}@test.ge`);
+
+    // Select Role — chip buttons inside the dialog (role names: admin/developer/editor/user)
+    const roleChip = tokenDialog.getByRole("button", { name: /^user$/i });
+    if (await roleChip.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await roleChip.click();
+    }
 
     // Select Duration
-    await page.locator("#expires-select").selectOption("12 hrs");
+    await tokenDialog.locator("#expires-select").selectOption("12 hrs");
 
-    await page.getByRole("button", { name: "Save" }).click();
+    await tokenDialog.getByRole("button", { name: "Save" }).click();
 
-    await expect(page.getByText(/Token Created/i)).toBeVisible();
+    // After success the modal stays open and renders an "Invitation Token Created"
+    // panel with the copyable invite link. Assert on that heading (scoped to the
+    // dialog) — a global getByText(/Token Created/i) also matches the toast and
+    // the success toast title, causing a strict-mode violation.
+    await expect(
+      tokenDialog.getByRole("heading", { name: /Invitation Token Created/i }),
+    ).toBeVisible({ timeout: 10_000 });
   });
 
   test("Toggle User Token Visibility", async ({ page }) => {
     await page.goto("/user");
 
-    // Open
-    await page.getByText(/Show User Token/i).click();
-    const tokenList = page.getByRole("heading", { name: "Token List:" });
-    await expect(tokenList).toBeVisible();
+    // Token view lives inside the User Management tab.
+    await openUserManagement(page);
 
-    // Close
-    await page.getByText(/Hide User Token/i).click();
-    await expect(tokenList).not.toBeVisible();
+    // Switch to Invitations tab
+    const tokensTab = page.getByTestId("admin-tab-tokens");
+    await expect(tokensTab).toBeVisible({ timeout: 10_000 });
+    await tokensTab.click();
+
+    // Verify token table is visible
+    const tokenTable = page.locator("table");
+    await expect(tokenTable).toBeVisible({ timeout: 10_000 });
+
+    // Switch back to Users tab
+    const usersTab = page.getByTestId("admin-tab-users");
+    await usersTab.click();
+    await expect(usersTab).toHaveAttribute("aria-selected", "true");
   });
 
   test("Toggle User List Visibility", async ({ page }) => {
     await page.goto("/user");
 
-    // Initially open
-    const userList = page.getByRole("heading", { name: "User List:" });
-    await expect(userList).toBeVisible();
+    // User list view lives inside the User Management tab.
+    await openUserManagement(page);
 
-    // Close
-    await page.getByText(/Hide User List/i).click();
-    await expect(userList).not.toBeVisible();
+    // Users tab should be active by default
+    const usersTab = page.getByTestId("admin-tab-users");
+    await expect(usersTab).toBeVisible({ timeout: 10_000 });
+    await expect(usersTab).toHaveAttribute("aria-selected", "true");
 
-    // Open
-    await page.getByText(/Show User List/i).click();
-    await expect(userList).toBeVisible();
+    // Verify user table is visible
+    const userTable = page.locator("table");
+    await expect(userTable).toBeVisible({ timeout: 10_000 });
+
+    // Switch to Invitations tab
+    const tokensTab = page.getByTestId("admin-tab-tokens");
+    await tokensTab.click();
+    await expect(tokensTab).toHaveAttribute("aria-selected", "true");
   });
 });

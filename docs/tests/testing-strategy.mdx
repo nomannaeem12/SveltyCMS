@@ -4,7 +4,7 @@ title: "Testing Strategy: Four-Gate Architecture"
 description: "SveltyCMS testing strategy — Contracts, White-Box unit, Black-Box integration, and E2E with Smart Orchestrator."
 author: "SveltyCMS Team"
 created: "2026-02-15"
-updated: "2026-06-17"
+updated: "2026-07-18"
 tags:
   - "testing"
   - "strategy"
@@ -17,21 +17,36 @@ tags:
 
 SveltyCMS uses a **four-gate testing architecture** enforced by a Smart Test Orchestrator. Every changed file triggers exactly the tests that verify it. Unknown changes fail closed into the full core suite.
 
+## 2026 product-route standard
+
+Admin/config routes should follow **[ADR: Testing 2026](./adr-testing-2026.mdx)**:
+
+- Shared **`fetchApi`** mutations (CSRF always)
+- Domain **`*-api.ts` + `*-utils.ts`** (unit) + golden E2E journey
+- **No soft-skip** for empty install on control-map rows — seed via `/api/testing`
+- **Reference route:** `/config/webhooks`
+
+## Primary goal: 100% three-layer completeness
+
+**North star:** critical product behavior is proven by **all three** automated layers where they apply:
+
+1. **White-box unit** (Vitest)
+2. **Black-box integration** (HTTP + DB matrix)
+3. **E2E** (Playwright)
+
+“100%” means **100% of the critical inventory** has the correct layer proof(s) — not 100% of every source line. Full definition, scorecards, and P0 lists: **[Three-Layer Completeness](./three-layer-completeness.mdx)**.
+
+**Headless-first placement** (adapters + session + RBAC before admin E2E): **[Headless-First Test Inventory](./headless-test-inventory.mdx)**.
+
 ````mermaid
 graph TD
-    classDef gate1 fill:#27ae60,stroke:#2ecc71,stroke-width:2px,color:white;
-    classDef gate2 fill:#2980b9,stroke:#3498db,stroke-width:2px,color:white;
-    classDef gate3 fill:#e67e22,stroke:#f39c12,stroke-width:2px,color:white;
-    classDef gate4 fill:#8e44ad,stroke:#9b59b6,stroke-width:2px,color:white;
-    classDef runner fill:#c0392b,stroke:#e74c3c,stroke-width:2px,color:white;
+    GitDiff[Git Diff] --> SmartOrch{Smart Orchestrator<br>scripts/test-smart.ts}
 
-    GitDiff[Git Diff]:::runner --> SmartOrch{Smart Orchestrator<br>scripts/test-smart.ts}:::runner
-
-    SmartOrch -->|"src/hooks/*"| Gate1[Gate 1: Unit Tests]:::gate1
-    SmartOrch -->|"src/routes/api/*"| Gate2[Gate 2: Contracts]:::gate2
-    SmartOrch -->|"*.svelte"| Gate3[Gate 3: Doctor]:::gate3
-    SmartOrch -->|"setup/*"| Gate4[Gate 4: E2E]:::gate4
-    SmartOrch -->|"unknown"| FullCore[Full Core Suite<br>FAIL-CLOSED]:::runner
+    SmartOrch -->|"src/hooks/*"| Gate1[Gate 1: Unit Tests]
+    SmartOrch -->|"src/routes/api/*"| Gate2[Gate 2: Contracts]
+    SmartOrch -->|"*.svelte"| Gate3[Gate 3: Doctor]
+    SmartOrch -->|"setup/*"| Gate4[Gate 4: E2E]
+    SmartOrch -->|"unknown"| FullCore[Full Core Suite<br>FAIL-CLOSED]
 ```text
 
 ## The Four Gates
@@ -57,6 +72,8 @@ tests/harness/
 ```text
 
 **Rule**: No test file invents its own tenant ID, user fixture, or mock data. Import from `@tests/harness`.
+
+API **unit** tests that call the catch-all dispatcher should use shared helpers in `tests/unit/utils/mock-event.ts` (`createMockRequestEvent`, `invokeApi`) — see [API Unit Helpers](./api-unit-helpers.mdx). Do not invent a per-file `createMockEvent` or a parallel HTTP-style test client for the same layer.
 
 ---
 
@@ -84,7 +101,7 @@ Every adapter (SQLite, MongoDB, PostgreSQL, MariaDB) MUST pass every assertion. 
 
 **"Test pure logic knowing how it works."**
 
-Files: `tests/unit/**/*.test.ts` | Runner: `bun run test:unit` | Tests: 1,122 (123 files, 0 failures)
+Files: `tests/unit/**/*.test.ts` | Runner: `bun run test:unit` | Tests: 1,100+ (150+ files — run `bun run test:unit` for current count)
 
 These tests have full access to internal code structure. They're fast (milliseconds), parallelizable, and catch logic regressions immediately.
 
@@ -127,6 +144,8 @@ bun run test:smart --suite=auth # filters by suite name
 | ------------------------------------- | ------------------------------------ |
 | `src/hooks/handle-authentication.ts`  | Auth & Security unit tests           |
 | `src/routes/api/[...path]/+server.ts` | Authorization & RBAC unit tests      |
+| `src/routes/api/[...path]/handlers/version.ts` | Version API unit tests     |
+| `src/services/core/version-service.ts` | Version comparison unit tests       |
 | `src/databases/**/*.ts`               | Full adapter contract matrix         |
 | `src/widgets/**/*.ts`                 | Widget unit + schema + accessibility |
 | `src/**/*.svelte`                     | Svelte Doctor (check + lint)         |
@@ -141,8 +160,9 @@ bun run test:smart --suite=auth # filters by suite name
 | ----------------------------------------- | ----------------------------------------------- |
 | Cross-database adapter parity             | Contract — `contract.test.ts` against all 4 DBs |
 | A validation schema (Valibot)             | Unit — `safeParse()` with edge cases            |
-| An API endpoint returning JSON            | Integration — real HTTP, real DB                |
-| Whether an editor can access admin routes | Integration — RBAC through real middleware      |
+| Dispatcher unit (auth/tenant edges)         | Unit — `invokeApi` ([helpers](./api-unit-helpers.mdx)) |
+| An API endpoint returning JSON (full hooks) | Integration — real HTTP, real DB              |
+| Whether an editor can access admin routes | Integration — RBAC through real middleware    |
 | The setup wizard flow                     | E2E — Playwright fills real forms               |
 | Keyboard tab order through a modal        | E2E — `page.keyboard.press("Tab")`              |
 
@@ -153,6 +173,7 @@ bun run test:smart --suite=auth # filters by suite name
 - [Test Status Report](./test-status.mdx)
 - [Utility Test Coverage](./utility-test-coverage.mdx)
 - [API Testing](./api-testing.mdx)
+- [API Unit Helpers](./api-unit-helpers.mdx)
 - [E2E Testing Guide](./e2e-testing-guide.mdx)
 - [Black-Box Testing Architecture](./black-box-testing.mdx)
 ````

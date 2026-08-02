@@ -22,6 +22,8 @@ import type {
   MediaItem,
   ISqlAdapter,
 } from "../db-interface";
+import { hashCredentialSha256Hex } from "@src/utils/security/credential-hash";
+import { assertTenantContext } from "@src/utils/security/safe-query";
 import * as utils from "./relational-utils";
 
 function looksJsonEncoded(value: string): boolean {
@@ -83,19 +85,6 @@ export class RelationalSystemModule implements ISystemAdapter {
 
   protected getDb(options?: BaseQueryOptions) {
     return options?.transaction?.db || this.db;
-  }
-
-  /**
-   * Helper to hash tokens before storage or comparison.
-   * Website tokens represent API credentials and must NEVER be stored in plaintext.
-   */
-  private async _hashToken(token: string): Promise<string> {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(token);
-    const hash = await crypto.subtle.digest("SHA-256", data);
-    return Array.from(new Uint8Array(hash))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
   }
 
   // ============================================================
@@ -451,16 +440,19 @@ export class RelationalSystemModule implements ISystemAdapter {
       );
     },
 
-    getNextReady: async (limit = 10, tenantId?: string | null): Promise<DatabaseResult<Job[]>> => {
+    getNextReady: async (
+      limit = 10,
+      options?: BaseQueryOptions,
+    ): Promise<DatabaseResult<Job[]>> => {
       return this.adapter.wrap(async () => {
-        // 🚀 CROSS-CONTEXT FIX: Always use a clean Date instance
-        // instantiated in the current context to ensure Drizzle checks pass.
+        // Fail-closed: scheduler must pass withSystemScope("scheduler") or tenantId.
+        assertTenantContext(options, "system.jobs.getNextReady");
         const cleanNow = new Date();
         const conditions = [
           eq(this.schema.sveltyJobs.status, "pending"),
           lte(this.schema.sveltyJobs.nextRunAt, cleanNow),
         ];
-        if (tenantId) conditions.push(eq(this.schema.sveltyJobs.tenantId, tenantId));
+        utils.applyTenantFilter(conditions, this.schema.sveltyJobs.tenantId, options);
 
         const results = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.sveltyJobs))
@@ -473,17 +465,20 @@ export class RelationalSystemModule implements ISystemAdapter {
     },
 
     list: async (
-      options?: PaginationOption & { status?: string; taskType?: string },
+      options?: PaginationOption & BaseQueryOptions & { status?: string; taskType?: string },
     ): Promise<DatabaseResult<Job[]>> => {
       return this.adapter.wrap(async () => {
+        // Fail-closed under MT: pass tenantId or withSystemScope("scheduler"|"bootstrap")
+        assertTenantContext(options, "system.jobs.list");
         let q = this.db
           .select(this.adapter.getPhysicalSelection(this.schema.sveltyJobs))
           .from(this.schema.sveltyJobs)
           .$dynamic();
-        const conditions = [];
+        const conditions: any[] = [];
         if (options?.status) conditions.push(eq(this.schema.sveltyJobs.status, options.status));
         if (options?.taskType)
           conditions.push(eq(this.schema.sveltyJobs.taskType, options.taskType));
+        utils.applyTenantFilter(conditions, this.schema.sveltyJobs.tenantId, options);
 
         if (conditions.length > 0) q = q.where(and(...conditions));
         q = q.orderBy(desc(this.schema.sveltyJobs.createdAt));
@@ -517,6 +512,7 @@ export class RelationalSystemModule implements ISystemAdapter {
     update: async (
       jobId: DatabaseId,
       data: Partial<EntityCreate<Job>>,
+      options?: BaseQueryOptions & { filter?: Record<string, unknown> },
     ): Promise<DatabaseResult<Job>> => {
       return this.adapter.wrap(async () => {
         const now = new Date();
@@ -540,15 +536,23 @@ export class RelationalSystemModule implements ISystemAdapter {
         if (Object.keys(updateValues).length === 0) {
           updateValues.updatedAt = now;
         }
+        // Atomic claim: an optional `filter` (e.g. { status: "pending" }) makes the
+        // update conditional so two consumers/instances cannot double-claim a job.
+        const conditions = [eq(this.schema.sveltyJobs._id, jobId as string)];
+        if (options?.filter?.status) {
+          conditions.push(eq(this.schema.sveltyJobs.status, String(options.filter.status) as any));
+        }
         await this.db
           .update(this.schema.sveltyJobs)
           .set(updateValues as any)
-          .where(eq(this.schema.sveltyJobs._id, jobId as string));
+          .where(and(...conditions));
 
         const [result] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.sveltyJobs))
           .from(this.schema.sveltyJobs)
-          .where(eq(this.schema.sveltyJobs._id, jobId as string));
+          .where(and(...conditions));
+        // No row matched the filter (already claimed by another consumer) → data
+        // is undefined; callers treat that as "not claimed".
         return utils.convertDatesToISO(result) as unknown as Job;
       }, "JOB_UPDATE_FAILED");
     },
@@ -662,12 +666,14 @@ export class RelationalSystemModule implements ISystemAdapter {
       logger.debug("Theme models setup (no-op for SQL)");
     },
 
-    getActive: async (): Promise<DatabaseResult<Theme | null>> => {
+    getActive: async (options?: BaseQueryOptions): Promise<DatabaseResult<Theme | null>> => {
       return this.adapter.wrap(async () => {
+        const conditions = [eq(this.schema.themes.isActive, true)];
+        utils.applyTenantFilter(conditions, this.schema.themes.tenantId, options);
         const [theme] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.themes))
           .from(this.schema.themes)
-          .where(eq(this.schema.themes.isActive, true))
+          .where(and(...conditions))
           .limit(1);
         return theme ? (utils.convertDatesToISO(theme) as unknown as Theme) : null;
       }, "GET_ACTIVE_THEME_FAILED");
@@ -778,29 +784,27 @@ export class RelationalSystemModule implements ISystemAdapter {
     },
 
     ensure: async (theme: EntityCreate<Theme>): Promise<Theme> => {
-      const [existing] = await this.db
-        .select()
-        .from(this.schema.themes)
-        .where(eq(this.schema.themes.name, theme.name))
-        .limit(1);
-      if (existing) return utils.convertDatesToISO(existing) as unknown as Theme;
+      try {
+        const [existing] = await this.db
+          .select()
+          .from(this.schema.themes)
+          .where(eq(this.schema.themes.name, theme.name))
+          .limit(1);
+        if (existing) return utils.convertDatesToISO(existing) as unknown as Theme;
+      } catch (err: any) {
+        logger.debug("[themes.ensure] Query failed, attempting install fallback:", err?.message);
+      }
       const res = await this.themes.install(theme);
       if (!res.success) throw res.error;
       return res.data;
     },
 
-    getDefaultTheme: async (
-      tenantId?: DatabaseId | null,
-    ): Promise<DatabaseResult<Theme | null>> => {
+    getDefaultTheme: async (options?: BaseQueryOptions): Promise<DatabaseResult<Theme | null>> => {
       return this.adapter.wrap(async () => {
+        // Fail-closed: pass tenantId or withSystemScope("bootstrap"|"setup")
+        assertTenantContext(options, "system.themes.getDefaultTheme");
         const conditions = [eq(this.schema.themes.isDefault, true)];
-        if (tenantId !== undefined) {
-          conditions.push(
-            tenantId === null
-              ? isNull(this.schema.themes.tenantId)
-              : eq(this.schema.themes.tenantId, tenantId as string),
-          );
-        }
+        utils.applyTenantFilter(conditions, this.schema.themes.tenantId, options);
         const [theme] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.themes))
           .from(this.schema.themes)
@@ -931,20 +935,22 @@ export class RelationalSystemModule implements ISystemAdapter {
   public readonly websiteTokens = {
     create: async (
       token: Omit<import("../db-interface").WebsiteToken, "_id" | "createdAt">,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<import("../db-interface").WebsiteToken>> => {
-      // Capture the original plaintext token before hashing.
-      // The raw token MUST be returned to the caller on creation (only storage is hashed).
       const originalToken = token.token;
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.websiteTokens.create");
         const id = utils.generateId();
         const now = new Date();
-        const hashedTokenValue = await this._hashToken(originalToken);
+        const hashedTokenValue = await hashCredentialSha256Hex(originalToken);
+        const tenantId = options?.tenantId;
         const values = {
           ...token,
           token: hashedTokenValue,
           _id: id,
           createdAt: now,
           updatedAt: now,
+          ...(tenantId !== undefined && tenantId !== null ? { tenantId } : {}),
         };
         await this.db
           .insert(this.schema.websiteTokens)
@@ -956,39 +962,52 @@ export class RelationalSystemModule implements ISystemAdapter {
         const stored = utils.convertDatesToISO(result, {
           mariaDoubleParseJson: this.adapter.type === "mariadb",
         }) as unknown as import("../db-interface").WebsiteToken;
-        // Override the stored hash with the original plaintext token in the response.
         return { ...stored, token: originalToken };
       }, "CREATE_WEBSITE_TOKEN_FAILED");
     },
 
-    getAll: async (options: {
-      limit?: number;
-      skip?: number;
-      sort?: string;
-      order?: string;
-    }): Promise<
+    getAll: async (
+      options?: BaseQueryOptions & {
+        limit?: number;
+        skip?: number;
+        sort?: string;
+        order?: string;
+      },
+    ): Promise<
       DatabaseResult<{
         data: import("../db-interface").WebsiteToken[];
         total: number;
       }>
     > => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.websiteTokens.getAll");
+        const opts = options ?? {};
+        const tenantConditions: any[] = [];
+        utils.applyTenantFilter(tenantConditions, this.schema.websiteTokens.tenantId, opts);
+        const tenantWhere = tenantConditions.length > 0 ? and(...tenantConditions) : undefined;
+
         let q = this.db
           .select(this.adapter.getPhysicalSelection(this.schema.websiteTokens))
           .from(this.schema.websiteTokens)
           .$dynamic();
-        if (options.sort) {
-          const orderFn = options.order === "desc" ? desc : asc;
-          const column = (this.schema.websiteTokens as any)[options.sort];
+        if (tenantWhere) q = q.where(tenantWhere);
+        if (opts.sort) {
+          const orderFn = opts.order === "desc" ? desc : asc;
+          const column = (this.schema.websiteTokens as any)[opts.sort];
           if (column) q = q.orderBy(orderFn(column));
         }
-        if (options.limit) q = q.limit(options.limit);
-        if (options.skip) q = q.offset(options.skip);
+        if (opts.limit) q = q.limit(opts.limit);
+        if (opts.skip) q = q.offset(opts.skip);
 
-        const results = await q;
-        const [totalResult] = await this.db
+        let countQ = this.db
           .select({ count: sql<number>`count(*)` })
-          .from(this.schema.websiteTokens);
+          .from(this.schema.websiteTokens)
+          .$dynamic();
+        if (tenantWhere) countQ = countQ.where(tenantWhere);
+
+        const [results, totalResultArr] = await Promise.all([q, countQ]);
+        const [totalResult] = totalResultArr;
+
         const stored = utils.convertArrayDatesToISO(results, {
           mariaDoubleParseJson: this.adapter.type === "mariadb",
         }) as unknown as import("../db-interface").WebsiteToken[];
@@ -1006,12 +1025,16 @@ export class RelationalSystemModule implements ISystemAdapter {
 
     getByName: async (
       name: string,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<import("../db-interface").WebsiteToken | null>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.websiteTokens.getByName");
+        const conditions = [eq(this.schema.websiteTokens.name, name)];
+        utils.applyTenantFilter(conditions, this.schema.websiteTokens.tenantId, options);
         const [result] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.websiteTokens))
           .from(this.schema.websiteTokens)
-          .where(eq(this.schema.websiteTokens.name, name))
+          .where(and(...conditions))
           .limit(1);
         return result
           ? (utils.convertDatesToISO(result, {
@@ -1023,13 +1046,24 @@ export class RelationalSystemModule implements ISystemAdapter {
 
     getByToken: async (
       token: string,
+      options?: BaseQueryOptions,
+    ): Promise<DatabaseResult<import("../db-interface").WebsiteToken | null>> => {
+      const hashedToken = await hashCredentialSha256Hex(token);
+      return this.websiteTokens.getByTokenHash(hashedToken, options);
+    },
+
+    getByTokenHash: async (
+      tokenHash: string,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<import("../db-interface").WebsiteToken | null>> => {
       return this.adapter.wrap(async () => {
-        const hashedToken = await this._hashToken(token);
+        assertTenantContext(options, "system.websiteTokens.getByTokenHash");
+        const conditions = [eq(this.schema.websiteTokens.token, tokenHash)];
+        utils.applyTenantFilter(conditions, this.schema.websiteTokens.tenantId, options);
         const [result] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.websiteTokens))
           .from(this.schema.websiteTokens)
-          .where(eq(this.schema.websiteTokens.token, hashedToken))
+          .where(and(...conditions))
           .limit(1);
         return result
           ? (utils.convertDatesToISO(result, {
@@ -1039,11 +1073,36 @@ export class RelationalSystemModule implements ISystemAdapter {
       }, "GET_WEBSITE_TOKEN_BY_TOKEN_FAILED");
     },
 
-    delete: async (tokenId: DatabaseId): Promise<DatabaseResult<void>> => {
+    getById: async (
+      tokenId: DatabaseId,
+      options?: BaseQueryOptions,
+    ): Promise<DatabaseResult<import("../db-interface").WebsiteToken | null>> => {
       return this.adapter.wrap(async () => {
-        await this.db
-          .delete(this.schema.websiteTokens)
-          .where(eq(this.schema.websiteTokens._id, tokenId));
+        assertTenantContext(options, "system.websiteTokens.getById");
+        const conditions = [eq(this.schema.websiteTokens._id, tokenId)];
+        utils.applyTenantFilter(conditions, this.schema.websiteTokens.tenantId, options);
+        const [result] = await this.db
+          .select(this.adapter.getPhysicalSelection(this.schema.websiteTokens))
+          .from(this.schema.websiteTokens)
+          .where(and(...conditions))
+          .limit(1);
+        return result
+          ? (utils.convertDatesToISO(result, {
+              mariaDoubleParseJson: this.adapter.type === "mariadb",
+            }) as unknown as import("../db-interface").WebsiteToken)
+          : null;
+      }, "GET_WEBSITE_TOKEN_BY_ID_FAILED");
+    },
+
+    delete: async (
+      tokenId: DatabaseId,
+      options?: BaseQueryOptions,
+    ): Promise<DatabaseResult<void>> => {
+      return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.websiteTokens.delete");
+        const conditions = [eq(this.schema.websiteTokens._id, tokenId)];
+        utils.applyTenantFilter(conditions, this.schema.websiteTokens.tenantId, options);
+        await this.db.delete(this.schema.websiteTokens).where(and(...conditions));
       }, "DELETE_WEBSITE_TOKEN_FAILED");
     },
   };
@@ -1054,16 +1113,17 @@ export class RelationalSystemModule implements ISystemAdapter {
   public readonly virtualFolder = {
     create: async (
       folder: EntityCreate<SystemVirtualFolder>,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<SystemVirtualFolder>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.create");
         const id = utils.generateId();
         const now = isoDateStringToDate(nowISODateString());
         await this.db.insert(this.schema.systemVirtualFolders).values(
           utils.convertISOToDates({
             ...folder,
             _id: id,
-            tenantId: tenantId || folder.tenantId || null,
+            tenantId: options?.tenantId ?? folder.tenantId ?? null,
             createdAt: now,
             updatedAt: now,
           }) as any,
@@ -1078,12 +1138,12 @@ export class RelationalSystemModule implements ISystemAdapter {
 
     getById: async (
       folderId: DatabaseId,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<SystemVirtualFolder | null>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.getById");
         const conditions = [eq(this.schema.systemVirtualFolders._id, folderId)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         const [folder] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
@@ -1095,14 +1155,14 @@ export class RelationalSystemModule implements ISystemAdapter {
 
     getByParentId: async (
       parentId: DatabaseId | null,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<SystemVirtualFolder[]>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.getByParentId");
         const conditions = parentId
           ? [eq(this.schema.systemVirtualFolders.parentId, parentId as string)]
           : [isNull(this.schema.systemVirtualFolders.parentId)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         const results = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
@@ -1111,16 +1171,16 @@ export class RelationalSystemModule implements ISystemAdapter {
       }, "GET_VIRTUAL_FOLDERS_BY_PARENT_FAILED");
     },
 
-    getAll: async (
-      tenantId?: DatabaseId | null,
-    ): Promise<DatabaseResult<SystemVirtualFolder[]>> => {
+    getAll: async (options?: BaseQueryOptions): Promise<DatabaseResult<SystemVirtualFolder[]>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.getAll");
         let q = this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
           .$dynamic();
-        if (tenantId)
-          q = q.where(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        const conditions: any[] = [];
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
+        if (conditions.length) q = q.where(and(...conditions));
         const results = await q;
         return utils.convertArrayDatesToISO(results) as unknown as SystemVirtualFolder[];
       }, "GET_ALL_VIRTUAL_FOLDERS_FAILED");
@@ -1129,12 +1189,12 @@ export class RelationalSystemModule implements ISystemAdapter {
     update: async (
       folderId: DatabaseId,
       updateData: Partial<SystemVirtualFolder>,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<SystemVirtualFolder>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.update");
         const conditions = [eq(this.schema.systemVirtualFolders._id, folderId)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         await this.db
           .update(this.schema.systemVirtualFolders)
           .set(
@@ -1154,24 +1214,21 @@ export class RelationalSystemModule implements ISystemAdapter {
 
     delete: async (
       folderId: DatabaseId,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<void>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.delete");
         const conditions = [eq(this.schema.systemVirtualFolders._id, folderId)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         await this.db.delete(this.schema.systemVirtualFolders).where(and(...conditions));
       }, "DELETE_VIRTUAL_FOLDER_FAILED");
     },
 
-    exists: async (
-      path: string,
-      tenantId?: DatabaseId | null,
-    ): Promise<DatabaseResult<boolean>> => {
+    exists: async (path: string, options?: BaseQueryOptions): Promise<DatabaseResult<boolean>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.exists");
         const conditions = [eq(this.schema.systemVirtualFolders.path, path)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         const [folder] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
@@ -1183,12 +1240,12 @@ export class RelationalSystemModule implements ISystemAdapter {
 
     getContents: async (
       folderPath: string,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<{ folders: SystemVirtualFolder[]; files: MediaItem[] }>> => {
       return this.adapter.wrap(async () => {
+        assertTenantContext(options, "system.virtualFolder.getContents");
         const conditions = [eq(this.schema.systemVirtualFolders.path, folderPath)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         const [folder] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
@@ -1196,14 +1253,19 @@ export class RelationalSystemModule implements ISystemAdapter {
           .limit(1);
         if (!folder) throw new Error("Folder not found");
 
+        const subConditions = [eq(this.schema.systemVirtualFolders.parentId, folder._id)];
+        utils.applyTenantFilter(subConditions, this.schema.systemVirtualFolders.tenantId, options);
+        const fileConditions = [eq(this.schema.mediaItems.folderId, folder._id)];
+        utils.applyTenantFilter(fileConditions, this.schema.mediaItems.tenantId, options);
+
         const subQuery = this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
-          .where(eq(this.schema.systemVirtualFolders.parentId, folder._id));
+          .where(and(...subConditions));
         const fileQuery = this.db
           .select(this.adapter.getPhysicalSelection(this.schema.mediaItems))
           .from(this.schema.mediaItems)
-          .where(eq(this.schema.mediaItems.folderId, folder._id));
+          .where(and(...fileConditions));
         const [subfolders, files] = await Promise.all([subQuery, fileQuery]);
         return {
           folders: utils.convertArrayDatesToISO(subfolders) as unknown as SystemVirtualFolder[],
@@ -1215,20 +1277,21 @@ export class RelationalSystemModule implements ISystemAdapter {
     addToFolder: async (
       _contentId: DatabaseId,
       _folderPath: string,
-      _tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<void>> => {
+      assertTenantContext(options, "system.virtualFolder.addToFolder");
       return this.adapter.notImplemented("virtualFolder.addToFolder");
     },
 
     ensure: async (
       folder: EntityCreate<SystemVirtualFolder>,
-      tenantId?: DatabaseId | null,
+      options?: BaseQueryOptions,
     ): Promise<DatabaseResult<SystemVirtualFolder>> => {
-      const res = await this.virtualFolder.exists(folder.path, tenantId);
+      assertTenantContext(options, "system.virtualFolder.ensure");
+      const res = await this.virtualFolder.exists(folder.path, options);
       if (res.success && res.data) {
         const conditions = [eq(this.schema.systemVirtualFolders.path, folder.path)];
-        if (tenantId)
-          conditions.push(eq(this.schema.systemVirtualFolders.tenantId, tenantId as string));
+        utils.applyTenantFilter(conditions, this.schema.systemVirtualFolders.tenantId, options);
         const [f] = await this.db
           .select(this.adapter.getPhysicalSelection(this.schema.systemVirtualFolders))
           .from(this.schema.systemVirtualFolders)
@@ -1239,7 +1302,7 @@ export class RelationalSystemModule implements ISystemAdapter {
           data: utils.convertDatesToISO(f) as unknown as SystemVirtualFolder,
         };
       }
-      return this.virtualFolder.create(folder, tenantId);
+      return this.virtualFolder.create(folder, options);
     },
   };
 

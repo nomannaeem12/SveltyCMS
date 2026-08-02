@@ -10,18 +10,18 @@
  * - System reinitialization for recovery scenarios
  */
 
-import { AppError } from "@utils/error-handling";
+import { logger } from "@utils/logger";
+import { AppError, isAppError } from "@utils/error-handling";
 import type { RequestEvent } from "@sveltejs/kit";
 import type { LocalCMS } from "@src/services/sdk";
 import type { DatabaseId } from "@src/content/types";
 import { successResponse } from "./base";
 import { safeParse } from "valibot";
-import { databaseConfigSchema } from "@src/databases/schemas";
+import { databaseConfigSchema, type DatabaseConfig } from "@src/databases/schemas";
 import { setupAdminSchema } from "@utils/schemas";
 import { SESSION_COOKIE_NAME } from "@src/databases/auth/constants";
 import type { ISODateString } from "@src/databases/db-interface";
 import { setupManager } from "@src/routes/setup/setup-manager";
-import { dev } from "$app/environment";
 
 // ─── Main Dispatcher ─────────────────────────────────────────────────────────
 
@@ -37,8 +37,14 @@ export async function handleSetupRoutes(
   try {
     // ── Setup completion gating ──
     // Only "reinitialize" is allowed after setup completes — everything else returns 403.
-    const { isSetupComplete } = await import("@src/utils/setup-check");
-    if (isSetupComplete() && action !== "reinitialize") {
+    const { isSetupComplete } = await import("@src/utils/server/setup-check");
+    const testSecret = process.env.TEST_API_SECRET;
+    const isTestReq =
+      Boolean(testSecret) &&
+      (process.env.TEST_MODE === "true" || process.env.VITE_TEST_MODE === "true") &&
+      request.headers.get("x-test-secret") === testSecret;
+
+    if (!isTestReq && isSetupComplete() && action !== "reinitialize") {
       throw new AppError(
         "Setup is already complete. Use the Admin panel for further configuration.",
         403,
@@ -67,8 +73,11 @@ export async function handleSetupRoutes(
         throw new AppError(`Setup action '${action}' not implemented`, 404);
     }
   } catch (err: any) {
-    console.error(`[SetupRoute Error] ${action}:`, err);
-    if (err instanceof AppError) throw err;
+    // Expected AppErrors (setup already complete, etc.) should not log noisy traces
+    if (!isAppError(err)) {
+      logger.error(`[SetupRoute Error] ${action}:`, err);
+    }
+    if (isAppError(err)) throw err;
     throw new AppError(err.message || "Setup operation failed", 500);
   }
 }
@@ -127,7 +136,7 @@ async function handleTestDatabase(event: RequestEvent) {
       throw new AppError(`Connection failed: ${healthCheck.message}`, 400, "DB_CONNECT_FAILED");
     }
   } catch (e: any) {
-    console.error("Database setup test error:", e);
+    logger.error("Database setup test error:", e);
     throw new AppError(`Failed to connect/test DB: ${e.message}`, 400, "DB_CONNECT_ERROR");
   } finally {
     if (adapterWrapper?.dbAdapter?.disconnect) {
@@ -149,11 +158,14 @@ async function handleTestDatabase(event: RequestEvent) {
 async function handleSeedDatabase(event: RequestEvent) {
   const { config: dbConfig } = await event.request.json();
 
+  // Validate that the target database is not already seeded with admins (Setup Hijack Protection)
+  await verifyDatabaseUnseeded(dbConfig);
+
   // Write private config and invalidate cache
   const { writePrivateConfig } = await import("@src/routes/setup/write-private-config");
   await writePrivateConfig(dbConfig);
 
-  const { invalidateSetupCache } = await import("@src/utils/setup-check");
+  const { invalidateSetupCache } = await import("@src/utils/server/setup-check");
   invalidateSetupCache(true);
 
   // Initialize adapter and start seeding
@@ -230,7 +242,8 @@ async function handleCompleteSetup(event: RequestEvent, _cms: LocalCMS, url: URL
 
   // Set secure session cookie
   const session = authResult.data.session;
-  const isSecure = url.protocol === "https:" || (url.hostname !== "localhost" && !dev);
+  const { isSecureCookieContext } = await import("@src/databases/auth/constants");
+  const isSecure = isSecureCookieContext(url.protocol, url.hostname);
   const cookieName = isSecure ? `__Host-${SESSION_COOKIE_NAME}` : SESSION_COOKIE_NAME;
 
   event.cookies.set(cookieName, session._id as string, {
@@ -256,7 +269,7 @@ async function handleCompleteSetup(event: RequestEvent, _cms: LocalCMS, url: URL
   } as any);
 
   // Invalidate setup cache so the system performs a fresh deep check on the next request
-  const { invalidateSetupCache } = await import("@src/utils/setup-check");
+  const { invalidateSetupCache } = await import("@src/utils/server/setup-check");
   invalidateSetupCache(true);
 
   return successResponse(event, {
@@ -275,4 +288,42 @@ async function handleReinitialize(event: RequestEvent, cms: LocalCMS) {
 
 function notAllowed(): never {
   throw new AppError("Method not allowed", 405);
+}
+
+// Check database state to verify no existing administrators are registered.
+// This prevents Setup hijacking if config/private.ts is lost or corrupted.
+async function verifyDatabaseUnseeded(dbConfig: DatabaseConfig) {
+  const { getSetupDatabaseAdapter } = await import("@src/routes/setup/utils");
+  let adapterWrapper;
+  try {
+    adapterWrapper = await getSetupDatabaseAdapter(dbConfig, {
+      createIfMissing: false,
+    });
+    const dbAdapter = adapterWrapper.dbAdapter;
+    const adminCountResult = await dbAdapter.auth.getUserCount(
+      { role: "admin" },
+      { bypassTenantCheck: true },
+    );
+
+    const count =
+      typeof adminCountResult === "number"
+        ? adminCountResult
+        : adminCountResult?.success
+          ? adminCountResult.data
+          : 0;
+    if (count > 0) {
+      throw new AppError(
+        "Database contains registered administrator accounts. Setup cannot be re-run.",
+        403,
+        "SETUP_ALREADY_COMPLETE",
+      );
+    }
+  } catch (err: any) {
+    if (err instanceof AppError) throw err;
+    // Database or table not existing is expected and safe to seed
+  } finally {
+    if (adapterWrapper?.dbAdapter?.disconnect) {
+      await adapterWrapper.dbAdapter.disconnect();
+    }
+  }
 }

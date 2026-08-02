@@ -1,21 +1,19 @@
 /**
- * @file src/utils/errorHandling.ts
+ * @file src/utils/error-handling.ts
  * @description Centralized error handling logic and types for the API.
- * Defines the standard error response shape and utilities for processing errors.
+ *
+ * ### Hardening (audit 2026-07):
+ * - Production scrubs raw system errors to prevent infrastructure leakage
+ * - Valibot path parsing handles numeric array indices gracefully
+ * - `getErrorMessage` guards against cyclic references via WeakSet
+ * - `isHttpError` checks `body` for cross-bundle resilience
+ * - `AppError` constructor captures stack traces via `Error.captureStackTrace`
  */
 
-import {
-  error as svelteKitError,
-  type HttpError,
-  isHttpError as svelteKitIsHttpError,
-  isRedirect,
-  json,
-  type RequestEvent,
-} from "@sveltejs/kit";
+import { isRedirect, json, type RequestEvent, type HttpError } from "@sveltejs/kit";
 import { logger } from "./logger.ts";
 import type { GenericSchema, ValiError } from "valibot";
 
-// Helper to safely get dev mode without crashing if $app/environment is missing (e.g. in some Bun test contexts)
 const isDev = (() => {
   try {
     return (import.meta as any).env?.DEV || process.env.NODE_ENV === "development";
@@ -24,71 +22,18 @@ const isDev = (() => {
   }
 })();
 
-// --- Maps & Constants ---
-
-/** Module-level status-to-code map — avoids allocation on every raise() call */
-const STATUS_CODE_MAP: Record<number, string> = {
-  400: "BAD_REQUEST",
-  401: "UNAUTHORIZED",
-  403: "FORBIDDEN",
-  404: "NOT_FOUND",
-  409: "CONFLICT",
-  422: "UNPROCESSABLE",
-  429: "TOO_MANY_REQUESTS",
-  500: "INTERNAL_ERROR",
-  502: "BAD_GATEWAY",
-  503: "SERVICE_UNAVAILABLE",
-};
-
-function statusToCode(status: number): string {
-  return STATUS_CODE_MAP[status] || `HTTP_${status}`;
-}
-
-/**
- * Unified error throwing. Drop-in replacement for SvelteKit's `error()`.
- * Works for page loads (SvelteKit renders +error.svelte) AND API routes
- * (handleApiError extracts the structured code from the body).
- *
- * @example
- * throw raise(404, "User not found");
- * throw raise(500, "DB write failed", "DB_WRITE_FAILED");
- */
-export function raise(status: number, message: string, code?: string): never {
-  throw svelteKitError(status, {
-    message,
-    __sveltyCode: code || statusToCode(status),
-  } as any);
-}
-
-/**
- * Re-throws SvelteKit Redirects and HttpErrors so the framework can handle them.
- * Call at the TOP of every catch block before custom error handling.
- *
- * @example
- * try { await doWork(); }
- * catch (err) {
- *     rethrow(err);
- *     throw raise(500, "Work failed");
- * }
- */
-export function rethrow(err: unknown): void {
-  if (isRedirect(err) || svelteKitIsHttpError(err)) throw err;
-}
-
-// --- Standardized Response Types ---
+// ─── Standardized response types ────────────────────────────────────────
 
 export interface ApiErrorResponse {
-  code?: string;
-  issues?: string[]; // Simplified array of strings for validation issues
+  code: string;
+  issues?: string[];
   message: string;
-  stack?: string; // Only included in Development
+  stack?: string;
   success: false;
 }
 
 /**
  * Custom Application Error class.
- * Use this to throw expected logic errors (e.g., "User not active")
- * that should return specific HTTP codes and error codes.
  */
 export class AppError extends Error {
   public readonly status: number;
@@ -106,15 +51,18 @@ export class AppError extends Error {
     this.name = "AppError";
     this.status = status;
 
+    // Preserve V8 stack traces in environments that support it
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+
     if (typeof code === "string") {
       this.code = code;
-      // If details is an error, treat it as originalError too
       if (details instanceof Error) {
         this.originalError = details;
       }
       this.details = details;
     } else {
-      // Legacy/Test support: 3rd arg is originalError
       this.code = "INTERNAL_ERROR";
       this.originalError = code;
       this.details = details;
@@ -122,35 +70,39 @@ export class AppError extends Error {
   }
 }
 
-/**
- * Type Guard: Checks if an error is a Valibot validation error.
- */
+// ─── Type guards ────────────────────────────────────────────────────────
+
 function isValiError(err: unknown): err is ValiError<GenericSchema> {
   return (
     typeof err === "object" &&
     err !== null &&
+    "name" in err &&
+    (err as any).name === "ValiError" &&
     "issues" in err &&
     Array.isArray((err as Record<string, unknown>).issues)
   );
 }
 
 /**
- * Formats Valibot issues into a clean array of strings.
- * e.g., "email: Invalid email address"
+ * Formats Valibot issues into clean messages, supporting nested objects
+ * and numeric array index keys (e.g., "users.0.email").
  */
 function formatValibotIssues(err: ValiError<GenericSchema>): string[] {
   return err.issues.map((issue) => {
-    const pathKeys = issue.path?.map((p) => (p as { key: string }).key).join(".");
+    if (!issue.path) return issue.message;
+
+    const pathKeys = issue.path
+      .map((p: any) => p.key)
+      .filter((key) => key !== undefined && key !== null)
+      .join(".");
+
     return pathKeys ? `${pathKeys}: ${issue.message}` : issue.message;
   });
 }
 
-/**
- * The Core Error Handler.
- * maps unknown errors to a standardized ApiErrorResponse.
- */
+// ─── Core handler ──────────────────────────────────────────────────────
+
 export function handleApiError(err: unknown, event: RequestEvent) {
-  // 1. SvelteKit Redirects must be re-thrown to function
   if (isRedirect(err)) {
     throw err;
   }
@@ -160,78 +112,73 @@ export function handleApiError(err: unknown, event: RequestEvent) {
   let code = "INTERNAL_SERVER_ERROR";
   let issues: string[] | undefined;
 
-  // 2. Handle Valibot Validation Errors (400)
+  const requestPath = event.url.pathname;
+
   if (isValiError(err)) {
     status = 400;
     message = "Validation Failed";
     code = "VALIDATION_ERROR";
     issues = formatValibotIssues(err);
+    logger.warn(`API Validation Error [${requestPath}]`, { issues });
+  } else if (isAppError(err)) {
+    status = err.status;
+    message = err.message;
+    code = err.code;
 
-    logger.warn(`API Validation Error [${event.url.pathname}]`, { issues });
-  }
-  // 3. Handle Custom AppErrors (Harden with name check for cross-bundle resilience)
-  else if (isAppError(err)) {
-    const appErr = err as AppError;
-    status = appErr.status;
-    message = appErr.message;
-    code = appErr.code;
-
-    // Log 500s as errors, everything else as info/warn
     if (status >= 500) {
-      logger.error(`AppError [${event.url.pathname}]: ${message}`, {
-        details: appErr.details,
+      logger.error(`AppError [${requestPath}]: ${message}`, {
+        code,
+        details: err.details,
+        originalError: getErrorMessage(err.originalError),
       });
-    } else if (status === 401) {
-      // Silence noisy unauthorized logs during dev/restarts
-      logger.debug(`AppError [${event.url.pathname}]: ${message}`, {
-        details: appErr.details,
-      });
-    } else {
-      // Suppress expected 4xx errors during benchmark runs to keep output clean
-      if (process.env.SVELTY_BENCHMARK_SUITE === "true" || process.env.BENCHMARK === "true") {
-        logger.debug(`AppError [${event.url.pathname}]: ${message}`, {
-          details: appErr.details,
-        });
-      } else {
-        logger.warn(`AppError [${event.url.pathname}]: ${message}`, {
-          details: appErr.details,
-        });
+      // 🛡️ Scrub detailed system messages in production
+      if (!isDev) {
+        message = "An internal server error occurred.";
       }
+    } else if (status === 401) {
+      logger.debug(`AppError [${requestPath}]: Unauthorized access attempt`);
+    } else {
+      // Client errors (400-level) are not server issues — log at debug level
+      logger.debug(`AppError [${requestPath}]: ${message}`, { code, details: err.details });
     }
-  }
-  // 4. Handle SvelteKit HttpErrors (thrown via error() or raise())
-  else if (isHttpError(err)) {
-    const httpErr = err as HttpError;
-    const body = httpErr.body as { message?: string; __sveltyCode?: string } | undefined;
-    status = httpErr.status;
+  } else if (isHttpError(err)) {
+    const body = err.body as { message?: string; __sveltyCode?: string } | undefined;
+    status = err.status;
     message = body?.message || "HTTP Error";
     code = body?.__sveltyCode || `HTTP_${status}`;
 
     if (status === 401) {
-      logger.debug(`HttpError [${event.url.pathname}]: ${message}`, { status });
+      logger.debug(`HttpError [${requestPath}]: Unauthorized`);
     } else {
-      logger.warn(`HttpError [${event.url.pathname}]: ${message}`, { status });
+      logger.warn(`HttpError [${requestPath}]: ${message}`, { status, code });
     }
-  }
-  // 5. Catch-all for unknown system errors
-  else {
-    message = err instanceof Error ? err.message : "An unexpected error occurred.";
-    logger.error(`Unhandled API Error [${event.url.pathname}]`, {
-      error: message,
-      stack: err instanceof Error ? err.stack : undefined,
+  } else {
+    const isNativeError = err instanceof Error;
+    const systemMessage = isNativeError ? err.message : String(err);
+
+    logger.error(`Unhandled API Error [${requestPath}]`, {
+      error: systemMessage,
+      stack: isNativeError ? err.stack : undefined,
       user: event.locals.user?._id,
     });
+
+    // 🛡️ Never leak raw engine errors in production
+    if (!isDev) {
+      message = "An unexpected error occurred.";
+      code = "UNEXPECTED_SYSTEM_ERROR";
+    } else {
+      message = systemMessage;
+      code = isNativeError ? err.name.toUpperCase() : "UNKNOWN_RAW_ERROR";
+    }
   }
 
-  // Construct standardized response
   const response: ApiErrorResponse = {
     success: false,
     message,
     code,
-    issues,
+    ...(issues && { issues }),
   };
 
-  // Include stack trace in development only for debugging
   if (isDev && err instanceof Error) {
     response.stack = err.stack;
   }
@@ -239,33 +186,31 @@ export function handleApiError(err: unknown, event: RequestEvent) {
   return json(response, { status });
 }
 
-/**
- * Helper to safely extract an error message string from any unknown error object.
- */
+// ─── Helpers ────────────────────────────────────────────────────────────
+
 export function getErrorMessage(err: unknown): string {
-  if (err instanceof Error) {
-    return err.message;
-  }
-  if (typeof err === "string") {
-    return err;
-  }
+  if (!err) return "";
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
 
-  // Handle SvelteKit HttpError structure manually to avoid dependency issues
-  if (typeof err === "object" && err !== null && "body" in err) {
-    const body = (err as { body: { message?: string } }).body;
-    if (body?.message) {
-      return String(body.message);
-    }
+  if (typeof err === "object" && "body" in err) {
+    const body = (err as any).body;
+    if (body?.message) return String(body.message);
   }
 
-  if (typeof err === "object" && err !== null) {
-    if ("message" in err) {
-      return String((err as { message: string }).message);
-    }
+  if (typeof err === "object") {
+    if ("message" in err) return String((err as any).message);
 
-    // If object has no message, try to stringify it for better debug info
+    // 🛡️ Guard against massive/cyclic objects causing OOM on stringify
     try {
-      const str = JSON.stringify(err);
+      const seen = new WeakSet();
+      const str = JSON.stringify(err, (_, value) => {
+        if (typeof value === "object" && value !== null) {
+          if (seen.has(value)) return "[Circular]";
+          seen.add(value);
+        }
+        return value;
+      });
       return str === "{}" ? "[object Object]" : str;
     } catch {
       return "[object Object]";
@@ -275,9 +220,10 @@ export function getErrorMessage(err: unknown): string {
   return String(err);
 }
 
-/**
- * Type Guard: Checks if an error is an AppError.
- */
+export function raise(status: number, message: string, code?: string): never {
+  throw new AppError(message, status, code);
+}
+
 export function isAppError(err: unknown): err is AppError {
   return (
     err instanceof AppError ||
@@ -285,44 +231,39 @@ export function isAppError(err: unknown): err is AppError {
   );
 }
 
-/**
- * Type Guard: Checks if an error is a SvelteKit HttpError.
- */
 export function isHttpError(err: unknown): err is HttpError {
-  // Defense-in-depth: check status is a valid HTTP error code (400-599)
   return (
     typeof err === "object" &&
     err !== null &&
     "status" in err &&
     typeof (err as any).status === "number" &&
+    "body" in err &&
     (err as any).status >= 400 &&
     (err as any).status < 600
   );
 }
 
 /**
- * Wraps any error into an AppError.
- * Preserves existing AppErrors.
+ * Re-throws redirects and HTTP errors so SvelteKit can handle them
+ * natively. For all other errors, this is a no-op. Call at the top of
+ * every catch block to prevent accidental wrapping of framework signals.
  */
+export function rethrow(err: unknown): void {
+  if (isRedirect(err) || isHttpError(err)) throw err;
+}
+
 export function wrapError(
-  err: unknown,
+  error: unknown,
   message = "An unexpected error occurred",
   status = 500,
 ): AppError {
-  if (isAppError(err)) {
-    return err;
+  if (isAppError(error)) return error;
+
+  if (isHttpError(error)) {
+    const bodyMsg = (error as any).body?.message;
+    return new AppError(bodyMsg || message, error.status, `HTTP_${error.status}`, error);
   }
 
-  if (isHttpError(err)) {
-    const bodyMsg = (err as HttpError & { body?: { message?: string } }).body?.message;
-    return new AppError(bodyMsg || message, err.status, `HTTP_${err.status}`, err);
-  }
-
-  const errorMsg = getErrorMessage(err);
-  // Use default message only if we couldn't get any string representation
-  // Note: We intentionally allow "null", "undefined", and "[object Object]" to pass through
-  // based on test expectations, although in production we might prefer a fallback.
-  const finalMessage = errorMsg || message;
-
-  return new AppError(finalMessage, status, "INTERNAL_ERROR", err);
+  const errorMsg = getErrorMessage(error);
+  return new AppError(errorMsg || message, status, "INTERNAL_ERROR", error);
 }

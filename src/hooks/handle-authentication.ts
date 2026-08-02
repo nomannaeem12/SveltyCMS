@@ -1,44 +1,84 @@
 /**
  * @file src/hooks/handle-authentication.ts
- * @description Enterprise-grade authentication middleware with session validation, rotation, and multi-tenancy.
+ * @description
+ * Enterprise-grade authentication middleware with session validation, rotation, and multi-tenancy.
  *
- * @summary This hook runs after handleSystemState and handleSetup confirm the system is ready. It provides:
+ * Runs after handleSystemState confirms the system is ready. Provides:
  * - **Session Management**: Validates session cookies with 3-layer caching (in-memory → Redis → database)
  * - **Security Token Rotation**: Automatic token rotation for active sessions (prevents session hijacking)
  * - **Multi-tenancy**: Hostname-based tenant identification with strict isolation
- * - **Memory Optimization**: WeakRef-based cache with automatic garbage collection
+ * - **Memory Optimization**: LRU cache with TTL-based eviction (no WeakRef GC flakiness)
  * - **Rate Limiting**: Session rotation rate limits to prevent abuse
- * - **Metrics Integration**: Comprehensive tracking via metrics-service *
+ * - **Metrics Integration**: Comprehensive tracking via metrics-service
  *
- * ### Features
- * - Session rotation every 15 minutes for active users (industry best practice)
- * - WeakRef cache with LRU eviction (top 100 hot sessions)
+ * ### Features:
+ * - Session rotation every 15 minutes for active users
+ * - LRU session cache (top 10,000 hot sessions) with TTL eviction
  * - Tenant isolation enforcement (prevents cross-tenant access)
- * - Rate-limited refresh attempts (100/min per IP)
- * - Automatic cleanup of expired sessions
- * - Zero-downtime session validation
+ * - API key auth with usage tracking via `getClientIp()` (no XFF spoofing)
+ * - Turbo GET hand-off when `__turboAuth` is already resolved
  *
- * @prerequisite handleSystemState and handleSetup have already confirmed readiness
+ * @prerequisite handleSystemState has already confirmed readiness
  */
 
 import type { ISODateString } from "@databases/db-interface";
 import { BloomFilter } from "@utils/bloom-filter";
 import { generateCsrfToken, ensureCsrfToken } from "@utils/security/csrf-utils";
-import { SESSION_COOKIE_NAME, getSessionCookieName } from "@src/databases/auth/constants";
+import {
+  SESSION_COOKIE_NAME,
+  getSessionCookieName,
+  isSecureCookieContext,
+} from "@src/databases/auth/constants";
 import type { User } from "@src/databases/auth/types";
+import { isValidApiKeyFormat, hashApiKeyWithLegacy } from "@src/databases/auth/api-keys";
+import {
+  getApiKeyAuthCacheSync,
+  getWebsiteTokenAuthCacheSync,
+  isApiKeyAuthNegativeHit,
+  isWebsiteTokenAuthNegativeHit,
+  recordApiKeyAuthMiss,
+  recordWebsiteTokenAuthMiss,
+  setApiKeyAuthCache,
+  setWebsiteTokenAuthCache,
+} from "@src/databases/auth/credential-auth-cache";
+import { hashCredentialSha256HexSync } from "@src/utils/security/credential-hash";
 import type { DatabaseId } from "../content/types";
 import { cacheService, SESSION_CACHE_TTL_MS } from "@src/databases/cache/cache-service";
-import { CacheCategory } from "@src/databases/cache/types";
+
 import { getDbInitPromise, auth, dbAdapter } from "@src/databases/db";
 import { metricsService } from "@src/services/observability/metrics-service";
 import type { Handle, RequestEvent } from "@sveltejs/kit";
 import { error } from "@sveltejs/kit";
-import { AppError, handleApiError } from "@utils/error-handling";
+import { AppError, handleApiError, isAppError } from "@utils/error-handling";
 import { logger } from "@utils/logger";
 import { RateLimiter } from "sveltekit-rate-limiter/server";
-import { getRequestFlags } from "@utils/hook-utils";
-import { getPrivateSettingSync } from "@src/services/core/settings-service";
-import { getTenantIdFromHostname } from "@utils/tenant";
+
+/** Mask an email for log safety: r***s@web.de */
+function maskEmail(email: string): string {
+  const atIndex = email.indexOf("@");
+  if (atIndex <= 1) return "***@***";
+  const local = email.slice(0, atIndex);
+  const domain = email.slice(atIndex);
+  return local[0] + "***" + local[local.length - 1] + domain;
+}
+
+/**
+ * Resolves the configured cookie path from system settings.
+ * Falls back to "/" when COOKIE_PATH is not configured or empty.
+ */
+function getCookiePath(): string {
+  const configuredPath = getPrivateSettingSync("COOKIE_PATH");
+  if (configuredPath && typeof configuredPath === "string" && configuredPath.length > 0) {
+    logger.debug(`[Auth] Cookie path from settings: ${configuredPath}`);
+    return configuredPath;
+  }
+  logger.debug(`[Auth] Cookie path defaulting to "/"`);
+  return "/";
+}
+
+import { getClientIp, getRequestFlags } from "@utils/hook-utils";
+import { getPrivateSettingSync, getPublicSettingSync } from "@src/services/core/settings-service";
+import { getTenantIdFromHostname, isMultiTenantEnabled } from "@utils/tenant";
 import { dev } from "$app/environment";
 import { runWithContext } from "@src/utils/context";
 import { invalidateTurboAuthContext } from "./handle-turbo-get";
@@ -51,8 +91,7 @@ let rotationRateLimiter: RateLimiter | null = null;
 
 function getCachedSettings() {
   if (multiTenantCached === null) {
-    const val = getPrivateSettingSync("MULTI_TENANT");
-    multiTenantCached = String(val) === "true" || val === true;
+    multiTenantCached = isMultiTenantEnabled();
   }
   if (demoModeCached === null) {
     const val = getPrivateSettingSync("DEMO");
@@ -69,7 +108,8 @@ function initRotationRateLimiter() {
   if (rotationRateLimiter) return rotationRateLimiter;
 
   const secret = getPrivateSettingSync("JWT_SECRET_KEY") as string;
-  if (!secret && !dev) {
+  const isTestMode = process.env.TEST_MODE === "true" || process.env.NODE_ENV === "test";
+  if (!secret && !dev && !isTestMode) {
     logger.error(
       "CRITICAL: JWT_SECRET_KEY is missing in production. Rate limiting will be unreliable.",
     );
@@ -94,13 +134,8 @@ interface SessionCacheEntry {
   user: User;
 }
 
-const sessionCache = new Map<string, WeakRef<SessionCacheEntry>>();
-const sessionCacheRegistry = new FinalizationRegistry<string>((sessionId) => {
-  sessionCache.delete(sessionId);
-});
-
-const MAX_STRONG_REFS = 100;
-const strongRefs = new Map<string, SessionCacheEntry>();
+const MAX_SESSION_CACHE = 10_000;
+const sessionCache = new Map<string, SessionCacheEntry>();
 const lastRefreshAttempt = new Map<string, number>();
 const lastRotationAttempt = new Map<string, number>();
 
@@ -110,58 +145,43 @@ const lastRotationAttempt = new Map<string, number>();
  */
 const SESSION_ROTATION_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes — per industry best practice
 
-const pendingDemoTenants = new Map<string, string>();
 const negativeCache = new BloomFilter(100000, 0.0001); // 2392x speedup for repeat misses
 
 /**
- * Gets a session from the cache, handling WeakRef dereferencing.
+ * Gets a session from the cache (LRU eviction, no WeakRef).
  */
 function getSessionFromCache(sessionId: string): SessionCacheEntry | null {
   const now = Date.now();
-  const strongRef = strongRefs.get(sessionId);
-  if (strongRef && now - strongRef.timestamp < SESSION_CACHE_TTL_MS) {
-    return strongRef;
-  }
-  const weakRef = sessionCache.get(sessionId);
-  if (weakRef) {
-    const entry = weakRef.deref();
-    if (entry && now - entry.timestamp < SESSION_CACHE_TTL_MS) {
-      addToStrongRefs(sessionId, entry);
-      return entry;
-    }
+  const entry = sessionCache.get(sessionId);
+  if (entry && now - entry.timestamp < SESSION_CACHE_TTL_MS) {
+    // Move to end (most recently used)
+    sessionCache.delete(sessionId);
+    sessionCache.set(sessionId, entry);
+    return entry;
   }
   return null;
 }
 
 /**
- * Sets a session in the cache with WeakRef.
+ * Sets a session in the cache with LRU eviction.
  */
 function setSessionInCache(sessionId: string, entry: SessionCacheEntry): void {
-  addToStrongRefs(sessionId, entry);
-  const weakRef = new WeakRef(entry);
-  sessionCache.set(sessionId, weakRef);
-  sessionCacheRegistry.register(entry, sessionId);
-}
-
-/**
- * Adds/updates a session in the strong reference LRU cache.
- */
-function addToStrongRefs(sessionId: string, entry: SessionCacheEntry): void {
-  if (strongRefs.has(sessionId)) strongRefs.delete(sessionId);
-  strongRefs.set(sessionId, entry);
-  if (strongRefs.size > MAX_STRONG_REFS) {
-    const firstKey = strongRefs.keys().next().value;
-    if (firstKey) strongRefs.delete(firstKey);
+  if (sessionCache.has(sessionId)) sessionCache.delete(sessionId);
+  sessionCache.set(sessionId, entry);
+  if (sessionCache.size > MAX_SESSION_CACHE) {
+    const firstKey = sessionCache.keys().next().value;
+    if (firstKey) sessionCache.delete(firstKey);
   }
 }
 
-// Periodic cleanup
-if (typeof setInterval !== "undefined") {
-  setInterval(
+// Periodic cleanup — guarded against duplicate timers on HMR reload
+const SESSION_CLEANUP_KEY = "__svelty_session_cleanup__";
+if (typeof setInterval !== "undefined" && !(globalThis as any)[SESSION_CLEANUP_KEY]) {
+  (globalThis as any)[SESSION_CLEANUP_KEY] = setInterval(
     () => {
       const now = Date.now();
-      for (const [sessionId, data] of strongRefs.entries()) {
-        if (now - data.timestamp > SESSION_CACHE_TTL_MS) strongRefs.delete(sessionId);
+      for (const [sessionId, data] of sessionCache.entries()) {
+        if (now - data.timestamp > SESSION_CACHE_TTL_MS) sessionCache.delete(sessionId);
       }
       for (const [sessionId, timestamp] of lastRefreshAttempt.entries()) {
         if (now - timestamp > 300_000) lastRefreshAttempt.delete(sessionId);
@@ -185,12 +205,26 @@ async function getUserFromSession(
   tenantId?: DatabaseId | null,
 ): Promise<User | null> {
   // --- Performance Tweak: Negative Caching ---
-  if (negativeCache.has(sessionId)) return null;
+  const isTestMode = process.env.TEST_MODE === "true";
+  if (!isTestMode && negativeCache.has(sessionId)) return null;
 
   const now = Date.now();
   const memCached = getSessionFromCache(sessionId);
   if (memCached) {
     return memCached.user;
+  }
+
+  // Fallback to checking the default SessionStore (holds active in-memory/Redis sessions)
+  try {
+    const { getDefaultSessionStore } = await import("@src/databases/auth/session-manager");
+    const store = getDefaultSessionStore();
+    const storedUser = await store.get(sessionId as DatabaseId);
+    if (storedUser) {
+      setSessionInCache(sessionId, { user: storedUser, timestamp: now });
+      return storedUser;
+    }
+  } catch (err: any) {
+    logger.trace(`SessionStore lookup failed: ${err.message}`);
   }
 
   try {
@@ -205,7 +239,7 @@ async function getUserFromSession(
   }
 
   const lastAttempt = lastRefreshAttempt.get(sessionId);
-  if (lastAttempt && now - lastAttempt < 60_000) {
+  if (!isTestMode && lastAttempt && now - lastAttempt < 60_000) {
     return null;
   }
 
@@ -223,14 +257,16 @@ async function getUserFromSession(
     const sessionResult = await adapter.auth.getSessionTokenData(sessionId as any);
 
     if (!sessionResult?.success) {
-      lastRefreshAttempt.delete(sessionId);
-      logger.warn(
-        `[Auth] Transient session validation error for ${sessionId}: ${sessionResult?.message || "Unknown"}`,
+      logger.debug(
+        `[Auth] getSessionTokenData unsuccessful for sessionId=${sessionId.slice(0, 12)}...`,
       );
       return null;
     }
 
     if (!sessionResult.data) {
+      logger.debug(
+        `[Auth] getSessionTokenData returned null data for sessionId=${sessionId.slice(0, 12)}...`,
+      );
       negativeCache.add(sessionId);
       return null;
     }
@@ -249,7 +285,7 @@ async function getUserFromSession(
       if (userResult.data) {
         const user = userResult.data;
         logger.debug(
-          `[Auth] Session validated: ${sessionId.slice(0, 8)}... → user ${(user as any).email}`,
+          `[Auth] Session validated: ${sessionId.slice(0, 8)}... → user ${maskEmail((user as any).email)}`,
         );
         const sessionData: SessionCacheEntry = { user, timestamp: now };
         setSessionInCache(sessionId, sessionData);
@@ -313,13 +349,11 @@ async function handleSessionRotation(
 
     if (newSession && newSession._id !== oldSessionId) {
       const newSessionId = newSession._id;
-      const isProd = !dev && process.env.TEST_MODE !== "true";
-      const isSecure =
-        event.url.protocol === "https:" || (event.url.hostname !== "localhost" && isProd);
+      const isSecure = isSecureCookieContext(event.url.protocol, event.url.hostname);
       const cookieName = getSessionCookieName(isSecure);
 
       event.cookies.set(cookieName, newSessionId, {
-        path: "/",
+        path: getCookiePath(),
         httpOnly: true,
         secure: isSecure,
         sameSite: isSecure ? "strict" : "lax",
@@ -339,61 +373,80 @@ async function handleSessionRotation(
 }
 
 /**
+ * Determines the secure cookie name for demo tenant identification.
+ * Uses __Host- prefix on HTTPS per RFC 6265bis for subdomain isolation.
+ */
+function getDemoTenantCookieName(isSecure: boolean): string {
+  return isSecure ? "__Host-demo_tenant_id" : "demo_tenant_id";
+}
+
+/**
+ * Reads DEMO_TTL from public settings (default: 60 minutes).
+ * Returns the TTL in seconds for cookie maxAge.
+ */
+function getDemoTTLSeconds(): number {
+  try {
+    const demoTTL = Number(getPublicSettingSync("DEMO_TTL")) || 60;
+    return demoTTL * 60; // Convert minutes to seconds
+  } catch {
+    return 3600; // Default: 60 minutes
+  }
+}
+
+/**
  * Handles automatic demo tenant generation and seeding.
+ * Each visitor gets their own unique tenantId — no hostname-based dedup.
  */
 async function handleDemoTenantAssignment(event: RequestEvent, isUserPresent: boolean) {
   const { cookies, url, locals } = event;
-  const tenantIdFromCookie = cookies.get("demo_tenant_id") || null;
+  const isSecure = url.protocol === "https:";
+  const cookieName = getDemoTenantCookieName(isSecure);
+  const tenantIdFromCookie =
+    cookies.get(cookieName) ||
+    // Also check the unprefixed variant for backward compat
+    (!isSecure ? null : cookies.get("demo_tenant_id")) ||
+    null;
 
   if (tenantIdFromCookie) {
     locals.tenantId = tenantIdFromCookie as DatabaseId;
     return;
   }
 
+  // If user has a session cookie but no user is present, skip assignment
   if (
     (cookies.get(SESSION_COOKIE_NAME) || cookies.get(`__Host-${SESSION_COOKIE_NAME}`)) &&
     !isUserPresent
   )
     return;
 
-  const sessionKey = url.hostname;
-  const existing = pendingDemoTenants.get(sessionKey);
-  let tenantId: string;
+  // Generate a unique tenantId per visitor — no shared dedup
+  const tenantId = crypto.randomUUID();
 
-  if (existing) {
-    tenantId = existing;
-  } else {
-    tenantId = crypto.randomUUID();
-    pendingDemoTenants.set(sessionKey, tenantId);
-    setTimeout(() => pendingDemoTenants.delete(sessionKey), 10_000);
-
-    try {
-      const { seedDemoTenant } = await import("@src/routes/setup/seed");
-      await seedDemoTenant(dbAdapter!, tenantId);
-    } catch (e) {
-      logger.error(`Failed to seed demo tenant ${tenantId}:`, e);
-    }
-  }
-
-  cookies.set("demo_tenant_id", tenantId, {
-    path: "/",
+  // SET COOKIE FIRST (before async seeding) to prevent race conditions
+  // where sign-up arrives mid-seed and generates a different tenantId.
+  const maxAge = getDemoTTLSeconds();
+  cookies.set(cookieName, tenantId, {
+    path: getCookiePath(),
     httpOnly: true,
-    secure: url.protocol === "https:",
-    sameSite: "lax",
-    maxAge: 3600,
+    secure: isSecure,
+    sameSite: "strict",
+    maxAge,
   });
   locals.tenantId = tenantId as DatabaseId;
+
+  // Fire-and-forget seeding — cookie is already set, user can proceed
+  try {
+    const { seedDemoTenant } = await import("@src/routes/setup/seed");
+    await seedDemoTenant(dbAdapter!, tenantId);
+  } catch (e) {
+    logger.error(`Failed to seed demo tenant ${tenantId}:`, e);
+  }
 }
 
 // --- MAIN HOOK ---
 
 export const handleAuthentication: Handle = async ({ event, resolve }) => {
   const { locals, url, cookies } = event;
-
-  // 🧪 TEST MODE BYPASS: Verified early in pipeline, skip everything else
-  if ((locals as any).__testBypass === true) {
-    return await resolve(event);
-  }
 
   // 🚀 TURBO GET FAST-PATH: Auth context already resolved by handleTurboGet.
   // User, roles, tenantId, and bitset are pre-injected — skip session validation entirely.
@@ -406,8 +459,7 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
   if (flags.isStatic) return resolve(event);
 
   // ── Compute cookie config once (used by turbo check + normal flow) ─────
-  const isProd = !dev && process.env.TEST_MODE !== "true";
-  const isSecure = url.protocol === "https:" || (url.hostname !== "localhost" && isProd);
+  const isSecure = isSecureCookieContext(url.protocol, url.hostname);
   const cookieName = getSessionCookieName(isSecure);
 
   // 🚀 UNIVERSAL TURBO AUTH: Check session → turbo auth cache BEFORE any
@@ -418,14 +470,16 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
     cookies.get(SESSION_COOKIE_NAME) ||
     cookies.get(`__Host-${SESSION_COOKIE_NAME}`) ||
     cookies.get(`__Secure-${SESSION_COOKIE_NAME}`);
-  if (turboSessionId) {
+  // 🛡️ Turbo-auth only for safe methods — mutations must go through CSRF
+  const method = event.request.method;
+  if (turboSessionId && (method === "GET" || method === "HEAD" || method === "OPTIONS")) {
     const turboCtx = turboAuthCache.get(turboSessionId);
     // 🛡️ Absolute expiry — never slides on access. Prevents timing attacks
     // that infer session liveness from TTL reset patterns.
     if (turboCtx && Date.now() < turboCtx.expiresAt) {
       (locals as any).user = turboCtx.user;
       (locals as any).roles = turboCtx.roles;
-      (locals as any).tenantId = turboCtx.tenantId || locals.tenantId;
+      (locals as any).tenantId = turboCtx.tenantId ?? locals.tenantId;
       (locals as any).__turboAuth = true;
       return await resolve(event);
     }
@@ -458,7 +512,9 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
   if (isSystemUser) return resolve(event);
 
   try {
+    // Raw adapter first; re-bound after tenant resolution (forTenant inject).
     locals.dbAdapter = dbAdapter;
+    (locals as any).dbAdapterUnscoped = dbAdapter;
     if (!dbAdapter) return await resolve(event);
 
     const { multiTenant, isDemoMode } = getCachedSettings();
@@ -476,6 +532,32 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
       }
     }
 
+    // TEST_MODE: allow black-box multi-tenant isolation tests without flipping
+    // MULTI_TENANT for the whole process. Header is ignored outside test/benchmark.
+    const testMode =
+      process.env.TEST_MODE === "true" ||
+      process.env.PLAYWRIGHT_TEST === "true" ||
+      process.env.BENCHMARK === "true";
+    if (testMode) {
+      const explicitTenant = event.request.headers.get("x-test-tenant-id");
+      if (explicitTenant && explicitTenant.length > 0 && explicitTenant !== "null") {
+        locals.tenantId = explicitTenant as DatabaseId;
+      }
+    }
+
+    // 🛡️ Request-scoped tenant binding (early — refined after session/user load).
+    // System/scheduler: use locals.dbAdapterUnscoped + bypassTenantCheck.
+    {
+      const { bindRequestDbAdapter } = await import("@src/databases/tenant-adapter");
+      const bound = bindRequestDbAdapter(
+        dbAdapter,
+        locals.tenantId as DatabaseId,
+        multiTenant || testMode,
+      );
+      locals.dbAdapter = bound.dbAdapter as any;
+      (locals as any).dbAdapterUnscoped = bound.dbAdapterUnscoped;
+    }
+
     const authHeader = event.request.headers.get("Authorization");
     // Accept whichever session cookie variant the auth layer issued. This keeps
     // local/test traffic on 127.0.0.1 compatible with secure-prefixed cookies.
@@ -485,133 +567,334 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
       cookies.get(`__Host-${SESSION_COOKIE_NAME}`) ||
       cookies.get(`__Secure-${SESSION_COOKIE_NAME}`);
     if (sessionId) {
-      metricsService.incrementAuthValidations();
-      if (!auth) {
-        logger.warn(`[Auth] Auth service NOT initialized! (sessionId: ${sessionId})`);
-        return await resolve(event);
-      }
+      // 🛡️ Guard: wrap session validation in try-catch so malformed/invalid session
+      // cookies don't crash the server (integration tests inject poisoned values).
+      try {
+        logger.debug(`[Auth] SESSION: ${sessionId.slice(0, 12)}... path=${event.url.pathname}`);
+        metricsService.incrementAuthValidations();
+        if (!auth) {
+          logger.warn(`[Auth] Auth service NOT initialized! (sessionId: ${sessionId})`);
+          return await resolve(event);
+        }
 
-      const user = await getUserFromSession(sessionId as string, locals.tenantId as DatabaseId);
+        const user = await getUserFromSession(sessionId as string, locals.tenantId as DatabaseId);
+        logger.debug(
+          `[Auth] getUserFromSession: ${user ? "FOUND " + maskEmail(user.email) + " (" + user.role + ")" : "NULL"} path=${event.url.pathname} tenantId=${locals.tenantId}`,
+        );
 
-      if (isDemoMode && !locals.tenantId && !user) {
-        await handleDemoTenantAssignment(event, !!user);
-        generateCsrfToken(cookies, isSecure);
-      }
+        if (isDemoMode && !locals.tenantId && !user) {
+          await handleDemoTenantAssignment(event, !!user);
+          generateCsrfToken(cookies, isSecure);
+        }
 
-      if (user) {
-        // --- NEW: Global Admin Exemption ---
-        // Global admins (no tenantId) are authorized to access any tenant path.
-        const isGlobalAdmin = !user.tenantId || user.tenantId === null;
-        if (
-          locals.tenantId &&
-          !isGlobalAdmin &&
-          user.tenantId &&
-          user.tenantId !== locals.tenantId
-        ) {
-          logger.warn(`[Auth] Tenant mismatch: local=${locals.tenantId}, user=${user.tenantId}`, {
-            sessionId,
+        if (user) {
+          // --- NEW: Global Admin Exemption ---
+          // Global admins (no tenantId) are authorized to access any tenant path.
+          const isGlobalAdmin = !user.tenantId || user.tenantId === null;
+          if (
+            locals.tenantId &&
+            !isGlobalAdmin &&
+            user.tenantId &&
+            user.tenantId !== locals.tenantId
+          ) {
+            logger.warn(`[Auth] Tenant mismatch: local=${locals.tenantId}, user=${user.tenantId}`, {
+              sessionId,
+            });
+            metricsService.incrementAuthFailures();
+            cookies.delete(SESSION_COOKIE_NAME, { path: getCookiePath() });
+            throw new AppError("Tenant isolation violation", 403, "FORBIDDEN_TENANT");
+          }
+          locals.user = user;
+          locals.session_id = sessionId as DatabaseId;
+          locals.permissions = user.permissions || [];
+          // Prefer host/header tenant; if only user.tenantId is set, bind that for MT.
+          if (!locals.tenantId && user.tenantId) {
+            locals.tenantId = user.tenantId as DatabaseId;
+          }
+          if ((multiTenant || testMode) && locals.tenantId) {
+            const { bindRequestDbAdapter } = await import("@src/databases/tenant-adapter");
+            const bound = bindRequestDbAdapter(
+              (locals as any).dbAdapterUnscoped || dbAdapter,
+              locals.tenantId as DatabaseId,
+              true,
+            );
+            locals.dbAdapter = bound.dbAdapter as any;
+          }
+          await handleSessionRotation(event, user, sessionId);
+        } else {
+          logger.warn(`[Auth] Invalid session or user not found: ${sessionId}`, {
+            cookieName,
+            hasSession: !!sessionId,
+            authInitialized: !!auth,
+            tenantId: locals.tenantId,
           });
           metricsService.incrementAuthFailures();
-          cookies.delete(SESSION_COOKIE_NAME, { path: "/" });
-          throw new AppError("Tenant isolation violation", 403, "FORBIDDEN_TENANT");
+          // Returning user: a session cookie was present but is no longer valid → this browser has
+          // signed in before. Flag it (the login page defaults to the Sign In form) before deleting
+          // the dead cookie.
+          (locals as any).returningUser = true;
+          cookies.delete(cookieName, { path: getCookiePath() });
         }
-        locals.user = user;
-        locals.session_id = sessionId as DatabaseId;
-        locals.permissions = user.permissions || [];
-        await handleSessionRotation(event, user, sessionId);
-      } else {
-        logger.warn(`[Auth] Invalid session or user not found: ${sessionId}`, {
-          cookieName,
-          hasSession: !!sessionId,
-          authInitialized: !!auth,
-          tenantId: locals.tenantId,
-        });
+      } catch (err: unknown) {
+        // Intentional security failures (tenant isolation, etc.) must surface as
+        // 403/AppError — never soft-convert them into anonymous 200s.
+        if (isAppError(err)) throw err;
+
+        // 🛡️ Hardened: unexpected validation crashes (malformed cookie, DB blip,
+        // service unavailable) are non-fatal. Log, clear the bad cookie, and
+        // continue as unauthenticated rather than crashing the request.
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          `[Auth] Session validation failed for ${sessionId?.slice(0, 12) || "unknown"}: ${message}`,
+          {
+            cookieName,
+            error: message,
+            tenantId: locals.tenantId,
+          },
+        );
         metricsService.incrementAuthFailures();
-        // Returning user: a session cookie was present but is no longer valid → this browser has
-        // signed in before. Flag it (the login page defaults to the Sign In form) before deleting
-        // the dead cookie.
         (locals as any).returningUser = true;
-        cookies.delete(cookieName, { path: "/" });
+        try {
+          cookies.delete(cookieName, { path: getCookiePath() });
+        } catch {
+          // Cookie delete is best-effort
+        }
       }
+    } else {
+      logger.debug(`[Auth] NO cookie found. path=${event.url.pathname} cookieName=${cookieName}`);
     }
 
     // 3. API Token Authentication (Bearer) - Hardened for 2026 Retro-compatibility
     if (!locals.user && authHeader?.startsWith("Bearer ")) {
       const tokenValue = authHeader.substring(7).trim();
       if (tokenValue) {
-        // --- Performance Tweak: Negative Caching ---
-        if (negativeCache.has(tokenValue)) return await resolve(event);
+        if (isValidApiKeyFormat(tokenValue)) {
+          // --- API Key Authentication (sck_...) ---
+          const hashes = hashApiKeyWithLegacy(tokenValue);
+          const hash = hashes.current;
+          const legacyHash = hashes.legacy;
+          if (isApiKeyAuthNegativeHit(hash, locals.tenantId as DatabaseId)) {
+            return await resolve(event);
+          }
 
-        // --- Performance Tweak: Positive Caching ---
-        const cacheKey = `apitoken:${tokenValue}`;
-        const cachedToken = cacheService.getSync<{ user: any; tenantId: string }>(
-          cacheKey,
-          locals.tenantId as DatabaseId,
-        );
+          const cachedKeyData = getApiKeyAuthCacheSync(hash, locals.tenantId as DatabaseId);
 
-        if (cachedToken) {
-          locals.user = cachedToken.user;
-          locals.permissions = cachedToken.user.permissions;
-          locals.tenantId = (cachedToken.tenantId as DatabaseId) || locals.tenantId;
-          logger.debug(`[Auth] Authenticated via API Token (Cache Hit)`);
-        } else {
-          metricsService.incrementAuthValidations();
-          const res = await dbAdapter.system.websiteTokens.getByToken(tokenValue);
+          if (cachedKeyData) {
+            locals.user = cachedKeyData.user as unknown as User;
+            locals.permissions = cachedKeyData.user.permissions as string[];
+            locals.tenantId = (cachedKeyData.tenantId as DatabaseId) || locals.tenantId;
+            logger.debug(`[Auth] Authenticated via API Key (Cache Hit)`);
 
-          if (res.success && res.data) {
-            const token = res.data;
-
-            // 1. Expiry Check
-            if (token.expiresAt && new Date(token.expiresAt) < new Date()) {
-              logger.warn(`[Auth] API Token expired: ${token.name}`);
-              metricsService.incrementAuthFailures();
-            } else {
-              // 2. Normalization (Retro-compatibility)
-              // If type is missing, normalize to 'content-api'
-              const tokenType = token.type || "content-api";
-
-              // 3. Tenant Isolation Check
-              if (token.tenantId && locals.tenantId && token.tenantId !== locals.tenantId) {
-                logger.warn(`[Auth] API Token tenant mismatch: ${token.name}`);
-                metricsService.incrementAuthFailures();
-                return await resolve(event);
-              }
-
-              // 4. Orphaned check & Virtual User building
-              // We skip fetching the full creator user to avoid redundant getById calls (as requested)
-              // SveltyCMS API tokens carry their own permissions as source of truth.
-              locals.user = {
-                _id: `token:${token._id}`,
-                email: `token@api.local`,
-                username: token.name,
-                role: tokenType === "admin-api" ? "admin" : "guest",
-                permissions: token.permissions || [],
-                tenantId: token.tenantId ?? (event.locals.tenantId as any),
-                isApiToken: true,
-              } as any;
-
-              locals.permissions = token.permissions || [];
-              locals.tenantId = (token.tenantId as DatabaseId) || locals.tenantId;
-
-              // Cache the verified token for 60 seconds to bypass DB hits
-              cacheService
-                .setWithCategory(
-                  cacheKey,
-                  { user: locals.user, tenantId: locals.tenantId as string },
-                  CacheCategory.GENERAL,
-                  locals.tenantId as DatabaseId,
-                  60, // TTL in seconds
-                )
-                .catch((err: any) => logger.warn(`Failed to cache API token: ${err.message}`));
-
-              logger.debug(`[Auth] Authenticated via API Token: ${token.name} (${tokenType})`);
-            }
+            // Fire-and-forget: update usage statistics in the background
+            // getClientIp uses platform address only — never trust raw X-Forwarded-For
+            const clientIp = getClientIp(event);
+            dbAdapter.auth
+              .updateApiKeyUsage(
+                (cachedKeyData.user._id as string).replace("apikey:", "") as DatabaseId,
+                clientIp,
+                {
+                  tenantId: locals.tenantId,
+                },
+              )
+              .catch(() => {});
           } else {
-            negativeCache.add(tokenValue);
-            metricsService.incrementAuthFailures();
-            logger.warn(`[Auth] Invalid or non-existent API Token provided`);
+            metricsService.incrementAuthValidations();
+            let res = await dbAdapter.auth.getApiKey(hash, {
+              tenantId: locals.tenantId,
+            });
+            // Fallback: try legacy SHA-256 hash for keys created before HMAC migration
+            if (!res.success && legacyHash !== hash) {
+              res = await dbAdapter.auth.getApiKey(legacyHash, {
+                tenantId: locals.tenantId,
+              });
+            }
+            if (res.success && res.data) {
+              const apiKey = res.data;
+
+              // 1. Expiry Check
+              if (apiKey.expiresAt && new Date(apiKey.expiresAt) < new Date()) {
+                logger.warn(`[Auth] API Key expired: ${apiKey.name}`);
+                metricsService.incrementAuthFailures();
+              } else if (apiKey.revoked) {
+                logger.warn(`[Auth] API Key is revoked: ${apiKey.name}`);
+                metricsService.incrementAuthFailures();
+              } else {
+                // 2. Tenant Isolation Check
+                if (apiKey.tenantId && locals.tenantId && apiKey.tenantId !== locals.tenantId) {
+                  logger.warn(`[Auth] API Key tenant mismatch: ${apiKey.name}`);
+                  metricsService.incrementAuthFailures();
+                  return await resolve(event);
+                }
+
+                // 3. Construct virtual API user
+                locals.user = {
+                  _id: `apikey:${apiKey._id}`,
+                  email: `apikey@api.local`,
+                  username: apiKey.name,
+                  role: "guest",
+                  permissions: apiKey.permissions || [],
+                  tenantId: apiKey.tenantId ?? (event.locals.tenantId as any),
+                  isApiKey: true,
+                  scopes: apiKey.scopes || [],
+                } as any;
+
+                locals.permissions = apiKey.permissions || [];
+                locals.tenantId = (apiKey.tenantId as DatabaseId) || locals.tenantId;
+
+                setApiKeyAuthCache(
+                  hash,
+                  {
+                    user: locals.user as unknown as Record<string, unknown>,
+                    tenantId: locals.tenantId as string,
+                  },
+                  String(apiKey._id),
+                  locals.tenantId as DatabaseId,
+                ).catch((err: any) => logger.warn(`Failed to cache API Key: ${err.message}`));
+
+                // Fire-and-forget: update usage count and last used IP
+                // getClientIp uses platform address only — never trust raw X-Forwarded-For
+                const clientIp = getClientIp(event);
+                dbAdapter.auth
+                  .updateApiKeyUsage(apiKey._id, clientIp, {
+                    tenantId: locals.tenantId,
+                  })
+                  .catch(() => {});
+
+                logger.debug(`[Auth] Authenticated via API Key: ${apiKey.name}`);
+              }
+            } else {
+              recordApiKeyAuthMiss(hash, locals.tenantId as DatabaseId);
+              metricsService.incrementAuthFailures();
+              logger.warn(`[Auth] Invalid or non-existent API Key provided`);
+            }
+          }
+        } else {
+          // --- Website Token / Retro-compatibility token ---
+          const tokenHash = hashCredentialSha256HexSync(tokenValue);
+          if (isWebsiteTokenAuthNegativeHit(tokenHash, locals.tenantId as DatabaseId)) {
+            return await resolve(event);
+          }
+
+          const cachedToken = getWebsiteTokenAuthCacheSync(
+            tokenHash,
+            locals.tenantId as DatabaseId,
+          );
+
+          if (cachedToken) {
+            locals.user = cachedToken.user as unknown as User;
+            locals.permissions = cachedToken.user.permissions as string[];
+            locals.tenantId = (cachedToken.tenantId as DatabaseId) || locals.tenantId;
+            logger.debug(`[Auth] Authenticated via API Token (Cache Hit)`);
+          } else {
+            metricsService.incrementAuthValidations();
+            const res = await dbAdapter.system.websiteTokens.getByTokenHash(tokenHash, {
+              tenantId: locals.tenantId as DatabaseId,
+              // Auth bootstrap: allow lookup when tenant not yet resolved (single-tenant)
+              ...(locals.tenantId ? {} : { bypassTenantCheck: true }),
+            });
+
+            if (res.success && res.data) {
+              const token = res.data;
+
+              // 1. Expiry Check
+              if (token.expiresAt && new Date(token.expiresAt) < new Date()) {
+                logger.warn(`[Auth] API Token expired: ${token.name}`);
+                metricsService.incrementAuthFailures();
+              } else {
+                // 2. Normalization (Retro-compatibility)
+                // If type is missing, normalize to 'content-api'
+                const tokenType = token.type || "content-api";
+
+                // 3. Tenant Isolation Check
+                if (token.tenantId && locals.tenantId && token.tenantId !== locals.tenantId) {
+                  logger.warn(`[Auth] API Token tenant mismatch: ${token.name}`);
+                  metricsService.incrementAuthFailures();
+                  return await resolve(event);
+                }
+
+                // 4. Orphaned check & Virtual User building
+                locals.user = {
+                  _id: `token:${token._id}`,
+                  email: `token@api.local`,
+                  username: token.name,
+                  role: tokenType === "admin-api" ? "admin" : "guest",
+                  permissions: token.permissions || [],
+                  tenantId: token.tenantId ?? (event.locals.tenantId as any),
+                  isApiToken: true,
+                } as any;
+
+                locals.permissions = token.permissions || [];
+                locals.tenantId = (token.tenantId as DatabaseId) || locals.tenantId;
+
+                setWebsiteTokenAuthCache(
+                  tokenHash,
+                  {
+                    user: locals.user as unknown as Record<string, unknown>,
+                    tenantId: locals.tenantId as string,
+                  },
+                  String(token._id),
+                  locals.tenantId as DatabaseId,
+                ).catch((err: any) => logger.warn(`Failed to cache API token: ${err.message}`));
+
+                logger.debug(`[Auth] Authenticated via API Token: ${token.name} (${tokenType})`);
+              }
+            } else {
+              recordWebsiteTokenAuthMiss(tokenHash, locals.tenantId as DatabaseId);
+              metricsService.incrementAuthFailures();
+              logger.warn(`[Auth] Invalid or non-existent API Token provided`);
+            }
           }
         }
+      }
+    }
+
+    // Ephemeral Guest Authentication for public API endpoints
+    const hasAuthAttempt =
+      !!authHeader ||
+      cookies.get(cookieName) ||
+      cookies.get(SESSION_COOKIE_NAME) ||
+      cookies.get(`__Host-${SESSION_COOKIE_NAME}`) ||
+      cookies.get(`__Secure-${SESSION_COOKIE_NAME}`);
+
+    // Skip ephemeral guest creation for test-mode requests — they should hit the real 401 path
+    const testSecret = event.request.headers.get("x-test-secret");
+    if (!locals.user && !hasAuthAttempt && !testSecret) {
+      const isPublicPath =
+        url.pathname.startsWith("/api/collections") ||
+        url.pathname.startsWith("/api/query") ||
+        url.pathname.startsWith("/api/graphql") ||
+        url.pathname.startsWith("/api/media");
+
+      const isAllowedMethod =
+        event.request.method === "GET" ||
+        event.request.method === "OPTIONS" ||
+        (event.request.method === "POST" && url.pathname === "/api/graphql");
+
+      if (isPublicPath && isAllowedMethod) {
+        locals.user = {
+          _id: "anonymous",
+          email: "anonymous@svelty.local",
+          username: "Anonymous Guest",
+          role: "guest",
+          permissions: [
+            "collections:read",
+            "api:collections",
+            "api:media",
+            "media:read",
+            "graphql:read",
+            "api:graphql",
+          ],
+          tenantId: locals.tenantId || null,
+          isAnonymous: true,
+        } as any;
+        locals.permissions = [
+          "collections:read",
+          "api:collections",
+          "api:media",
+          "media:read",
+          "graphql:read",
+          "api:graphql",
+        ];
       }
     }
 
@@ -622,7 +905,15 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
         permissions: locals.permissions,
         requestId: locals.requestId,
       },
-      () => resolve(event),
+      async () => {
+        // Full async tree can use getRequestDbAdapter() when tenant-bound.
+        const bound = locals.dbAdapter as any;
+        if (bound && typeof bound === "object" && "boundTenantId" in bound) {
+          const { runWithTenantAdapter } = await import("@src/databases/tenant-adapter");
+          return runWithTenantAdapter(bound, () => resolve(event));
+        }
+        return resolve(event);
+      },
     );
   } catch (err) {
     if (url.pathname.startsWith("/api/")) return handleApiError(err, event);
@@ -635,13 +926,30 @@ export const handleAuthentication: Handle = async ({ event, resolve }) => {
 
 export function invalidateSessionCache(sessionId: string, tenantId?: DatabaseId | null): void {
   sessionCache.delete(sessionId);
-  strongRefs.delete(sessionId);
   lastRefreshAttempt.delete(sessionId);
   lastRotationAttempt.delete(sessionId);
 
   // 🚀 Turbo GET: Also invalidate the auth context cache so a revoked
   // session can't access cached API responses within the TTL window.
   invalidateTurboAuthContext(sessionId);
+
+  // Invalidate global SessionStore
+  try {
+    const { getDefaultSessionStore } = require("@src/databases/auth/session-manager");
+    const store = getDefaultSessionStore();
+    if (store && typeof store.delete === "function") {
+      store.delete(sessionId as DatabaseId).catch(() => {});
+    }
+  } catch (e) {
+    // Dynamic fallback for non-CommonJS context
+    void e;
+    import("@src/databases/auth/session-manager")
+      .then((mod) => {
+        const store = mod.getDefaultSessionStore();
+        if (store) store.delete(sessionId as DatabaseId).catch(() => {});
+      })
+      .catch(() => {});
+  }
 
   const cacheKey = tenantId ? `session:${tenantId}:${sessionId}` : `session:${sessionId}`;
   cacheService.delete(cacheKey, tenantId ?? undefined).catch(() => {});
@@ -657,7 +965,6 @@ export function forceSessionRotation(sessionId: string): void {
 
 export function clearAllSessionCaches(): void {
   sessionCache.clear();
-  strongRefs.clear();
   lastRefreshAttempt.clear();
   lastRotationAttempt.clear();
   negativeCache.clear();
@@ -677,10 +984,9 @@ export function primeSessionMemoryCache(sessionId: string, user: User): void {
 
 export function getSessionCacheStats() {
   return {
-    weakRefs: sessionCache.size,
-    strongRefs: strongRefs.size,
+    cachedSessions: sessionCache.size,
     pendingRefreshes: lastRefreshAttempt.size,
     pendingRotations: lastRotationAttempt.size,
-    maxStrongRefs: MAX_STRONG_REFS,
+    maxCachedSessions: MAX_SESSION_CACHE,
   };
 }

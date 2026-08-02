@@ -7,27 +7,53 @@
  * per IP with configurable limits.
  *
  * ### Features:
- * - Per-IP sliding window rate limiting
+ * - Per-IP + per-tenant-hostname sliding window rate limiting
+ * - **Two-tier token buckets**: per-IP (fine-grained) + per-tenant (aggregate)
+ * - Per-tenant limit defaults to 10x the per-IP limit, preventing noisy-tenant starvation
+ * - Sync client-key hashing (no async wasm on mutation hot path)
  * - Adaptive cost multiplier from SystemMonitor (0.8x idle → 2.0x critical)
  * - Mutation rejection when heap > 90%
- * - Returns 429 with Retry-After + X-RateLimit-* headers
+ * - Content-negotiated 429: JSON for `/api/*` + Accept: json, HTML for browsers
  * - Skips setup/health/POST-only public paths
  * - Zero external dependencies (in-memory tracking)
  *
  * ### Security:
+ * - Client IP via `getClientIp()` / `event.getClientAddress()` only — never trust
+ *   raw `X-Forwarded-For` from the client (proxy must set address adapter)
  * - Fail-open: if SystemMonitor is unavailable, uses baseline 1.0x multiplier
  * - No PII stored: only hashed IPs in the tracking map
  * - Auto-cleanup: expired entries pruned every 60s
+ * - Mutable header injection via `withMutableHeaders` (immutable Response safety)
  */
 
-import type { Handle } from "@sveltejs/kit";
+import type { Handle, RequestEvent } from "@sveltejs/kit";
 import { logger } from "@utils/logger";
+import { renderRateLimitPage } from "@utils/rate-limit-page";
+import {
+  getClientIp,
+  getRequestFlags,
+  prefersJsonResponse,
+  withMutableHeaders,
+  IS_TEST_MODE,
+} from "@utils/hook-utils";
+import { getTenantIdFromHostname, isMultiTenantEnabled } from "@utils/tenant";
+import {
+  getPressureMultiplier,
+  shouldRejectMutations,
+  startSystemMonitor,
+} from "@utils/system-monitor";
+import { applyAllSecurityHeaders } from "./handle-security-headers";
+import { getMasterSecret, timingSafeEqual } from "@utils/test-bypass.server";
+
+// Eager start — snapshot loop runs in background; hot path stays fully sync
+startSystemMonitor();
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
-// Default: 100 requests per 60s window per IP
 const DEFAULT_WINDOW_MS = 60_000;
-const DEFAULT_MAX_REQUESTS = 100;
+const DEFAULT_MAX_REQUESTS = process.env.NODE_ENV !== "production" ? 1000 : 100;
+const DEFAULT_TENANT_MAX_REQUESTS = DEFAULT_MAX_REQUESTS * 10;
+const MAX_TRACKED_BUCKETS = 10000;
 const CLEANUP_INTERVAL_MS = 60_000;
 
 // Paths excluded from rate limiting
@@ -36,7 +62,7 @@ const EXCLUDED_PREFIXES = [
   "/api/system/health",
   "/favicon.ico",
   "/.well-known",
-  "/warming-up",
+  "/api/testing",
 ];
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -49,28 +75,127 @@ interface RateLimitEntry {
 // ─── State ────────────────────────────────────────────────────────────────
 
 const _buckets = new Map<string, RateLimitEntry>();
-let _cleanupInterval: ReturnType<typeof setInterval> | null = null;
+const _tenantBuckets = new Map<string, RateLimitEntry>();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-function getClientKey(event: Parameters<Handle>[0]["event"]): string {
-  // Use X-Forwarded-For if behind proxy, otherwise remote address
-  const forwarded = event.request.headers.get("x-forwarded-for");
-  const ip = forwarded?.split(",")[0]?.trim() || event.getClientAddress();
-  return ip || "unknown";
+/** Fast sync hash for rate-limit bucket keys (not cryptographic). */
+function hashClientKeySync(input: string): string {
+  if (typeof Bun !== "undefined" && typeof Bun.hash === "function") {
+    return Bun.hash(input).toString(16);
+  }
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+/**
+ * Bucket key from platform-resolved client IP + tenant host.
+ * Uses getClientIp (getClientAddress) — never raw X-Forwarded-For.
+ */
+function getClientKey(event: RequestEvent): string {
+  const rawIp = getClientIp(event);
+  const tenant = getTenantIdFromHostname(event.url.hostname, isMultiTenantEnabled()) || "global";
+  return hashClientKeySync(`${rawIp || "unknown"}:${tenant}`);
+}
+
+/**
+ * Derive the tenant key for per-tenant rate limit bucketing.
+ * When multi-tenancy is disabled, returns "global" so there is effectively
+ * no per-tenant separation (single shared aggregate bucket).
+ */
+function getTenantKey(event: RequestEvent): string {
+  return getTenantIdFromHostname(event.url.hostname, isMultiTenantEnabled()) || "global";
+}
+
+function withSecurityHeaders(response: Response, event: RequestEvent): Response {
+  return withMutableHeaders(response, (headers) => {
+    applyAllSecurityHeaders(
+      headers,
+      event.url.protocol === "https:",
+      event.request.headers.get("Origin"),
+      event.url.pathname,
+    );
+  });
 }
 
 function isExcluded(pathname: string): boolean {
   return EXCLUDED_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 }
 
-function startCleanupTimer(): void {
-  if (_cleanupInterval) return;
-  _cleanupInterval = setInterval(() => {
+/** Build a 429 body that matches the client (JSON API vs browser HTML). */
+function buildRateLimitResponse(
+  event: RequestEvent,
+  opts: {
+    retryAfterSeconds: number;
+    limit: number;
+    reason: string;
+    scope?: "ip" | "tenant";
+  },
+): Response {
+  const { retryAfterSeconds, limit, reason, scope } = opts;
+  const headers: Record<string, string> = {
+    "Retry-After": String(retryAfterSeconds),
+    "X-RateLimit-Limit": String(limit),
+    "X-RateLimit-Remaining": "0",
+    "X-RateLimit-Reset": String(retryAfterSeconds),
+  };
+  if (scope === "tenant") headers["X-RateLimit-Scope"] = "tenant";
+
+  if (prefersJsonResponse(event)) {
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: reason,
+        code: "RATE_LIMITED",
+        retryAfter: retryAfterSeconds,
+        ...(scope ? { scope } : {}),
+      }),
+      {
+        status: 429,
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+  }
+
+  return new Response(
+    renderRateLimitPage({
+      retryAfter: `${retryAfterSeconds} second${retryAfterSeconds === 1 ? "" : "s"}`,
+      retryAfterSeconds,
+      pathname: event.url.pathname,
+      reason,
+    }),
+    {
+      status: 429,
+      headers: {
+        ...headers,
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    },
+  );
+}
+
+const LIMITER_CLEANUP_KEY = Symbol.for("svelty.limiter.cleanup");
+const globalWithLimiter = globalThis as typeof globalThis & {
+  [key: symbol]: ReturnType<typeof setInterval> | undefined;
+};
+if (typeof setInterval !== "undefined" && !globalWithLimiter[LIMITER_CLEANUP_KEY]) {
+  globalWithLimiter[LIMITER_CLEANUP_KEY] = setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of _buckets) {
       if (now - entry.windowStart > DEFAULT_WINDOW_MS * 2) {
         _buckets.delete(key);
+      }
+    }
+    for (const [key, entry] of _tenantBuckets) {
+      if (now - entry.windowStart > DEFAULT_WINDOW_MS * 2) {
+        _tenantBuckets.delete(key);
       }
     }
   }, CLEANUP_INTERVAL_MS);
@@ -86,13 +211,32 @@ function startCleanupTimer(): void {
  */
 export const handleRateLimit: Handle = async ({ event, resolve }) => {
   const pathname = event.url.pathname;
+  const flags = getRequestFlags(event.locals);
+
+  if (flags.isStatic || flags.isBootstrap) {
+    return resolve(event);
+  }
 
   // Skip excluded paths
   if (isExcluded(pathname)) {
     return resolve(event);
   }
 
-  // Skip non-mutating GET/HEAD/OPTIONS unless under critical pressure
+  // Bypass rate limiting in test/benchmark mode — mirrors handle-security.ts:
+  // local traffic + TEST_MODE env, or a validated test secret. A bare
+  // `x-test-mode: true` header is NEVER trusted (client-forgeable).
+  const clientIp = getClientIp(event);
+  const isLocal =
+    clientIp === "127.0.0.1" || clientIp === "::1" || event.url.hostname === "localhost";
+  const incomingSecret = event.request.headers.get("x-test-secret");
+  const masterSecret = getMasterSecret();
+  const hasValidTestSecret =
+    incomingSecret && masterSecret ? await timingSafeEqual(incomingSecret, masterSecret) : false;
+  if (isLocal && (IS_TEST_MODE || hasValidTestSecret)) {
+    return resolve(event);
+  }
+
+  // Skip non-mutating GET/HEAD/OPTIONS (mutations only)
   const method = event.request.method;
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
     return resolve(event);
@@ -101,37 +245,39 @@ export const handleRateLimit: Handle = async ({ event, resolve }) => {
   const clientKey = getClientKey(event);
   const now = Date.now();
 
-  // Get or create bucket
+  // Get or create per-IP bucket
   let bucket = _buckets.get(clientKey);
   if (!bucket || now - bucket.windowStart > DEFAULT_WINDOW_MS) {
     bucket = { count: 0, windowStart: now };
     _buckets.set(clientKey, bucket);
   }
 
-  // Get adaptive pressure multiplier from SystemMonitor
+  // Sync SystemMonitor reads — no dynamic import / microtask on hot path
   let multiplier = 1.0;
   try {
-    const { getPressureMultiplier, shouldRejectMutations } = await import("@utils/system-monitor");
     multiplier = getPressureMultiplier();
 
-    // 🛡️ Reject mutations when heap is critically high
-    if (method !== "GET" && shouldRejectMutations()) {
+    // Reject mutations when heap is critically high
+    if (shouldRejectMutations()) {
       logger.warn(`[RateLimit] Mutation rejected — heap pressure critical (${clientKey})`, {
         pathname,
         method,
       });
-      return new Response(
-        JSON.stringify({
-          error: "Service temporarily unavailable due to high system load",
-          code: "HEAP_PRESSURE",
-        }),
-        {
-          status: 503,
-          headers: {
-            "Content-Type": "application/json",
-            "Retry-After": "30",
+      return withSecurityHeaders(
+        new Response(
+          JSON.stringify({
+            error: "Service temporarily unavailable due to high system load",
+            code: "HEAP_PRESSURE",
+          }),
+          {
+            status: 503,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "30",
+            },
           },
-        },
+        ),
+        event,
       );
     }
   } catch {
@@ -142,46 +288,77 @@ export const handleRateLimit: Handle = async ({ event, resolve }) => {
   const cost = Math.max(1, Math.round(multiplier));
   bucket.count += cost;
 
-  // Calculate remaining
   const remaining = Math.max(0, DEFAULT_MAX_REQUESTS - bucket.count);
   const resetTime = Math.ceil((bucket.windowStart + DEFAULT_WINDOW_MS - now) / 1000);
 
-  // Rate limit exceeded
+  // Per-IP rate limit exceeded
   if (bucket.count > DEFAULT_MAX_REQUESTS) {
     logger.warn(
       `[RateLimit] ${clientKey} exceeded limit (${bucket.count}/${DEFAULT_MAX_REQUESTS}, ${multiplier}x multiplier)`,
       { pathname, method },
     );
-    return new Response(
-      JSON.stringify({
-        error: "Too many requests",
-        code: "RATE_LIMITED",
-        retryAfter: resetTime,
+    return withSecurityHeaders(
+      buildRateLimitResponse(event, {
+        retryAfterSeconds: resetTime,
+        limit: DEFAULT_MAX_REQUESTS,
+        reason: "Too Many Requests",
+        scope: "ip",
       }),
-      {
-        status: 429,
-        headers: {
-          "Content-Type": "application/json",
-          "Retry-After": String(resetTime),
-          "X-RateLimit-Limit": String(DEFAULT_MAX_REQUESTS),
-          "X-RateLimit-Remaining": "0",
-          "X-RateLimit-Reset": String(resetTime),
-        },
-      },
+      event,
     );
   }
 
-  // Start cleanup timer on first request
-  startCleanupTimer();
+  // ─── Per-Tenant Bucket Check ──────────────────────────────────────────
+  // Aggregate tenant limit independent of individual IP limits — prevents
+  // one noisy tenant from starving others when each IP stays under the IP cap.
+
+  const tenantKey = getTenantKey(event);
+  let tenantBucket = _tenantBuckets.get(tenantKey);
+  if (!tenantBucket || now - tenantBucket.windowStart > DEFAULT_WINDOW_MS) {
+    tenantBucket = { count: 0, windowStart: now };
+    _tenantBuckets.set(tenantKey, tenantBucket);
+  }
+
+  tenantBucket.count += cost;
+
+  const tenantRemaining = Math.max(0, DEFAULT_TENANT_MAX_REQUESTS - tenantBucket.count);
+  const tenantResetTime = Math.ceil((tenantBucket.windowStart + DEFAULT_WINDOW_MS - now) / 1000);
+
+  if (tenantBucket.count > DEFAULT_TENANT_MAX_REQUESTS) {
+    logger.warn(
+      `[RateLimit] Tenant ${tenantKey} exceeded limit (${tenantBucket.count}/${DEFAULT_TENANT_MAX_REQUESTS}, ${multiplier}x multiplier)`,
+      { pathname, method, tenant: tenantKey },
+    );
+    return withSecurityHeaders(
+      buildRateLimitResponse(event, {
+        retryAfterSeconds: tenantResetTime,
+        limit: DEFAULT_TENANT_MAX_REQUESTS,
+        reason: "Too Many Requests — tenant limit reached",
+        scope: "tenant",
+      }),
+      event,
+    );
+  }
+
+  // Bounded map eviction: prevent OOM under distributed attacks
+  if (_buckets.size >= MAX_TRACKED_BUCKETS) {
+    const oldestKey = _buckets.keys().next().value;
+    if (oldestKey) _buckets.delete(oldestKey);
+  }
+  if (_tenantBuckets.size >= MAX_TRACKED_BUCKETS) {
+    const oldestKey = _tenantBuckets.keys().next().value;
+    if (oldestKey) _tenantBuckets.delete(oldestKey);
+  }
 
   const response = await resolve(event);
 
-  // Add rate limit headers to response
-  response.headers.set("X-RateLimit-Limit", String(DEFAULT_MAX_REQUESTS));
-  response.headers.set("X-RateLimit-Remaining", String(remaining));
-  response.headers.set("X-RateLimit-Reset", String(resetTime));
-
-  return response;
+  // Clone headers — resolve() Responses are often immutable
+  return withMutableHeaders(response, (headers) => {
+    headers.set("X-RateLimit-Limit", String(DEFAULT_MAX_REQUESTS));
+    headers.set("X-RateLimit-Remaining", String(remaining));
+    headers.set("X-RateLimit-Reset", String(resetTime));
+    headers.set("X-RateLimit-Tenant-Remaining", String(tenantRemaining));
+  });
 };
 
 /**
@@ -189,4 +366,5 @@ export const handleRateLimit: Handle = async ({ event, resolve }) => {
  */
 export function resetRateLimitBuckets(): void {
   _buckets.clear();
+  _tenantBuckets.clear();
 }

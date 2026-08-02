@@ -58,6 +58,10 @@ export const authUsers = pgTable(
     totpSecret: text("totpSecret"),
     backupCodes: jsonb("backupCodes").$type<string[]>(),
     last2FAVerification: timestamp("last2FAVerification"),
+    authenticators: jsonb("authenticators").$type<import("../auth/types").Authenticator[]>(),
+    preferences: jsonb("preferences").$type<import("../auth/types").User["preferences"]>(),
+    failedAttempts: integer("failedAttempts").notNull().default(0),
+    lockoutUntil: timestamp("lockoutUntil"),
     tenantId: tenantField(),
     ...timestamps,
   },
@@ -361,6 +365,34 @@ export const systemPreferences = pgTable(
   }),
 );
 
+// Outbox Events Table — Transactional Outbox Pattern
+// Events are written in the same transaction as the data change,
+// then a background process reads and delivers them reliably.
+export const sveltyOutbox = pgTable(
+  "svelty_outbox",
+  {
+    _id: varchar("_id", { length: 36 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    tenantId: tenantField(),
+    eventType: varchar("eventType", { length: 255 }).notNull(),
+    aggregateType: varchar("aggregateType", { length: 255 }).notNull(),
+    aggregateId: varchar("aggregateId", { length: 255 }).notNull(),
+    payload: jsonb("payload").notNull(),
+    status: varchar("status", { length: 50 }).notNull().default("pending"),
+    deliveredAt: timestamp("deliveredAt"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("lastError"),
+    ...timestamps,
+  },
+  (table) => ({
+    statusIdx: index("outbox_status_idx").on(table.status),
+    tenantIdx: index("outbox_tenant_idx").on(table.tenantId),
+    eventTypeIdx: index("outbox_event_type_idx").on(table.eventType),
+    createdAtIdx: index("outbox_created_at_idx").on(table.createdAt),
+  }),
+);
+
 // Background Jobs Table
 export const sveltyJobs = pgTable(
   "svelty_jobs",
@@ -406,6 +438,7 @@ export const websiteTokens = pgTable(
     tokenIdx: unique("website_tokens_token_unique").on(table.token),
     nameIdx: index("website_tokens_name_idx").on(table.name),
     tenantIdx: index("website_tokens_tenant_idx").on(table.tenantId),
+    tenantNameIdx: index("website_tokens_tenant_name_idx").on(table.tenantId, table.name),
   }),
 );
 
@@ -487,6 +520,30 @@ export const pluginMigrations = pgTable(
   }),
 );
 
+// Plugin Storage Table
+export const pluginStorage = pgTable(
+  "plugin_storage",
+  {
+    _id: varchar("_id", { length: 36 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    plugin: varchar("plugin", { length: 255 }).notNull(),
+    collectionName: varchar("collection", { length: 255 }).notNull(),
+    tenantId: tenantField(),
+    data: jsonb("data").notNull(),
+    ...timestamps,
+  },
+  (table) => ({
+    pluginIdx: index("plugin_storage_plugin_idx").on(table.plugin),
+    collectionIdx: index("plugin_storage_collection_idx").on(table.collectionName),
+    tenantIdx: index("plugin_storage_tenant_idx").on(table.tenantId),
+    pluginCollectionIdx: index("plugin_storage_plugin_collection_idx").on(
+      table.plugin,
+      table.collectionName,
+    ),
+  }),
+);
+
 // Audit Logs Table
 export const auditLogs = pgTable(
   "audit_logs",
@@ -557,11 +614,105 @@ export const tenants = pgTable(
   }),
 );
 
+// Redirects Materialized View Table
+export const redirectsMV = pgTable(
+  "redirects_mv",
+  {
+    _id: varchar("_id", { length: 36 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    tenantId: tenantField(),
+    source: text("source").notNull(),
+    target: text("target").notNull(),
+    type: integer("type").notNull().default(301),
+    isRegex: boolean("isRegex").notNull().default(false),
+    active: boolean("active").notNull().default(true),
+    metadata: jsonb("metadata").default({}),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantIdx: index("redirects_mv_tenant_idx").on(table.tenantId),
+    sourceIdx: index("redirects_mv_source_idx").on(table.source),
+    lookupIdx: index("idx_redirects_mv_lookup").on(table.tenantId, table.source, table.active),
+  }),
+);
+
+// Auth API Keys Table
+export const authApiKeys = pgTable(
+  "auth_api_keys",
+  {
+    _id: varchar("_id", { length: 36 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    name: varchar("name", { length: 255 }).notNull(),
+    hash: varchar("hash", { length: 255 }).notNull(),
+    prefix: varchar("prefix", { length: 12 }).notNull(),
+    userId: varchar("userId", { length: 36 }).notNull(),
+    scopes: jsonb("scopes").$type<string[]>().notNull().default([]),
+    permissions: jsonb("permissions").$type<string[]>().notNull().default([]),
+    revoked: boolean("revoked").notNull().default(false),
+    usageCount: integer("usageCount").notNull().default(0),
+    lastUsedAt: timestamp("lastUsedAt"),
+    lastUsedIp: varchar("lastUsedIp", { length: 45 }),
+    expiresAt: timestamp("expiresAt"),
+    tenantId: tenantField(),
+    ...timestamps,
+  },
+  (table) => ({
+    hashIdx: unique("auth_api_keys_hash_unique").on(table.hash),
+    userIdx: index("auth_api_keys_user_idx").on(table.userId),
+    tenantIdx: index("auth_api_keys_tenant_idx").on(table.tenantId),
+    tenantHashIdx: index("auth_api_keys_tenant_hash_idx").on(table.tenantId, table.hash),
+  }),
+);
+
+// Workflow Definitions Table
+export const workflowDefinitions = pgTable(
+  "workflow_definitions",
+  {
+    _id: varchar("_id", { length: 36 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    tenantId: tenantField(),
+    collectionId: varchar("collectionId", { length: 255 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: text("description"),
+    states: jsonb("states").notNull().default([]),
+    transitions: jsonb("transitions").notNull().default([]),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantIdx: index("workflow_def_tenant_idx").on(table.tenantId),
+    collectionIdx: index("workflow_def_collection_idx").on(table.collectionId),
+  }),
+);
+
+// Workflow Instances Table
+export const workflowInstances = pgTable(
+  "workflow_instances",
+  {
+    _id: varchar("_id", { length: 36 })
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    tenantId: tenantField(),
+    entryId: varchar("entryId", { length: 36 }).notNull(),
+    collectionId: varchar("collectionId", { length: 255 }).notNull(),
+    currentState: varchar("currentState", { length: 100 }).notNull(),
+    history: jsonb("history").notNull().default([]),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantIdx: index("workflow_inst_tenant_idx").on(table.tenantId),
+    entryIdx: index("workflow_inst_entry_idx").on(table.entryId),
+  }),
+);
+
 // Export all tables as a schema object for Drizzle
 export const schema = {
   authUsers,
   authSessions,
   authTokens,
+  authApiKeys,
   roles,
   contentNodes,
   contentDrafts,
@@ -571,11 +722,16 @@ export const schema = {
   mediaItems,
   systemVirtualFolders,
   systemPreferences,
+  sveltyOutbox,
   sveltyJobs,
   websiteTokens,
   pluginPagespeedResults,
   pluginStates,
+  pluginStorage,
   pluginMigrations,
   auditLogs,
   tenants,
+  redirectsMV,
+  workflowDefinitions,
+  workflowInstances,
 };

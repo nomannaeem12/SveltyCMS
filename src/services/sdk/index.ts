@@ -21,69 +21,48 @@ import type {
   TelemetryNamespace,
   AutomationNamespace,
   WebsiteTokensNamespace,
+  PluginStorageNamespace,
 } from "./namespaces/misc-namespaces";
+import type {
+  ConfigurationNamespace,
+  ContentTransferNamespace,
+  MigrationNamespace,
+  ImportersNamespace,
+  BackupNamespace,
+  ContentSyncNamespace,
+  ContentStructureNamespace,
+} from "./namespaces/data-operations";
+import type { VirtualCollectionsNamespace } from "./namespaces/virtual-collections-namespace";
 import { traceSpan } from "@utils/context";
 import { defineLazyNamespace } from "@src/databases/core/proxy-utils";
 
-const ASYNC_METHODS: Record<string, Set<string>> = {
-  collections: new Set([
-    "list",
-    "search",
-    "find",
-    "findStreaming",
-    "count",
-    "getSchema",
-    "getStructure",
-    "reorderContentNodes",
-    "getRevisions",
-    "bulkCreate",
-    "bulkUpdate",
-    "bulkDelete",
-    "findById",
-    "executeBatch",
-    "create",
-    "update",
-    "delete",
-  ]),
-  auth: new Set(["login", "logout", "me", "validateToken", "getPermissions"]),
-  system: new Set([
-    "getHealth",
-    "reinitialize",
-    "refresh",
-    "getPreferences",
-    "setPreference",
-    "sendMail",
-  ]),
-  media: new Set(["list", "upload", "delete", "getMetadata"]),
+/**
+ * Methods explicitly excluded from instrumentation (sync getters, non-traceable)
+ */
+const INSTRUMENT_SKIP: Record<string, Set<string>> = {
+  collections: new Set(["db"]),
+  auth: new Set(["db"]),
+  media: new Set(["db"]),
+  system: new Set(["formatBytes"]),
 };
 
 /**
- * Dynamically wraps all methods of a namespace instance inside high-resolution tracing spans.
- * Short-circuits with absolute zero overhead if tracing is not active.
+ * Auto-detects async methods on a namespace and wraps them with tracing spans.
+ * Every async function on the prototype is automatically instrumented
+ * unless explicitly excluded via INSTRUMENT_SKIP.
  */
 function instrumentNamespace<T extends object>(name: string, instance: T): T {
   const proto = Object.getPrototypeOf(instance);
   if (!proto) return instance;
-
-  const asyncSet = ASYNC_METHODS[name];
-  if (!asyncSet) return instance;
-
+  const skipSet = INSTRUMENT_SKIP[name];
   const keys = Object.getOwnPropertyNames(proto);
   for (const key of keys) {
-    if (!asyncSet.has(key)) continue;
-
     const original = (instance as any)[key];
-    if (typeof original === "function") {
-      if (process.env.BENCHMARK_DEBUG === "true") {
-        console.log(`[SDK] Instrumenting async method ${name}:${key}`);
-      }
-
-      (instance as any)[key] = async function (this: any, ...args: any[]) {
-        return await traceSpan(`sdk:${name}:${key}`, async () => {
-          return await original.apply(this, args);
-        });
-      };
-    }
+    if (key === "constructor" || typeof original !== "function" || skipSet?.has(key)) continue;
+    if (original.constructor.name !== "AsyncFunction") continue;
+    (instance as any)[key] = async function (this: any, ...args: any[]) {
+      return await traceSpan(`sdk:${name}:${key}`, async () => original.apply(this, args));
+    };
   }
   return instance;
 }
@@ -104,6 +83,15 @@ export class LocalCMS {
   public readonly telemetry!: TelemetryNamespace;
   public readonly automation!: AutomationNamespace;
   public readonly websiteTokens!: WebsiteTokensNamespace;
+  public readonly virtualCollections!: VirtualCollectionsNamespace;
+  public readonly config!: ConfigurationNamespace;
+  public readonly contentTransfer!: ContentTransferNamespace;
+  public readonly migrations!: MigrationNamespace;
+  public readonly importers!: ImportersNamespace;
+  public readonly backups!: BackupNamespace;
+  public readonly contentSync!: ContentSyncNamespace;
+  public readonly contentStructure!: ContentStructureNamespace;
+  public readonly pluginStorage!: PluginStorageNamespace;
 
   /**
    * Access the underlying database adapter directly.
@@ -142,10 +130,10 @@ export class LocalCMS {
       },
       { tokens: true },
     );
-
+    // tokens are part of auth — delegate to auth.tokens
     defineLazyNamespace(this, "tokens", async () => {
-      const { TokensNamespace } = await import("./namespaces/auth-namespace");
-      return instrumentNamespace("tokens", new TokensNamespace(this._dbAdapter));
+      await this.auth;
+      return (this.auth as any).tokens;
     });
 
     defineLazyNamespace(this, "collections", async () => {
@@ -190,6 +178,59 @@ export class LocalCMS {
       const { WebsiteTokensNamespace } = await import("./namespaces/misc-namespaces");
       return instrumentNamespace("websiteTokens", new WebsiteTokensNamespace(this._dbAdapter));
     });
+
+    defineLazyNamespace(this, "virtualCollections", async () => {
+      const { VirtualCollectionsNamespace } =
+        await import("./namespaces/virtual-collections-namespace");
+      return instrumentNamespace(
+        "virtualCollections",
+        new VirtualCollectionsNamespace(this._dbAdapter),
+      );
+    });
+
+    // ── Data Operation Namespaces ──────────────────────────────────────────
+    defineLazyNamespace(this, "config", async () => {
+      const { ConfigurationNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace("config", new ConfigurationNamespace(this._dbAdapter));
+    });
+
+    defineLazyNamespace(this, "contentTransfer", async () => {
+      const { ContentTransferNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace("contentTransfer", new ContentTransferNamespace(this._dbAdapter));
+    });
+
+    defineLazyNamespace(this, "migrations", async () => {
+      const { MigrationNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace("migrations", new MigrationNamespace(this._dbAdapter));
+    });
+
+    defineLazyNamespace(this, "importers", async () => {
+      const { ImportersNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace("importers", new ImportersNamespace(this._dbAdapter));
+    });
+
+    defineLazyNamespace(this, "backups", async () => {
+      const { BackupNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace("backups", new BackupNamespace(this._dbAdapter));
+    });
+
+    defineLazyNamespace(this, "contentSync", async () => {
+      const { ContentSyncNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace("contentSync", new ContentSyncNamespace(this._dbAdapter));
+    });
+
+    defineLazyNamespace(this, "contentStructure", async () => {
+      const { ContentStructureNamespace } = await import("./namespaces/data-operations");
+      return instrumentNamespace(
+        "contentStructure",
+        new ContentStructureNamespace(this._dbAdapter),
+      );
+    });
+
+    defineLazyNamespace(this, "pluginStorage", async () => {
+      const { PluginStorageNamespace } = await import("./namespaces/misc-namespaces");
+      return instrumentNamespace("pluginStorage", new PluginStorageNamespace(this._dbAdapter));
+    });
   }
 
   /**
@@ -233,7 +274,19 @@ export class LocalCMS {
       collections: cms.collections,
       media: cms.media,
       system: cms.system,
+      tokens: cms.tokens,
+      automation: cms.automation,
+      telemetry: cms.telemetry,
+      websiteTokens: cms.websiteTokens,
       widgets: cms.widgets,
+      virtualCollections: cms.virtualCollections,
+      pluginStorage: cms.pluginStorage,
+      config: cms.config,
+      contentTransfer: cms.contentTransfer,
+      migrations: cms.migrations,
+      importers: cms.importers,
+      backups: cms.backups,
+      contentSync: cms.contentSync,
     };
   }
 

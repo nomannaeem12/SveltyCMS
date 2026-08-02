@@ -1,7 +1,10 @@
 /**
  * @file src/routes/setup/writePrivateConfig.ts
- * @description Utility to write the `config/private.ts` file with database credentials
- * during the setup process.
+ * @description Utility to write the `config/private.ts` file with bootstrap-only
+ * database credentials and security keys during the setup process.
+ *
+ * SSO/SAML keys, password policy, and rate limiting secrets are now DB-driven
+ * and seeded via `seedSettings()` — they no longer belong in private.ts.
  */
 
 import { generateSecureToken } from "@utils/native-utils";
@@ -9,7 +12,7 @@ import type { DatabaseConfig } from "@src/databases/schemas";
 import { logger } from "@utils/logger";
 
 /**
- * Writes database credentials and security keys to private.ts
+ * Writes bootstrap-only credentials and security keys to private.ts
  * Includes safety features: backup existing file and prevent overwrite after setup
  */
 export async function writePrivateConfig(
@@ -23,25 +26,18 @@ export async function writePrivateConfig(
   const configFileName = process.env.TEST_MODE ? "private.test.ts" : "private.ts";
   const privateConfigPath = path.resolve(process.cwd(), "config", configFileName);
 
-  // Generate random keys
+  const { isLocalBenchmarkSandbox, assertLiveDataWriteAllowed } =
+    await import("@utils/benchmark-sandbox");
+  if (isLocalBenchmarkSandbox()) {
+    throw new Error(
+      "[BenchmarkSandbox] Cannot write private config during local benchmark — live config/private.ts must remain untouched.",
+    );
+  }
+  assertLiveDataWriteAllowed(privateConfigPath);
+
+  // Generate bootstrap security keys
   const jwtSecret = generateSecureToken(32);
   const encryptionKey = generateSecureToken(32);
-  const samlClientSecretVerifier = generateSecureToken(32);
-  const samlEncryptionKey = generateSecureToken(32);
-
-  // Generate RSA-2048 keys for JWT signing
-  const { generateKeyPairSync } = await import("node:crypto");
-  const { publicKey, privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    publicKeyEncoding: {
-      type: "spki",
-      format: "pem",
-    },
-    privateKeyEncoding: {
-      type: "pkcs8",
-      format: "pem",
-    },
-  });
 
   // Sanitization helper to prevent code injection via single quotes
   const escape = (val: string | number | undefined) => {
@@ -55,7 +51,7 @@ export async function writePrivateConfig(
       .replace(/\r/g, "\\r");
   };
 
-  // Generate the private.ts content
+  // Generate the private.ts content (bootstrap-only values)
   const privateConfigContent = `
 /**
  * @file config/private.ts
@@ -66,7 +62,7 @@ export async function writePrivateConfig(
 // import { createPrivateConfig } from '@src/databases/schemas'; // Removed to avoid alias resolution issues in production/tests
 
 export const privateEnv = {
-	// --- Core Database Connection ---
+	// --- Core Database Connection (bootstrap — required before DB is available) ---
 	DB_TYPE: '${escape(dbConfig.type)}',
 	DB_HOST: '${escape(dbConfig.host)}',
 	DB_PORT: ${Number(dbConfig.port) || 0},
@@ -74,26 +70,22 @@ export const privateEnv = {
 	DB_USER: '${escape(dbConfig.user)}',
 	DB_PASSWORD: '${escape(dbConfig.password)}',
 
-	// --- Connection Behavior ---
+	// --- Connection Resilience (bootstrap) ---
 	DB_RETRY_ATTEMPTS: 5,
 	DB_RETRY_DELAY: 3000, // 3 seconds
 
-	// --- Core Security Keys ---
+	// --- Core Security Keys (bootstrap — session tokens + encryption need these immediately) ---
 	JWT_SECRET_KEY: '${jwtSecret}',
 	ENCRYPTION_KEY: '${encryptionKey}',
 
-	// --- SAML / SSO Security Keys ---
-	SAML_CLIENT_SECRET_VERIFIER: '${samlClientSecretVerifier}',
-	SAML_ENCRYPTION_KEY: '${samlEncryptionKey}',
-	SAML_JWT_SIGNING_PRIVATE_KEY: '${escape(privateKey)}',
-	SAML_JWT_SIGNING_PUBLIC_KEY: '${escape(publicKey)}',
-
-	// --- Fundamental Architectural Mode ---
+	// --- Architectural Mode (bootstrap — affects middleware before DB) ---
 	MULTI_TENANT: ${system.multiTenant ? "true" : "false"},
 	DEMO: ${system.demoMode ? "true" : "false"},
 
-	/* * NOTE: All other settings (SMTP, Google OAuth, Redis, feature flags, etc.)
-	 * are loaded dynamically from the database after the application starts.
+	/*
+	 * NOTE: All other settings (SSO/SAML keys, password policy, rate limiting,
+	 * SMTP, OAuth, Redis, feature flags, etc.) are seeded into the database
+	 * during setup and managed via the System Settings UI at /config/system-settings.
 	 */
 };
 `;
@@ -113,14 +105,6 @@ export const privateEnv = {
       {
         name: "ENCRYPTION_KEY",
         regex: /\bENCRYPTION_KEY\s*:\s*['"][^'"]{32,}['"]/,
-      },
-      {
-        name: "SAML_CLIENT_SECRET_VERIFIER",
-        regex: /\bSAML_CLIENT_SECRET_VERIFIER\s*:\s*['"][^'"]{32,}['"]/,
-      },
-      {
-        name: "SAML_ENCRYPTION_KEY",
-        regex: /\bSAML_ENCRYPTION_KEY\s*:\s*['"][^'"]{32,}['"]/,
       },
       {
         name: "DB_HOST",
@@ -202,10 +186,14 @@ export async function updatePrivateConfigMode(modes: {
           logger.debug("DEBUG: [updatePrivateConfigMode] Updated MULTI_TENANT");
         }
       } else {
-        // If not found, try to insert after the marker
-        const insertMarker = "// --- Fundamental Architectural Mode ---";
-        if (content.includes(insertMarker)) {
-          content = content.replace(insertMarker, `${insertMarker}\n\t${newValue}`);
+        // If not found, try to insert after the full marker comment line.
+        // Anchored to end-of-line: the generated file's marker is
+        // `// --- Architectural Mode (bootstrap — affects middleware before DB) ---`,
+        // so matching only the bare prefix would split the comment and break the TS.
+        const insertMarker = /\/\/ --- Architectural Mode[^\n]*/;
+        const markerMatch = content.match(insertMarker);
+        if (markerMatch) {
+          content = content.replace(insertMarker, `${markerMatch[0]}\n\t${newValue}`);
           modified = true;
           logger.debug("DEBUG: [updatePrivateConfigMode] Inserted MULTI_TENANT after marker");
         } else {

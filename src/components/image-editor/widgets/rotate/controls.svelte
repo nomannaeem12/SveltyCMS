@@ -1,56 +1,67 @@
 <!--
-@file: src/components/image-editor/widgets/Rotate/Controls.svelte
+@file: src/components/image-editor/widgets/rotate/controls.svelte
 @component
-Professional rotate controls with straighten and snap features
+Pintura-style rotate dock — compact glass pills, inline accent slider, single aligned row.
 -->
 <script lang="ts">
-	import Button from '@components/ui/button.svelte';
-
 	let {
-		rotationAngle,
-		isFlippedH = false,
-		isFlippedV = false,
-		showGrid = false,
-		snapToAngles = true,
-		onRotateLeft,
-		onRotateRight,
-		onRotationChange,
-		onFlipHorizontal,
-		onFlipVertical,
-		onStraighten,
-		onAutoStraighten,
-		onGridToggle,
-		onSnapToggle
-	}: {
-		rotationAngle: number;
-		isFlippedH?: boolean;
-		isFlippedV?: boolean;
-		showGrid?: boolean;
-		snapToAngles?: boolean;
-		onRotateLeft: () => void;
-		onRotateRight: () => void;
-		onRotationChange: (angle: number) => void;
-		onFlipHorizontal: () => void;
-		onFlipVertical: () => void;
-		onStraighten?: () => void;
-		onAutoStraighten?: () => void;
-		onGridToggle?: () => void;
-		onSnapToggle?: () => void;
-	} = $props();
+			rotationAngle,
+			isFlippedH = false,
+			isFlippedV = false,
+			showGrid = false,
+			snapToAngles = true,
+			onRotateLeft,
+			onRotateRight,
+			onRotationChange,
+			onFlipHorizontal,
+			onFlipVertical,
+			onStraighten,
+			onAutoStraighten,
+			onGridToggle,
+			onSnapToggle
+		}: {
+			rotationAngle: number;
+			isFlippedH?: boolean;
+			isFlippedV?: boolean;
+			showGrid?: boolean;
+			snapToAngles?: boolean;
+			onRotateLeft: () => void;
+			onRotateRight: () => void;
+			onRotationChange: (angle: number) => void;
+			onFlipHorizontal: () => void;
+			onFlipVertical: () => void;
+			onStraighten?: () => void;
+			onAutoStraighten?: () => void;
+			onGridToggle?: () => void;
+			onSnapToggle?: () => void;
+		} = $props();
 
-	// Preset angles
 	const presetAngles = [-90, 0, 90, 180];
 
-	// Normalize angle to -180 to 180 for display
 	const displayAngle = $derived.by(() => {
 		let angle = rotationAngle % 360;
-		if (angle > 180) {
-			angle -= 360;
+		if (angle > 180) angle -= 360;
+		if (angle < -180) angle += 360;
+		return Math.round(angle * 10) / 10;
+	});
+
+	const sliderProgress = $derived((rotationAngle + 180) / 360);
+
+	const sliderFillStyle = $derived.by(() => {
+		const center = 50;
+		const thumb = sliderProgress * 100;
+		const accent = 'var(--editor-accent, #f5c518)';
+		const track = 'rgba(255, 255, 255, 0.16)';
+
+		if (Math.abs(displayAngle) < 0.05) {
+			return `linear-gradient(to right, ${track} 0%, ${track} 100%)`;
 		}
-		if (angle < -180) {
-			angle += 360;
+
+		if (displayAngle > 0) {
+			return `linear-gradient(to right, ${track} 0%, ${track} ${center}%, ${accent} ${center}%, ${accent} ${thumb}%, ${track} ${thumb}%, ${track} 100%)`;
 		}
-		return Math.round(angle * 10) / 10; // Round to 1 decimal
+
+		return `linear-gradient(to right, ${track} 0%, ${track} ${thumb}%, ${accent} ${thumb}%, ${accent} ${center}%, ${track} ${center}%, ${track} 100%)`;
 	});
 
 	function handleAngleInput(e: Event) {
@@ -58,34 +69,23 @@ Professional rotate controls with straighten and snap features
 		onRotationChange(Number.parseFloat(target.value));
 	}
 
-	// Keyboard shortcuts
 	function handleKeyDown(e: KeyboardEvent) {
-		if ((e.target as HTMLElement).tagName === 'INPUT') {
-			return;
-		}
+		if ((e.target as HTMLElement).tagName === 'INPUT') return;
 
 		const cmdOrCtrl = e.metaKey || e.ctrlKey;
 
 		switch (e.key) {
 			case 'ArrowLeft':
 				e.preventDefault();
-				if (e.shiftKey) {
-					onRotationChange(rotationAngle - 0.1);
-				} else if (cmdOrCtrl) {
-					onRotateLeft();
-				} else {
-					onRotationChange(rotationAngle - 1);
-				}
+				if (e.shiftKey) onRotationChange(rotationAngle - 0.1);
+				else if (cmdOrCtrl) onRotateLeft();
+				else onRotationChange(rotationAngle - 1);
 				break;
 			case 'ArrowRight':
 				e.preventDefault();
-				if (e.shiftKey) {
-					onRotationChange(rotationAngle + 0.1);
-				} else if (cmdOrCtrl) {
-					onRotateRight();
-				} else {
-					onRotationChange(rotationAngle + 1);
-				}
+				if (e.shiftKey) onRotationChange(rotationAngle + 0.1);
+				else if (cmdOrCtrl) onRotateRight();
+				else onRotationChange(rotationAngle + 1);
 				break;
 			case 'h':
 			case 'H':
@@ -121,69 +121,97 @@ Professional rotate controls with straighten and snap features
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<div class="rotate-controls" role="toolbar" aria-label="Rotate controls">
-	<!-- Group 1: Tools (Toggles & Actions) -->
-	<div class="control-group">
-		<!-- Quick Rotate -->
-		<div class="btn-group">
-			<Button variant="outline" size="sm" class="p-0! min-w-0" onclick={onRotateLeft} title="Rotate Left 90° (Ctrl+←)" aria-label="Rotate Left 90°">
-				<iconify-icon icon="mdi:rotate-left" width="20" aria-hidden="true"></iconify-icon>
-			</Button>
-			<Button variant="outline" size="sm" class="p-0! min-w-0" onclick={onRotateRight} title="Rotate Right 90° (Ctrl+→)" aria-label="Rotate Right 90°">
-				<iconify-icon icon="mdi:rotate-right" width="20" aria-hidden="true"></iconify-icon>
-			</Button>
+<div class="flex flex-col flex-[0_0_auto] gap-1 items-stretch w-full min-w-0 h-auto leading-none" role="toolbar" aria-label="Rotate controls">
+	<div class="flex flex-nowrap gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none overflow-x-auto overflow-y-hidden pb-0 scrollbar-thin [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full px-0.5 max-lg:justify-start" role="group" aria-label="Rotate and flip">
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full">
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center justify-center h-7 w-7 px-0 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35" onclick={onRotateLeft} title="Rotate left 90°" aria-label="Rotate left 90°">
+				<iconify-icon icon="mdi:rotate-left" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center justify-center h-7 w-7 px-0 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35" onclick={onRotateRight} title="Rotate right 90°" aria-label="Rotate right 90°">
+				<iconify-icon icon="mdi:rotate-right" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center justify-center h-7 w-7 px-0 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35"
+				class:text-white={isFlippedH}
+				onclick={onFlipHorizontal}
+				title="Flip horizontal (H)"
+				aria-label="Flip horizontal"
+				aria-pressed={isFlippedH}
+			>
+				<iconify-icon icon="mdi:flip-horizontal" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center justify-center h-7 w-7 px-0 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35"
+				class:text-white={isFlippedV}
+				onclick={onFlipVertical}
+				title="Flip vertical (V)"
+				aria-label="Flip vertical"
+				aria-pressed={isFlippedV}
+			>
+				<iconify-icon icon="mdi:flip-vertical" width="15" aria-hidden="true"></iconify-icon>
+			</button>
 		</div>
 
-		<!-- Flip -->
-		<div class="btn-group">
-			<Button variant="outline" size="sm" class="p-0! min-w-0" aria-pressed={isFlippedH} onclick={onFlipHorizontal} title="Flip Horizontal (H)" aria-label="Flip Horizontal">
-				<iconify-icon icon="mdi:flip-horizontal" width="20" aria-hidden="true"></iconify-icon>
-			</Button>
-			<Button variant="outline" size="sm" class="p-0! min-w-0" aria-pressed={isFlippedV} onclick={onFlipVertical} title="Flip Vertical (V)" aria-label="Flip Vertical">
-				<iconify-icon icon="mdi:flip-vertical" width="20" aria-hidden="true"></iconify-icon>
-			</Button>
-		</div>
-
-		<!-- Helpers -->
-		<div class="btn-group">
-			{#if onGridToggle}
-				<Button variant="outline" size="sm" class="p-0! min-w-0" aria-pressed={showGrid} onclick={onGridToggle} title="Toggle Grid (G)" aria-label="Toggle Grid">
-					<iconify-icon icon="mdi:grid" width="20" aria-hidden="true"></iconify-icon>
-				</Button>
-			{/if}
-			{#if onSnapToggle}
-				<Button variant="outline" size="sm" class="p-0! min-w-0" aria-pressed={snapToAngles} onclick={onSnapToggle} title="Snap to Angles" aria-label="Snap to Angles">
-					<iconify-icon icon="mdi:magnet" width="20" aria-hidden="true"></iconify-icon>
-				</Button>
-			{/if}
-			{#if onStraighten}
-				<Button variant="outline" size="sm" class="p-0! min-w-0" onclick={onStraighten} title="Straighten (S)" aria-label="Straighten">
-					<iconify-icon icon="mdi:image-filter-center-focus-weak" width="20" aria-hidden="true"></iconify-icon>
-				</Button>
-			{/if}
-			{#if onAutoStraighten}
-				<Button variant="outline" size="sm" class="p-0! min-w-0" onclick={onAutoStraighten} title="Auto-Straighten" aria-label="Auto-Straighten"><iconify-icon icon="mdi:auto-fix" width="20" aria-hidden="true"></iconify-icon></Button>
-			{/if}
-		</div>
-	</div>
-
-	<!-- Group 2: Presets -->
-	<div class="control-group">
-		<div class="preset-angles">
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full" role="group" aria-label="Rotation presets">
 			{#each presetAngles as angle (angle)}
-				<Button variant="outline" size="sm" aria-pressed={Math.abs(displayAngle - angle) < 0.5} onclick={() => onRotationChange(angle)}>
+				<button
+					type="button"
+					class="inline-flex flex-[0_0_auto] gap-1.5 items-center px-1.75 text-[10px] tabular-nums h-7 font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35"
+					class:text-white={Math.abs(displayAngle - angle) < 0.5}
+					onclick={() => onRotationChange(angle)}
+					aria-label="Rotate to {angle} degrees"
+				>
 					{angle > 0 ? '+' : ''}{angle}°
-				</Button>
+				</button>
 			{/each}
 		</div>
-	</div>
 
-	<!-- Group 3: Slider (Refined) -->
-	<div class="control-group flex-1">
-		<div class="slider-wrapper">
-			<div class="slider-track-container">
-				<div class="center-tick"></div>
-				<input
+		{#if onGridToggle}
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center px-1.75 text-[10px] tabular-nums h-7 font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35"
+				class:text-white={showGrid}
+				onclick={onGridToggle}
+				title="Toggle grid (G)"
+				aria-label="Toggle grid"
+				aria-pressed={showGrid}
+			>
+				<iconify-icon icon="mdi:grid" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+		{/if}
+
+		{#if onSnapToggle}
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center px-1.75 text-[10px] tabular-nums h-7 font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35"
+				class:text-white={snapToAngles}
+				onclick={onSnapToggle}
+				title="Snap to angles"
+				aria-label="Snap to angles"
+				aria-pressed={snapToAngles}
+			>
+				<iconify-icon icon="mdi:magnet" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+		{/if}
+
+		{#if onStraighten}
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center px-1.75 text-[10px] tabular-nums h-7 font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35" onclick={onStraighten} title="Straighten (S)" aria-label="Straighten">
+				<iconify-icon icon="mdi:image-filter-center-focus-weak" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+		{/if}
+
+		{#if onAutoStraighten}
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center px-1.75 text-[10px] tabular-nums h-7 font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35" onclick={onAutoStraighten} title="Auto-straighten" aria-label="Auto-straighten">
+				<iconify-icon icon="mdi:auto-fix" width="15" aria-hidden="true"></iconify-icon>
+			</button>
+		{/if}
+
+		<div class="flex flex-[1_1_7rem] items-center justify-center min-w-24 max-w-56 mx-0.5 max-lg:basis-full max-lg:order-4 max-lg:max-w-none max-lg:mx-0">
+			<div class="relative w-full">
+				<div class="absolute top-1/2 left-1/2 z-1 w-[1.5px] h-2.5 pointer-events-none bg-white/45 rounded-[1px] -translate-x-1/2 -translate-y-1/2" aria-hidden="true"></div>
+				<input aria-label="Rotation angle"
 					id="rotate-slider"
 					type="range"
 					min="-180"
@@ -191,175 +219,17 @@ Professional rotate controls with straighten and snap features
 					step={snapToAngles ? '15' : '0.1'}
 					value={rotationAngle}
 					oninput={handleAngleInput}
-					class="slider"
-					aria-label="Fine-tune rotation angle"
+					class="relative z-2 w-full flex-1 h-1 m-0 appearance-none cursor-pointer bg-white/18 rounded-full [&::-webkit-slider-thumb]:size-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:bg-[--editor-accent-hover,var(--color-warning-400,#ffd43b)] [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:[box-shadow:0_0_0_1px_rgba(0,0,0,0.2)] [&::-moz-range-thumb]:size-3.5 [&::-moz-range-thumb]:cursor-pointer [&::-moz-range-thumb]:bg-[--editor-accent-hover,var(--color-warning-400,#ffd43b)] [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-[rgba(0,0,0,0.15)] [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:[box-shadow:0_0_0_1px_rgba(0,0,0,0.2)]"
+					style:background={sliderFillStyle}
+					aria-valuemin={-180}
+					aria-valuemax={180}
+					aria-valuenow={rotationAngle}
 				/>
 			</div>
-			<div class="angle-display">{displayAngle}°</div>
+		</div>
+
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center justify-center h-auto min-h-0 p-0.5 px-2 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full shrink-0 max-lg:order-5">
+			<span class="min-w-9 text-[11px] font-medium tabular-nums leading-7 text-[rgba(255,255,255,0.92)] text-center" aria-live="polite">{displayAngle}°</span>
 		</div>
 	</div>
-
-	<!-- Actions -->
-	<!-- Actions removed: Handled by global toolbar -->
-	<div class="h-2"></div>
 </div>
-
-<style>
-	.rotate-controls {
-		display: flex;
-		flex-wrap: wrap; /* Always allow wrapping */
-		gap: 1rem;
-		align-items: center;
-		width: 100%;
-		padding: 0;
-		background: transparent;
-		border: none;
-	}
-
-	/* Groups of controls */
-	.control-group {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-		align-items: center;
-	}
-
-	.btn-group {
-		display: flex;
-		gap: 2px;
-		padding: 2px;
-		overflow: hidden;
-		background: rgba(0, 0, 0, 0.2);
-		border-radius: 9999px;
-	}
-
-	.preset-angles {
-		display: flex;
-		gap: 0.25rem;
-	}
-
-	/* Enhanced Slider Styling */
-	.slider-wrapper {
-		display: flex;
-		flex: 1;
-		gap: 0.75rem;
-		align-items: center;
-		min-width: 200px;
-		padding: 0.25rem 0.75rem;
-		background: rgba(0, 0, 0, 0.2);
-		border: 1px solid rgba(255, 255, 255, 0.1);
-		border-radius: 9999px;
-	}
-
-	.slider-track-container {
-		position: relative;
-		display: flex;
-		flex: 1;
-		align-items: center;
-		height: 1.5rem;
-		padding: 0 0.5rem; /* Add padding for thumb */
-	}
-
-	.slider {
-		position: absolute;
-		width: 100%;
-		height: 6px;
-		margin: 0;
-		-webkit-appearance: none;
-		appearance: none;
-		cursor: pointer;
-		outline: none;
-		background: rgb(var(--color-surface-300) / 1);
-		border-radius: 3px;
-	}
-
-	:global(.dark) .slider {
-		background: rgb(var(--color-surface-600) / 1);
-	}
-
-	/* Slider Thumb - Webkit */
-	.slider::-webkit-slider-thumb {
-		width: 20px;
-		height: 20px;
-		margin-top: -7px; /* Nudge to center if needed, though usually auto-centers on height */
-		-webkit-appearance: none;
-		appearance: none;
-		cursor: pointer;
-		background: white;
-		border: 2px solid rgb(var(--color-primary-500) / 1);
-		border-radius: 50%;
-		box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
-		transition: transform 0.1s; /* Nudge to center if needed, though usually auto-centers on height */
-	}
-
-	.slider::-webkit-slider-thumb:hover {
-		box-shadow: 0 0 0 4px rgb(var(--color-primary-500) / 0.2);
-		transform: scale(1.1);
-	}
-
-	.slider::-webkit-slider-thumb:active {
-		background: rgb(var(--color-primary-500) / 1);
-		border-color: white;
-	}
-
-	/* Slider Thumb - Mozilla */
-	.slider::-moz-range-thumb {
-		width: 20px;
-		height: 20px;
-		cursor: pointer;
-		background: white;
-		border: 2px solid rgb(var(--color-primary-500) / 1);
-		border-radius: 50%;
-		box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
-		transition: transform 0.1s;
-	}
-
-	.slider::-moz-range-thumb:hover {
-		box-shadow: 0 0 0 4px rgb(var(--color-primary-500) / 0.2);
-		transform: scale(1.1);
-	}
-
-	.slider::-moz-range-thumb:active {
-		background: rgb(var(--color-primary-500) / 1);
-		border-color: white;
-	}
-
-	/* Center tick mark */
-	.center-tick {
-		position: absolute;
-		top: 50%;
-		left: 50%;
-		width: 2px;
-		height: 10px;
-		pointer-events: none;
-		background: rgb(var(--color-surface-400) / 1);
-		border-radius: 1px;
-		transform: translate(-50%, -50%);
-	}
-
-	.angle-display {
-		min-width: 3.5rem;
-		font-family: monospace;
-		font-size: 0.875rem;
-		font-weight: 600;
-		color: rgb(var(--color-primary-500) / 1);
-		text-align: right;
-	}
-
-	/* Responsive Breakpoints */
-	@media (max-width: 1024px) {
-		/* Tablet/Mobile: Stack the main sections */
-		.rotate-controls {
-			row-gap: 1rem;
-		}
-
-		/* Make slider row full width */
-		.control-group:last-of-type {
-			width: 100%;
-		}
-
-		.slider-wrapper {
-			width: 100%;
-		}
-	}
-</style>

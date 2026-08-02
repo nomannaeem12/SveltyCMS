@@ -94,7 +94,7 @@ export const widgetMeta = {
 				{:else}
 					<!-- Header Stats -->
 					<div class="flex items-center justify-between">
-						<div class="flex items-center space-x-2">
+						<div class="flex items-center gap-2">
 							<div class="relative">
 								<div class="h-3 w-3 rounded-full {cpu.level === 'high' ? 'bg-error-500' : cpu.level === 'medium' ? 'bg-yellow-500' : 'bg-emerald-500'}"></div>
 								<div class="absolute inset-0 h-3 w-3 rounded-full {cpu.level === 'high' ? 'bg-error-500' : cpu.level === 'medium' ? 'bg-yellow-500' : 'bg-emerald-500'} animate-ping opacity-75"></div>
@@ -155,7 +155,7 @@ export const widgetMeta = {
 
 						<!-- Data Points (Only in rich layout) -->
 						{#if size.h !== 1}
-							{#each points as p, i}
+							{#each points as p, i (i)}
 								<circle
 									cx={p.x}
 									cy={p.y}

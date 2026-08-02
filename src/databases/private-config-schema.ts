@@ -107,6 +107,8 @@ export const privateConfigSchema = object({
   CACHE_TTL_USER: optional(pipe(coercedNumber, minValue(1))),
   CACHE_TTL_API: optional(pipe(coercedNumber, minValue(1))),
 
+  COOKIE_PATH: optional(pipe(string(), minLength(1))),
+
   GOOGLE_CLIENT_ID: optional(pipe(string(), minLength(1))),
   GOOGLE_CLIENT_SECRET: optional(pipe(string(), minLength(1))),
   GOOGLE_API_KEY: optional(pipe(string(), minLength(1))),
@@ -160,6 +162,9 @@ export const privateConfigSchema = object({
 
   // --- Media & Uploads ---
   CONCURRENT_UPLOAD_SIZE: optional(pipe(coercedNumber, minValue(1))),
+
+  // --- Signed Media URLs ---
+  MEDIA_SIGNED_URL_SECRET: optional(pipe(string(), minLength(1))),
 });
 
 export type PrivateConfig = InferOutput<typeof privateConfigSchema>;

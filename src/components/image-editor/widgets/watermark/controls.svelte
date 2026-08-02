@@ -1,48 +1,45 @@
 <!--
-@file: src/components/image-editor/widgets/Watermark/Controls.svelte
+@file: src/components/image-editor/widgets/watermark/controls.svelte
 @component
-Professional watermark controls with text, image, and advanced options
+Pintura-style watermark bottom dock controls.
 -->
 <script lang="ts">
-	import Badge from '@components/ui/badge.svelte';
-	import Button from '@components/ui/button.svelte';
 	let {
-		onAddImage,
-		onAddText,
-		onDeleteWatermark,
-		onPositionChange,
-		onOpacityChange,
-		onSizeChange,
-		onTileToggle,
-		hasSelection,
-		selectedType = null,
-		textDraft = 'Watermark',
-		onTextDraftChange,
-		onApplyText,
-		currentOpacity = 0.8,
-		currentSize = 100,
-		isTiled = false,
-		watermarkCount = 0
-	}: {
-		onAddImage: () => void;
-		onAddText?: () => void;
-		onDeleteWatermark: () => void;
-		onPositionChange: (position: string) => void;
-		onOpacityChange?: (opacity: number) => void;
-		onSizeChange?: (size: number) => void;
-		onTileToggle?: () => void;
-		hasSelection: boolean;
-		selectedType?: 'text' | 'image' | null;
-		textDraft?: string;
-		onTextDraftChange?: (value: string) => void;
-		onApplyText?: () => void;
-		currentOpacity?: number;
-		currentSize?: number;
-		isTiled?: boolean;
-		watermarkCount?: number;
-	} = $props();
+			onAddImage,
+			onAddText,
+			onDeleteWatermark,
+			onPositionChange,
+			onOpacityChange,
+			onSizeChange,
+			onTileToggle,
+			hasSelection,
+			selectedType = null,
+			textDraft = 'Watermark',
+			onTextDraftChange,
+			onApplyText,
+			currentOpacity = 0.8,
+			currentSize = 100,
+			isTiled = false,
+			watermarkCount = 0
+		}: {
+			onAddImage: () => void;
+			onAddText?: () => void;
+			onDeleteWatermark: () => void;
+			onPositionChange: (position: string) => void;
+			onOpacityChange?: (opacity: number) => void;
+			onSizeChange?: (size: number) => void;
+			onTileToggle?: () => void;
+			hasSelection: boolean;
+			selectedType?: 'text' | 'image' | null;
+			textDraft?: string;
+			onTextDraftChange?: (value: string) => void;
+			onApplyText?: () => void;
+			currentOpacity?: number;
+			currentSize?: number;
+			isTiled?: boolean;
+			watermarkCount?: number;
+		} = $props();
 
-	// Position presets with better labels
 	const positions = [
 		{ label: '↖', value: 'northwest', title: 'Top Left' },
 		{ label: '↑', value: 'north', title: 'Top Center' },
@@ -55,7 +52,6 @@ Professional watermark controls with text, image, and advanced options
 		{ label: '↘', value: 'southeast', title: 'Bottom Right' }
 	];
 
-	// Size presets (percentage of image width)
 	const sizePresets = [
 		{ label: 'XS', value: 50 },
 		{ label: 'S', value: 75 },
@@ -69,11 +65,8 @@ Professional watermark controls with text, image, and advanced options
 		onOpacityChange?.(Number.parseFloat(target.value));
 	}
 
-	// Keyboard shortcuts
 	function handleKeyDown(e: KeyboardEvent) {
-		if ((e.target as HTMLElement).tagName === 'INPUT') {
-			return;
-		}
+		if ((e.target as HTMLElement).tagName === 'INPUT') return;
 
 		switch (e.key) {
 			case 'Delete':
@@ -101,283 +94,124 @@ Professional watermark controls with text, image, and advanced options
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<div class="watermark-controls" role="toolbar" aria-label="Watermark controls">
-	<!-- Group 1: Add Controls -->
-	<div class="control-group">
-		<div class="add-buttons">
-			<Button variant="tertiary" size="sm" onclick={onAddImage} title="Add Image Watermark (I)">
-				<iconify-icon icon="mdi:image-plus" width="18"></iconify-icon>
-				<span class="hidden sm:inline">Add Image</span>
-			</Button>
+<div class="flex flex-col flex-[0_0_auto] gap-1 items-stretch w-full min-w-0 h-auto leading-none" role="toolbar" aria-label="Watermark controls">
+	<div class="flex flex-wrap gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none flex-nowrap overflow-x-auto overflow-y-hidden pb-0 [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full">
+		<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35" onclick={onAddImage} title="Add image watermark (I)">
+			<iconify-icon icon="mdi:image-plus" width="15" aria-hidden="true"></iconify-icon>
+			<span>Add image</span>
+		</button>
 
-			{#if onAddText}
-				<Button variant="tertiary" size="sm" onclick={onAddText} title="Add Text Watermark (T)">
-					<iconify-icon icon="mdi:text-box-plus" width="18"></iconify-icon>
-					<span class="hidden sm:inline">Add Text</span>
-				</Button>
-			{/if}
-		</div>
+		{#if onAddText}
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35" onclick={onAddText} title="Add text watermark (T)">
+				<iconify-icon icon="mdi:text-box-plus" width="15" aria-hidden="true"></iconify-icon>
+				<span>Add text</span>
+			</button>
+		{/if}
 
 		{#if watermarkCount > 0}
-			<Badge variant="surface" class="text-xs"><span class="font-bold">{watermarkCount}</span></Badge>
+			<span class="text-[9px] font-semibold text-[rgba(255,255,255,0.45)]">{watermarkCount} active</span>
+		{/if}
+
+		{#if hasSelection}
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35"
+				onclick={onDeleteWatermark}
+				title="Delete watermark"
+				aria-label="Delete watermark"
+			>
+				<iconify-icon icon="mdi:delete" width="15" aria-hidden="true"></iconify-icon>
+				<span>Delete</span>
+			</button>
 		{/if}
 	</div>
 
 	{#if selectedType === 'text' && onTextDraftChange}
-		<div class="text-editor">
-			<label class="text-label" for="watermark-text">Text</label>
-			<input
+		<div class="flex flex-wrap gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none flex-nowrap overflow-x-auto overflow-y-hidden pb-0 [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full">
+			<label class="text-[11px] font-normal text-[rgba(255,255,255,0.45)] lowercase" for="watermark-text">text</label>
+			<input aria-label="Opacity"
 				id="watermark-text"
 				type="text"
-				class="text-input"
+				class="h-7 px-2 text-[11px] font-medium text-white bg-white/6 border border-white/[0.1] rounded-md outline-none focus:border-white/[0.25] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:m-0 [&::-webkit-inner-spin-button]:m-0 [&[type=number]]:[-moz-appearance:textfield] [&[type=number]]:[appearance:textfield] min-w-40 flex-1"
 				value={textDraft}
 				placeholder="Watermark text"
 				oninput={(e) => onTextDraftChange(e.currentTarget.value)}
 			/>
-			<Button variant="primary" size="sm" onclick={onApplyText || (() => undefined)}>Apply</Button>
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium whitespace-nowrap cursor-pointer rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35 text-white bg-white/[0.1] border-white/[0.14]" onclick={onApplyText || (() => undefined)}>
+				Apply
+			</button>
 		</div>
 	{/if}
 
 	{#if hasSelection}
-		<div class="divider"></div>
-
-		<!-- Group 2: Position -->
-		<div class="control-group">
-			<span class="control-label hidden md:flex">Position:</span>
-			<div class="position-grid">
+		<div class="flex flex-wrap gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none flex-nowrap overflow-x-auto overflow-y-hidden pb-0 [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full">
+			<span class="text-[11px] font-normal text-[rgba(255,255,255,0.45)] lowercase">position</span>
+			<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full grid grid-cols-3 gap-0.5 p-0.5 rounded-lg">
 				{#each positions as pos (pos.value)}
-					<Button variant="ghost" size="sm" class="w-7! h-7! p-0! min-w-0 text-gray-400 hover:text-white hover:bg-white/10" onclick={() => onPositionChange(pos.value)} title={pos.title} aria-label={pos.title}>{pos.label}</Button>
+					<button
+						type="button"
+						class="inline-flex flex-[0_0_auto] gap-1.5 items-center justify-center min-w-7 px-[0.35rem] h-7 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35"
+						onclick={() => onPositionChange(pos.value)}
+						title={pos.title}
+						aria-label={pos.title}
+					>
+						{pos.label}
+					</button>
 				{/each}
 			</div>
 		</div>
 
-		<!-- Group 3: Style (Opacity, Size, Tiled) -->
-		<div class="control-group flex-1">
-			<!-- Opacity -->
-			{#if onOpacityChange}
-				<div class="slider-wrapper flex-1">
-					<div class="slider-track-container">
-						<input
-							type="range"
-							min="0"
-							max="1"
-							step="0.01"
-							value={currentOpacity}
-							oninput={handleOpacityInput}
-							class="slider"
-							aria-label="Watermark opacity"
-							title="Opacity: {Math.round(currentOpacity * 100)}%"
-						/>
+		{#if onOpacityChange || onSizeChange || onTileToggle}
+			<div class="flex flex-wrap gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none flex-nowrap overflow-x-auto overflow-y-hidden pb-0 [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full">
+				{#if onOpacityChange}
+					<div class="flex flex-col gap-1 w-full max-w-[36rem] mx-auto flex-[1_1_10rem] max-w-64 mx-0">
+						<div class="flex items-center justify-between">
+							<span class="text-[11px] font-normal text-[rgba(255,255,255,0.45)] lowercase">opacity</span>
+							<span class="min-w-8 text-xs font-medium text-[rgba(255,255,255,0.45)] text-end text-white">{Math.round(currentOpacity * 100)}%</span>
+						</div>
+						<div class="flex gap-2.5 items-center">
+							<input aria-label="Scale"
+								type="range"
+								min="0"
+								max="1"
+								step="0.01"
+								value={currentOpacity}
+								oninput={handleOpacityInput}
+								class="flex-1 h-1 m-0 appearance-none cursor-pointer bg-white/[0.18] rounded-full [&::-webkit-slider-thumb]:size-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:rounded-full [&::-moz-range-thumb]:size-3.5 [&::-moz-range-thumb]:cursor-pointer [&::-moz-range-thumb]:bg-white [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-transparent [&::-moz-range-thumb]:rounded-full"
+							/>
+						</div>
 					</div>
-					<div class="slider-value">{Math.round(currentOpacity * 100)}%</div>
-				</div>
-			{/if}
+				{/if}
 
-			{#if onSizeChange}
-				<div class="size-presets hidden sm:flex">
+				{#if onSizeChange}
 					{#each sizePresets as preset (preset.value)}
-						<Button
-							variant={Math.abs(currentSize - preset.value) < 5 ? 'primary' : 'outline'}
-							size="sm"
+						<button
+							type="button"
+							class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35"
+							class:text-white={Math.abs(currentSize - preset.value) < 5}
 							onclick={() => onSizeChange(preset.value)}
 							title="{preset.label} ({preset.value}%)"
 						>
 							{preset.label}
-						</Button>
+						</button>
 					{/each}
-				</div>
-			{/if}
+				{/if}
 
-			{#if onTileToggle}
-				<Button
-					variant={isTiled ? 'tertiary' : 'outline'}
-					size="sm"
-					onclick={onTileToggle}
-					title="Tile watermark across image"
-					aria-label="Tile watermark across image"
-				>
-					<iconify-icon icon="mdi:view-grid" width="18"></iconify-icon>
-				</Button>
-			{/if}
-		</div>
-
-		<div class="divider hidden lg:block"></div>
-
-		<!-- Group 4: Actions (Delete) -->
-		<Button variant="error" size="sm" onclick={onDeleteWatermark} title="Delete Watermark (Delete)" aria-label="Delete watermark">
-			<iconify-icon icon="mdi:delete" width="18"></iconify-icon>
-		</Button>
+				{#if onTileToggle}
+					<button
+						type="button"
+						class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35"
+						class:text-white={isTiled}
+						onclick={onTileToggle}
+						title="Tile watermark"
+						aria-label="Tile watermark across image"
+						aria-pressed={isTiled}
+					>
+						<iconify-icon icon="mdi:view-grid" width="15" aria-hidden="true"></iconify-icon>
+						<span>Tile</span>
+					</button>
+				{/if}
+			</div>
+		{/if}
 	{/if}
-
-	<!-- Spacer -->
-	<div class="flex-1 hidden lg:block"></div>
-
-	<!-- Actions removed: Handled by global toolbar -->
-	<div class="h-2"></div>
 </div>
-
-<style>
-	.watermark-controls {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1rem;
-		align-items: center;
-		width: 100%;
-		padding: 0;
-		background: transparent;
-		border: none;
-	}
-
-	.control-group {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-		align-items: center;
-	}
-
-	.control-label {
-		display: flex;
-		gap: 0.25rem;
-		align-items: center;
-		font-size: 0.75rem;
-		font-weight: 600;
-		color: rgb(var(--color-surface-500) / 1);
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		white-space: nowrap;
-	}
-
-	:global(.dark) .control-label {
-		color: rgb(var(--color-surface-400) / 1);
-	}
-
-	.add-buttons {
-		display: flex;
-		gap: 0.5rem;
-	}
-
-	.text-editor {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		padding: 0.35rem 0.5rem;
-		background: rgba(0, 0, 0, 0.2);
-		border-radius: 0.75rem;
-	}
-
-	.text-label {
-		font-size: 0.7rem;
-		font-weight: 700;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: #9ca3af;
-	}
-
-	.text-input {
-		min-width: 180px;
-		padding: 0.4rem 0.6rem;
-		color: #fff;
-		background: rgba(255, 255, 255, 0.06);
-		border: 1px solid rgba(255, 255, 255, 0.12);
-		border-radius: 0.5rem;
-		outline: none;
-	}
-
-	.text-input:focus {
-		border-color: rgb(var(--color-primary-500) / 1);
-		box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
-	}
-
-	.position-grid {
-		display: grid;
-		grid-template-columns: repeat(3, 1fr);
-		gap: 2px;
-		padding: 2px;
-		background: rgba(0, 0, 0, 0.2);
-		border-radius: 0.375rem;
-	}
-
-	/* Slider */
-	.slider-wrapper {
-		display: flex;
-		gap: 0.75rem;
-		align-items: center;
-		min-width: 160px;
-		height: 2.25rem;
-		padding: 0.25rem 0.75rem;
-		background: rgba(0, 0, 0, 0.2);
-		border: 1px solid rgba(255, 255, 255, 0.1);
-		border-radius: 9999px;
-	}
-
-	.slider-track-container {
-		position: relative;
-		display: flex;
-		flex: 1;
-		align-items: center;
-		height: 100%;
-	}
-
-	.slider {
-		position: absolute;
-		width: 100%;
-		height: 4px;
-		margin: 0;
-		-webkit-appearance: none;
-		appearance: none;
-		cursor: pointer;
-		outline: none;
-		background: rgb(var(--color-surface-300) / 1);
-		border-radius: 2px;
-	}
-
-	:global(.dark) .slider {
-		background: rgb(var(--color-surface-600) / 1);
-	}
-
-	.slider::-webkit-slider-thumb {
-		width: 16px;
-		height: 16px;
-		margin-top: -6px;
-		-webkit-appearance: none;
-		appearance: none;
-		cursor: pointer;
-		background: white;
-		border: 2px solid rgb(var(--color-primary-500) / 1);
-		border-radius: 50%;
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-		transition: transform 0.1s;
-	}
-
-	.slider-value {
-		min-width: 2.5rem;
-		font-family: monospace;
-		font-size: 0.75rem;
-		font-weight: 600;
-		color: rgb(var(--color-primary-500) / 1);
-		text-align: right;
-	}
-
-	.size-presets {
-		display: flex;
-		gap: 0.25rem;
-	}
-
-	.divider {
-		flex-shrink: 0;
-		width: 1px;
-		height: 1.5rem;
-		background: rgb(var(--color-surface-300) / 1);
-	}
-
-	:global(.dark) .divider {
-		background: rgb(var(--color-surface-600) / 1);
-	}
-
-	/* Mobile */
-	@media (max-width: 1024px) {
-		.watermark-controls {
-			row-gap: 1rem;
-		}
-	}
-</style>

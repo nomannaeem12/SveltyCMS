@@ -4,11 +4,13 @@
  * Uses svelte-realtime for high-performance WebSocket communication.
  */
 
+import { logger } from "@utils/logger";
 import type { AutomationEventPayload } from "@src/services/background/automation/types";
 import { collections } from "@src/stores/collection-store.svelte";
 import { toast } from "@src/stores/toast.svelte.ts";
 import { ui } from "@src/stores/ui-store.svelte";
 import { browser } from "$app/environment";
+import { page } from "$app/state";
 import { events } from "$live/system";
 import { chat, sendMessage as sendRpcMessage } from "$live/chat";
 
@@ -64,63 +66,97 @@ class CollaborationStore {
   private effectCleanup?: () => void;
 
   constructor() {
-    if (browser) {
-      // 1. Subscribe to the global events store
-      const unsubscribeEvents = this.eventStream.subscribe((value: any) => {
-        this.eventStreamValue = (value as any[]) || [];
-      });
-
-      this.effectCleanup = $effect.root(() => {
-        // 2. Room Management (Auto-join based on collection)
-        $effect(() => {
-          const activeCollection = collections.active;
-          const activeValue = collections.activeValue;
-
-          if (activeCollection) {
-            let room = `collection:${activeCollection._id}`;
-            if (activeValue && (activeValue as any)._id) {
-              room = `entry:${(activeValue as any)._id}`;
-            }
-
-            if (this.currentRoom !== room) {
-              this.currentRoom = room;
-            }
-          } else if (this.currentRoom !== null) {
-            this.currentRoom = null;
-          }
+    // Skip real-time connections on login/setup pages — user isn't authenticated yet
+    try {
+      if (
+        browser &&
+        !page.url.pathname.startsWith("/login") &&
+        !page.url.pathname.startsWith("/setup")
+      ) {
+        // 1. Subscribe to the global events store
+        const unsubscribeEvents = this.eventStream.subscribe((value: any) => {
+          this.eventStreamValue = (value as any[]) || [];
         });
 
-        // 3. Dynamic chat stream subscription based on currentRoom
-        $effect(() => {
-          const stream = chat(this.currentRoom || "ai");
-          const unsubscribeChat = stream.subscribe((value: any) => {
-            this.chatStreamValue = (value as any[]) || [];
+        this.effectCleanup = $effect.root(() => {
+          // 2. Room Management (Auto-join based on collection)
+          $effect(() => {
+            const activeCollection = collections.active;
+            const activeValue = collections.activeValue;
+
+            if (activeCollection) {
+              let room = `collection:${activeCollection._id}`;
+              if (activeValue && (activeValue as any)._id) {
+                room = `entry:${(activeValue as any)._id}`;
+              }
+
+              if (this.currentRoom !== room) {
+                this.currentRoom = room;
+              }
+            } else if (this.currentRoom !== null) {
+              this.currentRoom = null;
+            }
           });
-          return unsubscribeChat;
+
+          // 3. Dynamic chat stream subscription based on currentRoom
+          $effect(() => {
+            // chat is a live.stream factory on the client; guard so a broken
+            // realtime export never takes down AdminPageShell (500s in E2E).
+            if (typeof chat !== "function") {
+              this.isConnected = false;
+              return;
+            }
+            try {
+              const stream = chat(this.currentRoom || "ai");
+              if (!stream?.subscribe) {
+                this.isConnected = false;
+                return;
+              }
+              const unsubscribeChat = stream.subscribe((value: any) => {
+                this.chatStreamValue = (value as any[]) || [];
+              });
+              return unsubscribeChat;
+            } catch (err) {
+              this.isConnected = false;
+              logger.debug(
+                "[CollaborationStore] chat stream unavailable:",
+                err instanceof Error ? err.message : String(err),
+              );
+              return;
+            }
+          });
+
+          // 4. Notification Triggers (Toasts)
+          $effect(() => {
+            const latestEvent = this.eventStreamValue.at(-1);
+            if (latestEvent) {
+              this.triggerToast(latestEvent);
+            }
+          });
+
+          // 5. Typing State Management
+          $effect(() => {
+            const history = this.aiHistory;
+            const lastMsg = history.at(-1);
+            this.isTyping = lastMsg?.role === "user";
+          });
         });
 
-        // 4. Notification Triggers (Toasts)
-        $effect(() => {
-          const latestEvent = this.eventStreamValue.at(-1);
-          if (latestEvent) {
-            this.triggerToast(latestEvent);
-          }
-        });
-
-        // 5. Typing State Management
-        $effect(() => {
-          const history = this.aiHistory;
-          const lastMsg = history.at(-1);
-          this.isTyping = lastMsg?.role === "user";
-        });
-      });
-
-      // Wrap the cleanup to release the events subscription as well
-      const originalCleanup = this.effectCleanup;
-      this.effectCleanup = () => {
-        unsubscribeEvents();
-        originalCleanup();
-      };
+        // Wrap the cleanup to release the events subscription as well
+        const originalCleanup = this.effectCleanup;
+        this.effectCleanup = () => {
+          unsubscribeEvents();
+          originalCleanup();
+        };
+      }
+    } catch (err) {
+      // Silently handle initialization failures — the collaboration panel
+      // will show as "offline" without crashing the app.
+      this.isConnected = false;
+      logger.debug(
+        "[CollaborationStore] Initialization skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
     }
   }
 
@@ -170,7 +206,7 @@ class CollaborationStore {
         history,
       });
     } catch (err) {
-      console.error("RTC: Send message error", err);
+      logger.error("RTC: Send message error", err);
       toast.error({ title: "Error", description: "Failed to send message" });
     }
   }

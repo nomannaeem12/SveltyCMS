@@ -11,6 +11,7 @@
  */
 
 import type { WidgetRecord as widgets } from "@src/widgets/types";
+import type { SchemaHooks } from "./schema-hooks";
 // Note: collectionSchemas may be used in the future for runtime validation
 
 // Auth
@@ -88,15 +89,33 @@ export interface ContentNode extends BaseEntity {
   description?: string;
   icon?: string;
   name: string;
-  nodeType: "category" | "collection";
+  nodeType: "category" | "collection" | "folder";
   order: number;
   position?: number;
   parentId?: DatabaseId;
   path?: string;
   slug?: string;
-  source?: "filesystem" | "database";
+  source?: "filesystem" | "database" | "builder";
   translations: Translation[];
 }
+
+/**
+ * Partial payload for GUI structure mutations (create/update/move/delete/rename).
+ * Only `path` is required for delete; create/move supply additional fields.
+ */
+export type ContentNodeInput = {
+  path: string;
+  _id?: DatabaseId | string;
+  name?: string;
+  nodeType?: ContentNode["nodeType"];
+  parentId?: DatabaseId | string;
+  order?: number;
+  source?: ContentNode["source"];
+  icon?: string;
+  description?: string;
+  translations?: Translation[];
+  [key: string]: unknown;
+};
 
 // --- Website Token ---
 // Represents an API token for headless website access.
@@ -217,6 +236,9 @@ export interface FieldInstance {
   disableUnique?: boolean;
   tenantScopedUnique?: boolean;
 
+  /** Maximum allowed length for string field values (default: 255). */
+  maxLength?: number;
+
   // Functions
   validate?: (value: FieldValue) => boolean | Promise<boolean>;
   /** A reference to the widget's immutable definition. */
@@ -253,7 +275,22 @@ export interface MinimalSchema {
   _id?: string;
   name?: ContentTypes | string;
   fields: FieldDefinition[];
+  hooks?: SchemaHooks;
   [key: string]: any;
+}
+
+/** Native collection → virtual collection enrichment (Unified Data Hub sidebar preview) */
+export interface FederationEnrichment {
+  /** Sidebar section label */
+  label: string;
+  /** Native field holding the foreign key */
+  nativeField: string;
+  /** Virtual collection slug to enrich from */
+  virtualSlug: string;
+  /** Virtual field to match against native value (default: id) */
+  virtualKeyField?: string;
+  /** Optional subset of virtual fields to display in preview */
+  displayFields?: string[];
 }
 
 // Collection Schema Definition (SINGLE DEFINITION)
@@ -280,6 +317,18 @@ export interface Schema {
   tenantScopedUnique?: boolean; // If true, unique schema-level indexes include tenantId
   translations?: Translation[]; // Optional translations with enhanced metadata
   displaySpec?: Record<string, unknown>; // json-render-svelte display specification
+  /** If true, bulk delete operations are forbidden for this collection */
+  disableBulkDelete?: boolean;
+  /**
+   * Schema lifecycle hooks that run on every write path.
+   * - beforeValidate: normalizes/transforms data before field validation
+   * - afterValidate: transforms data after validation passes
+   *
+   * All hooks are optional — schemas without hooks work unchanged.
+   */
+  hooks?: SchemaHooks;
+  /** Unified Data Hub: virtual enrichment previews in entry editor sidebar */
+  federationEnrichments?: FederationEnrichment[];
 }
 
 export interface MinimalContentNode {
@@ -301,7 +350,7 @@ export interface Category {
 export type ContentNodeOperationType = "create" | "delete" | "move" | "rename" | "update";
 
 export interface ContentNodeOperation {
-  node: ContentNode;
+  node: ContentNodeInput;
   type: ContentNodeOperationType;
 }
 
@@ -375,7 +424,7 @@ export interface NavigationNode {
   icon?: string;
   lastModified?: Date;
   name: string;
-  nodeType: "category" | "collection";
+  nodeType: "category" | "collection" | "folder";
   order?: number;
   parentId?: string;
   path?: string;

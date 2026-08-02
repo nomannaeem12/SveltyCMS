@@ -59,6 +59,9 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			totpSecret VARCHAR(255),
 			backupCodes JSON,
 			last2FAVerification DATETIME,
+			authenticators JSON,
+			failedAttempts INT NOT NULL DEFAULT 0,
+			lockoutUntil DATETIME,
 			tenantId VARCHAR(36),
 			createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -344,6 +347,21 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			UNIQUE INDEX plugin_tenant_unique (pluginId, tenantId)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
+    // Plugin Storage
+    `CREATE TABLE IF NOT EXISTS plugin_storage (
+			_id VARCHAR(36) PRIMARY KEY,
+			plugin VARCHAR(255) NOT NULL,
+			collection VARCHAR(255) NOT NULL,
+			tenantId VARCHAR(36),
+			data JSON NOT NULL,
+			createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			INDEX plugin_storage_plugin_idx (plugin),
+			INDEX plugin_storage_collection_idx (collection),
+			INDEX plugin_storage_tenant_idx (tenantId),
+			INDEX plugin_storage_plugin_collection_idx (plugin, collection)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
     // Plugin Migrations
     `CREATE TABLE IF NOT EXISTS plugin_migrations (
 			_id VARCHAR(36) PRIMARY KEY,
@@ -380,13 +398,13 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			userAgent TEXT,
 			tenantId VARCHAR(36),
 			createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			      previousHash VARCHAR(64),
-			      chainHash VARCHAR(64),
-			      INDEX timestamp_idx (timestamp),
-			      INDEX event_type_idx (eventType),
-			      INDEX tenant_idx (tenantId)
-			    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+			updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			previousHash VARCHAR(64),
+			chainHash VARCHAR(64),
+			INDEX timestamp_idx (timestamp),
+			INDEX event_type_idx (eventType),
+			INDEX tenant_idx (tenantId)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
     // Svelty Jobs
     `CREATE TABLE IF NOT EXISTS svelty_jobs (
@@ -406,6 +424,26 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			INDEX tenant_idx (tenantId)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
+    // Transactional outbox
+    `CREATE TABLE IF NOT EXISTS svelty_outbox (
+			_id VARCHAR(36) PRIMARY KEY,
+			tenantId VARCHAR(36),
+			eventType VARCHAR(255) NOT NULL,
+			aggregateType VARCHAR(255) NOT NULL,
+			aggregateId VARCHAR(255) NOT NULL,
+			payload JSON NOT NULL,
+			status VARCHAR(50) NOT NULL DEFAULT 'pending',
+			deliveredAt DATETIME,
+			attempts INT NOT NULL DEFAULT 0,
+			lastError TEXT,
+			createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			INDEX outbox_status_idx (status),
+			INDEX outbox_tenant_idx (tenantId),
+			INDEX outbox_event_type_idx (eventType),
+			INDEX outbox_created_at_idx (createdAt)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
     // 404 Logs
     `CREATE TABLE IF NOT EXISTS \`404_logs\` (
 			_id VARCHAR(36) PRIMARY KEY,
@@ -416,7 +454,7 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			metadata JSON NOT NULL,
 			createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			INDEX path_tenant_idx (path, tenantId)
+			UNIQUE INDEX path_tenant_idx (path, tenantId)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
     // Redirects MV
@@ -431,8 +469,9 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			metadata JSON NOT NULL,
 			createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			INDEX tenant_source_idx (tenantId, source)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+			      INDEX tenant_source_idx (tenantId, source),
+						INDEX idx_redirects_mv_lookup (tenantId, source, active)
+					) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
     // Workflow Definitions
     `CREATE TABLE IF NOT EXISTS workflow_definitions (
@@ -460,28 +499,52 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
 			INDEX entry_idx (entryId, collectionId)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
-    // Full-text search indexes (not auto-created by Drizzle ORM)
-    `CREATE FULLTEXT INDEX IF NOT EXISTS content_nodes_fts_idx ON content_nodes (name, description)`,
+    // Full-text search indexes are applied best-effort after core tables.
   ];
 
   for (const query of queries) {
-    await connection.query(query);
+    try {
+      await connection.query(query);
+    } catch (err) {
+      // Never abort the whole migration for a single statement; log and continue.
+      logger.warn(
+        `[MariaDB] Migration statement failed (continuing): ${(err as any)?.message || String(err)}`,
+      );
+    }
+  }
+
+  // Optional FTS index — best-effort only
+  try {
+    await connection.query(
+      `CREATE FULLTEXT INDEX content_nodes_fts_idx ON content_nodes (name, description)`,
+    );
+  } catch {
+    // Index may already exist or engine may not support FULLTEXT on these columns
   }
 
   // Add isRegistered column if it doesn't exist (for existing databases)
   try {
     await connection.query(
-      `ALTER TABLE auth_users ADD COLUMN isRegistered BOOLEAN NOT NULL DEFAULT FALSE`,
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS isRegistered BOOLEAN NOT NULL DEFAULT FALSE`,
     );
     await connection.query(
-      `ALTER TABLE auth_users ADD COLUMN role VARCHAR(50) NOT NULL DEFAULT 'user'`,
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS role VARCHAR(50) NOT NULL DEFAULT 'user'`,
     );
     await connection.query(
-      `ALTER TABLE auth_users ADD COLUMN is2FAEnabled BOOLEAN NOT NULL DEFAULT FALSE`,
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS is2FAEnabled BOOLEAN NOT NULL DEFAULT FALSE`,
     );
-    await connection.query(`ALTER TABLE auth_users ADD COLUMN totpSecret VARCHAR(255)`);
-    await connection.query(`ALTER TABLE auth_users ADD COLUMN backupCodes JSON`);
-    await connection.query(`ALTER TABLE auth_users ADD COLUMN last2FAVerification DATETIME`);
+    await connection.query(
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS totpSecret VARCHAR(255)`,
+    );
+    await connection.query(`ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS backupCodes JSON`);
+    await connection.query(
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS last2FAVerification DATETIME`,
+    );
+    await connection.query(`ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS authenticators JSON`);
+    await connection.query(
+      `ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS failedAttempts INT NOT NULL DEFAULT 0`,
+    );
+    await connection.query(`ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS lockoutUntil DATETIME`);
     await connection.query(`ALTER TABLE content_nodes ADD COLUMN IF NOT EXISTS collectionDef JSON`);
     await connection.query(
       `ALTER TABLE content_nodes ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'filesystem'`,
@@ -533,6 +596,15 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
     } catch (err) {
       logger.error("[MariaDB] redirects_mv column migration failed:", err);
     }
+
+    // 🚀 MIGRATION: Add compound lookup index (tenantId, source, active) for redirects_mv
+    try {
+      await connection.query(
+        "CREATE INDEX IF NOT EXISTS idx_redirects_mv_lookup ON redirects_mv (tenantId, source, active)",
+      );
+    } catch {
+      // Index may already exist
+    }
   } catch {
     // Column already exists or other error we can ignore
   }
@@ -545,7 +617,7 @@ async function createTablesIfNotExist(connection: mysql.Pool): Promise<void> {
         const tableName = Object.values(row as any)[0] as string;
         // MariaDB supports ADD COLUMN IF NOT EXISTS
         await connection.query(
-          `ALTER TABLE \`${tableName}\` ADD COLUMN IF NOT EXISTS isDeleted BOOLEAN NOT NULL DEFAULT FALSE`,
+          `ALTER TABLE \`${tableName.replace(/`/g, "``")}\` ADD COLUMN IF NOT EXISTS isDeleted BOOLEAN NOT NULL DEFAULT FALSE`,
         );
       }
     }

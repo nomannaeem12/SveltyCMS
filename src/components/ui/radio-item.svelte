@@ -28,6 +28,7 @@ via Svelte context. Supports default, card, and button visual variants.
 -->
 
 <script lang="ts">
+import { logger } from "@utils/logger";
 	import { cn } from '@utils/cn';
 	import { getContext } from 'svelte';
 	import type { RadioGroupContext } from './radio-group.svelte';
@@ -50,7 +51,7 @@ via Svelte context. Supports default, card, and button visual variants.
 
 	const ctx = getContext<RadioGroupContext>('RADIO_GROUP');
 	if (!ctx && typeof window !== 'undefined') {
-		console.warn('[RadioItem] Must be used inside a <RadioGroup> component.');
+		logger.warn('[RadioItem] Must be used inside a <RadioGroup> component.');
 	}
 
 	const checked = $derived(ctx?.value === itemValue);
@@ -86,7 +87,7 @@ via Svelte context. Supports default, card, and button visual variants.
 				: 'border-surface-200 dark:border-surface-700 bg-surface-50 dark:bg-surface-900 hover:border-surface-300 dark:hover:border-surface-600',
 			ctx?.invalid && 'border-error-500!',
 			isDisabled && 'opacity-50 cursor-not-allowed',
-			!isDisabled && 'cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/40 focus-visible:ring-offset-2',
+			!isDisabled && 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/40 focus-visible:ring-offset-2',
 			className
 		)}
 		onclick={handleSelect}
@@ -129,7 +130,7 @@ via Svelte context. Supports default, card, and button visual variants.
 				? 'border-tertiary-500 dark:border-primary-500 bg-primary-50 dark:bg-primary-500/20 text-primary-700 dark:text-primary-300'
 				: 'border-surface-200 dark:border-surface-700 bg-surface-50 dark:bg-surface-900 text-surface-700 dark:text-surface-300 hover:border-surface-300 dark:hover:border-surface-600',
 			isDisabled && 'opacity-50 cursor-not-allowed',
-			!isDisabled && 'cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/40',
+			!isDisabled && 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/40',
 			className
 		)}
 		onclick={handleSelect}
@@ -142,10 +143,11 @@ via Svelte context. Supports default, card, and button visual variants.
 	<label
 		class={cn(
 			'inline-flex items-center gap-2.5 select-none',
-			isDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
-			className
-		)}
-	>
+			isDisabled ? 'opacity-50 cursor-not-allowed' : '',
+							className
+						)}
+					>
+						<input type="radio" aria-label={label || itemValue || 'Radio option'} />
 		<button
 			type="button"
 			role="radio"

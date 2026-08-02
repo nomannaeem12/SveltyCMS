@@ -17,6 +17,7 @@ import { Renderer, JSONUIProvider, type Spec } from "json-render-svelte";
 import { sveltyRegistry } from "@src/services/json-render/catalog";
 import type { Snippet } from "svelte";
 import { logger } from "@utils/logger";
+import { clientJsonHeaders } from "@utils/security/client-csrf";
 	import Button from '@components/ui/button.svelte';
 	import Input from '@components/ui/input.svelte';
 
@@ -43,7 +44,7 @@ async function handleRegenerate() {
 	try {
 		const response = await fetch("/api/ai/generate-layout", {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: clientJsonHeaders(),
 			body: JSON.stringify({
 				prompt: prompt,
 				contextRules:

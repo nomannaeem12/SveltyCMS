@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, afterAll } from "bun:test";
+import { beforeAll, describe, expect, it, afterAll } from "vitest";
 import { getApiBaseUrl, safeFetch, waitForServer } from "../helpers/server";
 import { prepareAuthenticatedContext, cleanupTestDatabase } from "../helpers/test-setup";
 import { generateUUID } from "@src/utils/native-utils";
@@ -17,7 +17,7 @@ describe("Authentication Lockout Integration", () => {
     testUserEmail = `lockout-test-${generateUUID()}@example.com`;
 
     // Create a specific user for lockout testing using the admin context
-    const createUserRes = await safeFetch(`${API_BASE_URL}/api/users`, {
+    const createUserRes = await safeFetch(`${API_BASE_URL}/api/user`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -49,11 +49,15 @@ describe("Authentication Lockout Integration", () => {
     for (let i = 0; i < 5; i++) {
       const res = await safeFetch(loginUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Test-Security": "true" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Test-Security": "true",
+        },
         body: JSON.stringify({
           email: testUserEmail,
           password: "WrongPassword123!",
         }),
+        skipTestSecret: true,
       });
       // Should be 401 or similar for failed login
       expect(res.status).toBeGreaterThanOrEqual(400);
@@ -62,11 +66,15 @@ describe("Authentication Lockout Integration", () => {
     // 2. Submit the 6th failed attempt, which should trigger a lockout response
     const lockoutRes = await safeFetch(loginUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Test-Security": "true" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Test-Security": "true",
+      },
       body: JSON.stringify({
         email: testUserEmail,
         password: "WrongPassword123!",
       }),
+      skipTestSecret: true,
     });
 
     // Auth lockout typically returns 423 Locked or 429 Too Many Requests or 403
@@ -75,11 +83,15 @@ describe("Authentication Lockout Integration", () => {
     // 3. Attempt a successful login, which should fail because the account is locked out
     const correctRes = await safeFetch(loginUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Test-Security": "true" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Test-Security": "true",
+      },
       body: JSON.stringify({
         email: testUserEmail,
         password: testUserPassword,
       }),
+      skipTestSecret: true,
     });
 
     // Even with the correct password, the account is locked, so login must fail

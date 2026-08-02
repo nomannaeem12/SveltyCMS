@@ -73,15 +73,15 @@ This component provides a tooltip for any element.
 	const resolvedTriggerClass = $derived(`p-0 m-0 border-none ${!triggerClass ? 'bg-transparent' : ''} ${wFull ? 'block w-full' : 'inline-block'} ${triggerClass}`);
 </script>
 
-<Tooltip
-	{title}
-	{positioning}
-	class={`${TOOLTIP_CLASS} ${contentClass}`}
-	triggerClass={resolvedTriggerClass}
-	style={triggerStyle}
-	{role}
-	{tabindex}
->
+	<Tooltip
+		{title}
+		{positioning}
+		class={`${TOOLTIP_CLASS} ${contentClass}`}
+		triggerClass={resolvedTriggerClass}
+		style={triggerStyle}
+		{role}
+		{tabindex}
+	>
 	{#snippet children()}
 		{@render childrenProp?.()}
 	{/snippet}

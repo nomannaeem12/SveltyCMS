@@ -7,7 +7,7 @@ published: true
 order: 3
 author: "SveltyCMS Team"
 created: "2025-10-05"
-updated: "2026-03-27"
+updated: "2026-07-07"
 tags:
   - "user"
   - "registration"
@@ -17,8 +17,6 @@ tags:
 ---
 
 # User Registration & Invitations
-
-## Overview
 
 ## Overview
 
@@ -141,7 +139,7 @@ Each invitation token includes:
 4. **Expired**: Token past its expiration date (can still be viewed)
 5. **Blocked**: Token manually disabled by admin
 
-### Token Security
+### Token Security {#token-lifecycle-security}
 
 - Tokens are unique, cryptographically secure strings
 - Each token can only be used once
@@ -376,7 +374,7 @@ Registration attempts are rate-limited to prevent abuse:
 - 100 requests per minute per IP + User-Agent
 - 50 requests per minute per cookie
 
-### Token Security
+### Token Security {#token-security-2}
 
 - Cryptographically secure random tokens
 - One-time use (consumed upon successful registration)
@@ -414,11 +412,17 @@ token=invite_token_here
 
 ## Related Documentation
 
-- [Admin User Management](/docs/architecture/admin-user-management.mdx) - Managing users and permissions
-- [Access Management](/docs/architecture/admin-user-management.mdx) - Roles and permissions system
-- [Two-Factor Authentication](/docs/api/auth.mdx) - Enhanced security setup
-- [Multi-Tenant Configuration](/docs/architecture/multi-tenancy.mdx) - Tenant isolation setup
+- [Admin User Management](/docs/reference/architecture/admin-user-management.mdx) - Managing users and permissions
+- [Access Management](/docs/guides/configuration/access-management.mdx) - Roles and permissions system
+- [Email System](/docs/guides/configuration/email-system.mdx) - SMTP configuration and email templates
+- [Two-Factor Authentication](/docs/reference/api/auth.mdx) - Enhanced security setup
+- [Multi-Tenant Configuration](/docs/reference/architecture/multi-tenancy.mdx) - Tenant isolation setup
 
 ---
 
-**Last Updated**: October 5, 2025
+> **Note on SMTP**: If SMTP is not configured, invitation tokens and password reset links are
+> **not sent via email**. The admin must copy the token/link from the server terminal or share
+> it manually. See the [Email System Guide](/docs/guides/configuration/email-system.mdx)
+> for details.
+
+**Last Updated**: July 7, 2026

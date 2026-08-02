@@ -10,8 +10,35 @@ async function loadApp() {
 
   // Production configuration
   process.env.BODY_SIZE_LIMIT = "104857600"; // 100MB
-  process.env.ORIGIN = process.env.ORIGIN || "https://demo.sveltycms.com";
-  process.env.NODE_ENV = "production";
+  // Prefer explicit ORIGIN. For local/CI preview (127.0.0.1 / localhost) default to
+  // the listening URL so SvelteKit remote CSRF (completeSetup) is not rejected as
+  // cross-site against the demo production host.
+  if (!process.env.ORIGIN) {
+    const host = process.env.HOST || "127.0.0.1";
+    const port = process.env.PORT || "4173";
+    const isLocal =
+      host === "127.0.0.1" ||
+      host === "localhost" ||
+      host === "0.0.0.0" ||
+      host === "::" ||
+      process.env.TEST_MODE === "true";
+    process.env.ORIGIN = isLocal
+      ? `http://${host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host}:${port}`
+      : "https://demo.sveltycms.com";
+  }
+  // Preserve harness NODE_ENV so /api/testing + test bypass stay open.
+  // Forcing production here was blocking BENCHMARK/TEST_MODE matrix seeding.
+  const isHarness =
+    process.env.TEST_MODE === "true" ||
+    process.env.BENCHMARK === "true" ||
+    process.env.SVELTY_BENCHMARK_SUITE === "true" ||
+    process.env.PLAYWRIGHT_TEST === "true" ||
+    process.env.PLAYWRIGHT_TEST === "1";
+  if (!isHarness) {
+    process.env.NODE_ENV = "production";
+  } else if (!process.env.NODE_ENV || process.env.NODE_ENV === "production") {
+    process.env.NODE_ENV = "test";
+  }
 
   // PROXY HEADERS: Fix for "Too Many Requests" issue & Header mismatches
   process.env.ADDRESS_HEADER = "x-forwarded-for";
@@ -30,13 +57,29 @@ async function loadApp() {
     handler(req, res);
   });
 
+  // Start standard Yjs collaboration WebSocket server
+  console.log("[SveltyCMS] Initializing Yjs WebSocket collaboration server on /ws...");
+  let stopYjs;
+  try {
+    const { startYjsSyncServer } = await import("./build/yjs-sync-server.js");
+    stopYjs = startYjsSyncServer({ server, path: "/ws" });
+  } catch (err) {
+    console.warn("[SveltyCMS] Failed to initialize Yjs collaboration server:", err.message);
+  }
+
   server.listen(port, () => {
-    console.log(`[SveltyCMS] Server listening on port ${port}`);
+    console.log(`[SveltyCMS] Server listening on port ${port} (WS enabled)`);
   });
 
   // Handle signals for graceful shutdown
-  process.on("SIGTERM", () => server.close());
-  process.on("SIGINT", () => server.close());
+  process.on("SIGTERM", () => {
+    if (stopYjs) stopYjs();
+    server.close();
+  });
+  process.on("SIGINT", () => {
+    if (stopYjs) stopYjs();
+    server.close();
+  });
 }
 
 loadApp().catch((err) => {

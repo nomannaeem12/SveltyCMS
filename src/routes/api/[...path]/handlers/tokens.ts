@@ -153,12 +153,14 @@ export async function handleTokenRoutes(
 
       if (isWebsite) {
         if (!body.name) throw new AppError("Name is required", 400);
+        // Allow the client to override tenantId (null = global scope)
+        const tokenTenantId = body.tenantId !== undefined ? body.tenantId : tenantId;
         const result = await cms.websiteTokens.create({
           name: body.name,
           permissions: body.permissions,
           expiresAt: body.expiresAt,
           user: locals.user,
-          tenantId,
+          tenantId: tokenTenantId,
         });
         return rawResponse(event, result, 201);
       }
@@ -225,7 +227,9 @@ export async function handleTokenRoutes(
 
     if (isWebsite) {
       // Website token update: delegate to websiteTokens module
-      const result = await cms.websiteTokens.update(tokenId, updateData, { tenantId });
+      const result = await cms.websiteTokens.update(tokenId, updateData, {
+        tenantId,
+      });
       if (!result) throw new AppError("Website token not found", 404);
       return successResponse(event, result);
     }

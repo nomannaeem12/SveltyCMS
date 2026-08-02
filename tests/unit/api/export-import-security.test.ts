@@ -45,9 +45,15 @@ vi.mock("@src/databases/db", () => {
   };
 });
 
+// Mock tenant utils
+vi.mock("@utils/tenant", () => ({
+  isMultiTenantEnabled: vi.fn().mockReturnValue(true),
+  getTenantIdFromHostname: vi.fn().mockReturnValue(null),
+}));
+
 // Mock settings service
 vi.mock("@src/services/core/settings-service", () => ({
-  getPrivateSettingSync: vi.fn().mockReturnValue(true), // MULTI_TENANT = true
+  getPrivateSettingSync: vi.fn().mockReturnValue(true),
   getAllSettings: vi.fn().mockResolvedValue({ public: {}, private: {} }),
   invalidateSettingsCache: vi.fn(),
   getPublicSettingSync: vi.fn().mockReturnValue("mediaFolder"),
@@ -106,7 +112,11 @@ describe("Export/Import API Security - Tenant Isolation", () => {
     it("should allow super-admin to override tenantId", async () => {
       const event = {
         params: { path: "export" },
-        locals: { user: mockSuperAdmin, tenantId: myTenant, __testBypass: true },
+        locals: {
+          user: mockSuperAdmin,
+          tenantId: myTenant,
+          __testBypass: true,
+        },
         request: {
           method: "POST",
           json: vi.fn().mockResolvedValue({ type: "users" }),

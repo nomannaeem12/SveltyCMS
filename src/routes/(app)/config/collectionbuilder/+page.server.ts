@@ -11,9 +11,10 @@
 // System Logger
 import { contentSystem } from "@src/content/index.server";
 // Auth - Use cached roles from locals instead of global config
-import { hasPermissionWithRoles } from "@src/databases/auth/permissions";
-import { error, fail, redirect, isRedirect, isHttpError } from "@sveltejs/kit";
+import { hasCollectionBuilderPermission } from "@src/databases/auth/permissions";
+import { error, fail, isRedirect, isHttpError } from "@sveltejs/kit";
 import { logger } from "@utils/logger";
+import { getAuthenticatedUser } from "@utils/page-guards.server";
 import type { Actions, PageServerLoad } from "./$types";
 // 🚀 PERFORMANCE: Move static node module imports to the top level
 import path from "node:path";
@@ -23,13 +24,10 @@ import fs from "node:fs";
  * @internal Helper function to enforce collection builder permissions.
  * @throws {Error} If user lacks required permission or is not logged in.
  */
-function requireCollectionBuilderPermission(locals: any): void {
-  const { user, roles: tenantRoles, isAdmin } = locals;
-  if (!user) {
-    throw error(401, "Authentication required");
-  }
-  if (isAdmin) return;
-  if (!hasPermissionWithRoles(user, "config:collectionbuilder", tenantRoles)) {
+function requireCollectionBuilderPermission(locals: App.Locals): void {
+  const user = getAuthenticatedUser(locals);
+  const { roles: tenantRoles, isAdmin } = locals;
+  if (!hasCollectionBuilderPermission(user, tenantRoles, isAdmin)) {
     logger.warn("[CollectionBuilder] Permission denied for action.", {
       userId: user._id,
     });
@@ -38,27 +36,29 @@ function requireCollectionBuilderPermission(locals: any): void {
 }
 
 export const load: PageServerLoad = async ({ locals }) => {
+  logger.info("[CB-DEBUG] Load function started");
   try {
-    const { user, isAdmin, tenantId } = locals;
+    logger.info("[CB-DEBUG] locals keys: " + Object.keys(locals).join(", "));
+    const user = getAuthenticatedUser(locals);
+    const { isAdmin, tenantId } = locals;
+    logger.info(`[CB-DEBUG] user=${!!user}, isAdmin=${isAdmin}, tenantId=${tenantId}`);
 
-    // User authentication already done by handleAuthorization hook. We assume `user` exists here due to the hook.
-    if (!user) {
-      logger.warn("User not authenticated, redirecting to login");
-      throw redirect(302, "/login");
-    }
-
-    // Use centralized guard function (redundant but explicit for load context)
     requireCollectionBuilderPermission(locals);
+    logger.info("[CB-DEBUG] Permission check passed");
 
     // Ensure content system is initialized for this tenant
     if (!contentSystem.isInitialized) {
-      logger.debug("[CollectionBuilder] System not initialized, initializing now...");
+      logger.info("[CB-DEBUG] Content system NOT initialized, initializing...");
       await contentSystem.initialize(tenantId, true);
+      logger.info("[CB-DEBUG] Content system initialized");
+    } else {
+      logger.info("[CB-DEBUG] Content system already initialized");
     }
 
     // Fetch the initial content structure directly from database for organizational work
-    logger.debug("[CollectionBuilder] Fetching content structure from database...");
+    logger.info("[CB-DEBUG] Fetching content structure from database...");
     let contentStructure = await contentSystem.getContentStructureFromDatabase("flat", tenantId);
+    logger.info(`[CB-DEBUG] Content structure fetched: ${contentStructure?.length ?? 0} nodes`);
 
     // 🚑 SELF-HEALING: If no content nodes in DB but system was already marked as
     // initialized (e.g. from a prior skipReconciliation setup), trigger a full refresh.
@@ -116,17 +116,21 @@ export const load: PageServerLoad = async ({ locals }) => {
     });
 
     // Return user data with proper admin status and the content structure
-    const { _id, ...rest } = user;
+    const userId = user._id?.toString();
 
-    if (!_id) {
+    if (!userId) {
       logger.error("[CollectionBuilder] user._id is missing!", { user });
     }
 
     return {
       user: {
-        id: _id?.toString() || "missing-user-id",
-        ...rest,
-        isAdmin, // Add the properly calculated admin status
+        id: userId || "missing-user-id",
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        avatar: user.avatar,
+        locale: user.locale,
+        isAdmin,
       },
       contentStructure: serializedStructure,
     };
@@ -186,7 +190,6 @@ export const actions: Actions = {
   },
 
   saveConfig: async ({ request, locals }) => {
-    // 🛡️ SECURITY FIX: Use centralized permission check
     requireCollectionBuilderPermission(locals);
 
     const formData = await request.formData();
@@ -197,18 +200,8 @@ export const actions: Actions = {
     }
 
     try {
-      await contentSystem.upsertContentNodes(items, locals.tenantId);
-      const updatedStructure = await contentSystem.getContentStructureFromDatabase(
-        "flat",
-        locals.tenantId,
-      );
-      const serializedStructure = updatedStructure.map((node: any) => ({
-        ...node,
-        _id: node._id.toString(),
-        ...(node.parentId ? { parentId: node.parentId.toString() } : {}),
-      }));
-
-      return { success: true, contentStructure: serializedStructure };
+      const { executeGuiStructureSave } = await import("./collectionbuilder.server");
+      return await executeGuiStructureSave(locals.tenantId ?? null, items);
     } catch (err) {
       logger.error("Error saving config:", err);
       return fail(500, { message: "Failed to save configuration" });

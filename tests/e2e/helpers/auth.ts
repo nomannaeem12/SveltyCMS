@@ -1,35 +1,45 @@
 /**
- * @file tests/playwright/helpers/auth.ts
- * @description Shared authentication helper for Playwright tests
- * Uses the same credentials as setup-wizard to ensure consistency
+ * @file tests/e2e/helpers/auth.ts
+ * @description Canonical authentication helper for Playwright E2E tests.
+ *
+ * Single entry for admin login. Credentials come from `@tests/harness`
+ * (same universe as integration seed / CI). Session cookie injection lives
+ * in `test-auth.ts` — import `applySessionCookie` / `ensureAuthenticated`
+ * from there when you need low-level API session attach.
  */
 
 import { expect, type Page } from "@playwright/test";
-import { TEST_API_HEADERS } from "./test-api";
+// Relative import: Playwright does not resolve @tests aliases.
+import {
+  ADMIN_CREDENTIALS as HARNESS_ADMIN,
+  EDITOR_CREDENTIALS as HARNESS_EDITOR,
+  TEST_PASSWORD,
+} from "../../harness/fixtures";
+import { TEST_API_HEADERS } from "./api";
 
 /**
- * Login credentials that match the setup wizard defaults
+ * Login credentials — harness is source of truth; env can override in CI.
  */
 export const ADMIN_CREDENTIALS = {
-  email: process.env.ADMIN_EMAIL || "admin@example.com",
-  password: process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS || "Password123!",
+  email: process.env.ADMIN_EMAIL || HARNESS_ADMIN.email,
+  password: process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS || HARNESS_ADMIN.password,
 };
 
+/** Editor role credentials (RBAC E2E). */
+export const EDITOR_CREDENTIALS = {
+  email: process.env.EDITOR_EMAIL || HARNESS_EDITOR.email,
+  password: process.env.EDITOR_PASSWORD || HARNESS_EDITOR.password,
+};
+
+export { TEST_PASSWORD };
+
 /**
- * Generic login function for any user
+ * Prepare the login form by dismissing modals and clicking the sign in icon
  * @param page - Playwright page object
- * @param email - User email
- * @param password - User password
- * @param waitForUrl - URL pattern to wait for after login (default: not /login)
  */
-export async function loginAs(
-  page: Page,
-  email: string,
-  password: string,
-  waitForUrl?: string | RegExp,
-) {
+export async function prepareLoginForm(page: Page) {
   // Atomic Auth: Clear all previous session state to prevent session bleed
-  console.log(`[Auth] Logging in as ${email}...`);
+  console.log(`[Auth] Preparing login form...`);
   await page.context().clearCookies();
 
   // Navigate first to ensure we have a valid origin for localStorage access
@@ -51,10 +61,15 @@ export async function loginAs(
     // Setup wizard welcome modal
     window.sessionStorage.setItem("sveltycms_welcome_modal_shown", "true");
 
-    // Cookie consent
+    // Cookie consent (full shape so GDPR banner never mounts)
     window.localStorage.setItem(
       "sveltycms_consent",
-      JSON.stringify({ responded: true, necessary: true }),
+      JSON.stringify({
+        responded: true,
+        necessary: true,
+        analytics: false,
+        marketing: false,
+      }),
     );
 
     // First login welcome for admin
@@ -67,7 +82,9 @@ export async function loginAs(
 
   // Navigate to login page (reload to apply init scripts)
   console.log("[Auth] Navigating to /login...");
-  await page.goto("/login", { waitUntil: "networkidle", timeout: 30_000 });
+  await page.goto("/login", { waitUntil: "domcontentloaded", timeout: 30_000 });
+  // Prefer network-idle-ish settle via URL stability over fixed sleep
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
 
   // Check if we got redirected to setup (config incomplete)
   if (page.url().includes("/setup")) {
@@ -114,25 +131,29 @@ export async function loginAs(
     }
 
     // Reload login page with seeded database
-    await page.goto("/login", { waitUntil: "networkidle", timeout: 100000 });
+    await page.goto("/login", { waitUntil: "domcontentloaded", timeout: 30_000 });
     await page.waitForTimeout(1000);
   }
 
-  // Strategy 2: First Login Welcome Modal
-  const welcomeModal = page.locator('div.fixed.inset-0.z-50:has-text("Welcome")').first();
+  // Strategy 2: First Login Welcome Modal — use role-based, not CSS classes
+  const welcomeModal = page
+    .getByRole("dialog")
+    .filter({ hasText: /welcome/i })
+    .first();
   if (await welcomeModal.isVisible({ timeout: 1000 }).catch(() => false)) {
     console.log("[Auth] First Login Welcome Modal detected, dismissing...");
-    const skipBtn = page
-      .locator('button:has-text("Skip"), button:has-text("Close"), button:has-text("Get Started")')
-      .first();
+    const skipBtn = welcomeModal.getByRole("button", { name: /skip|close|get started/i }).first();
     if (await skipBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
       await skipBtn.click();
       await page.waitForTimeout(500);
     }
   }
 
-  // Strategy 3: General modal dismissal (any other blocking modals)
-  const genericModal = page.locator("div.fixed.inset-0.z-50").first();
+  // Strategy 3: General modal dismissal — role-based, no CSS classes
+  const genericModal = page
+    .getByRole("dialog")
+    .filter({ hasNotText: /cookie|privacy|welcome/i })
+    .first();
   if (await genericModal.isVisible({ timeout: 1000 }).catch(() => false)) {
     console.log("[Auth] Generic modal detected, attempting to dismiss...");
     const anyCloseBtn = page
@@ -146,16 +167,14 @@ export async function loginAs(
     }
   }
 
-  // Strategy 4: Cookie consent banner (fixed bottom bar, z-9999, aria-modal)
-  const cookieBanner = page.locator('[role="dialog"][aria-modal="true"]').first();
-  if (await cookieBanner.isVisible({ timeout: 1000 }).catch(() => false)) {
-    console.log("[Auth] Cookie consent banner detected, accepting...");
-    const acceptBtn = cookieBanner.getByRole("button", { name: /accept/i });
-    if (await acceptBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-      await acceptBtn.click();
-      await page.waitForTimeout(500);
-      console.log("[Auth] ✓ Cookie consent accepted");
-    }
+  // Strategy 4: Cookie consent banner (defense-in-depth fallback)
+  // The addInitScript above should prevent this, but dismiss if still visible
+  const cookieAcceptBtn = page.getByTestId("cookie-accept-all");
+  if (await cookieAcceptBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+    console.log("[Auth] Cookie consent still visible despite init script, accepting...");
+    await cookieAcceptBtn.click();
+    await page.waitForTimeout(300);
+    console.log("[Auth] ✓ Cookie consent accepted");
   }
 
   console.log("[Auth] Modal dismissal complete.");
@@ -208,8 +227,139 @@ export async function loginAs(
         const testId = await input.getAttribute("data-testid");
         console.error(`[Auth]   Input ${i}: name=${name}, data-testid=${testId}`);
       }
+
+      // Check if signup form is showing (first-user mode / no users in DB)
+      const confirmPassword = page.locator('input[name="confirm_password"]');
+      if (await confirmPassword.isVisible({ timeout: 2000 }).catch(() => false)) {
+        console.log("[Auth] Signup form detected (first-user mode). Auto-seeding admin user...");
+        try {
+          await page.request.post("/api/testing", {
+            headers: TEST_API_HEADERS,
+            data: {
+              action: "seed",
+              email: ADMIN_CREDENTIALS.email,
+              password: ADMIN_CREDENTIALS.password,
+            },
+          });
+          console.log("[Auth] ✓ Admin user seeded, reloading and retrying...");
+        } catch (seedError) {
+          console.log("[Auth] Seed failed, trying reset first...", seedError);
+          await page.request.post("/api/testing", {
+            headers: TEST_API_HEADERS,
+            data: { action: "reset" },
+          });
+          await page.request.post("/api/testing", {
+            headers: TEST_API_HEADERS,
+            data: {
+              action: "seed",
+              email: ADMIN_CREDENTIALS.email,
+              password: ADMIN_CREDENTIALS.password,
+            },
+          });
+          console.log("[Auth] ✓ Database reset and seeded");
+        }
+
+        // Reload and re-click SIGN IN
+        await page.goto("/login", { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await page.waitForTimeout(500);
+
+        const signInIconRetry = page.getByTestId("signin-icon");
+        if (await signInIconRetry.isVisible({ timeout: 5000 }).catch(() => false)) {
+          await signInIconRetry.click({ force: true, timeout: 10000 });
+          await page.waitForTimeout(1000);
+        }
+
+        // Retry finding the signin-email field
+        await page.getByTestId("signin-email").waitFor({ state: "visible", timeout: 15_000 });
+        console.log("[Auth] ✓ Login form ready after auto-seeding");
+        return;
+      }
+
       throw e;
     });
+}
+
+/**
+ * Generic login function for any user with retry + auto-seed on failure.
+ * If login fails (still on /login after submit), seeds the admin user via
+ * the testing API and retries once. This handles cases where a previous test
+ * modified/renamed the admin user.
+ *
+ * @param page - Playwright page object
+ * @param email - User email
+ * @param password - User password
+ * @param waitForUrl - URL pattern to wait for after login (default: not /login)
+ */
+export async function loginAs(
+  page: Page,
+  email: string,
+  password: string,
+  waitForUrl?: string | RegExp,
+) {
+  // --- First attempt ---
+  let loginSuccess = await attemptLogin(page, email, password, waitForUrl);
+
+  if (!loginSuccess) {
+    // Admin user may have been modified or locked by a previous test — re-seed to reset.
+    console.log("[Auth] Login failed — re-seeding admin user via testing API...");
+    try {
+      await page.request.post("/api/testing", {
+        headers: TEST_API_HEADERS,
+        data: {
+          action: "seed",
+          email: email,
+          password: password,
+        },
+      });
+      console.log("[Auth] ✓ Admin user re-seeded (password + lockout reset), retrying login...");
+    } catch (seedError) {
+      console.log("[Auth] Seeding failed, trying reset + seed...", seedError);
+      try {
+        await page.request.post("/api/testing", {
+          headers: TEST_API_HEADERS,
+          data: { action: "reset" },
+        });
+        await page.request.post("/api/testing", {
+          headers: TEST_API_HEADERS,
+          data: {
+            action: "seed",
+            email: email,
+            password: password,
+          },
+        });
+        console.log("[Auth] ✓ Database reset and re-seeded");
+      } catch (resetError) {
+        console.log("[Auth] Reset+seed also failed:", resetError);
+      }
+    }
+
+    // --- Second attempt: full prepareLoginForm cycle ---
+    loginSuccess = await attemptLogin(page, email, password, waitForUrl);
+  }
+
+  if (!loginSuccess) {
+    throw new Error(
+      `Login failed for ${email} after retry with seeding. Current URL: ${page.url()}`,
+    );
+  }
+}
+
+/**
+ * Internal: attempt a single login and return whether it succeeded.
+ * Always calls prepareLoginForm for a clean state before filling.
+ */
+async function attemptLogin(
+  page: Page,
+  email: string,
+  password: string,
+  waitForUrl?: string | RegExp,
+): Promise<boolean> {
+  try {
+    await prepareLoginForm(page);
+  } catch (e) {
+    console.log("[Auth] prepareLoginForm failed:", e);
+    return false;
+  }
 
   // Fill login form using data-testid selectors
   console.log(`[Auth] Filling email: ${email}`);
@@ -220,20 +370,245 @@ export async function loginAs(
   console.log("[Auth] Submitting login form...");
   await page.getByTestId("signin-submit").click();
 
-  if (waitForUrl) {
-    await page.waitForURL(waitForUrl, { timeout: 15_000 });
-  } else {
-    await expect(page).not.toHaveURL(/\/login/, { timeout: 15_000 });
+  // Wait for redirect away from /login
+  try {
+    if (waitForUrl) {
+      await page.waitForURL(waitForUrl, { timeout: 10_000 });
+    } else {
+      await expect(page).not.toHaveURL(/\/login/, { timeout: 10_000 });
+    }
+    console.log("[Auth] ✓ Login successful");
+    return true;
+  } catch {
+    console.log(`[Auth] Login attempt failed — still on ${page.url()}`);
+    return false;
   }
 }
 
 /**
- * Login as admin user (uses default ADMIN_CREDENTIALS)
- * @param page - Playwright page object
- * @param waitForUrl - URL pattern to wait for after login (default: Collections/Names page)
+ * Login as a non-admin test user (editor by default) via testing API when possible.
+ * Always clears prior admin storageState so role-gated UI is honest.
+ */
+export async function loginAsEditor(
+  page: Page,
+  waitForUrl?: string | RegExp,
+  credentials: { email: string; password: string } = {
+    email: HARNESS_EDITOR.email,
+    password: HARNESS_EDITOR.password,
+  },
+) {
+  await page.context().clearCookies();
+  await page
+    .evaluate(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    })
+    .catch(() => {});
+
+  try {
+    let loginRes = await page.request.post("/api/testing", {
+      headers: TEST_API_HEADERS,
+      data: { action: "login", email: credentials.email, password: credentials.password },
+    });
+    if (!loginRes.ok()) {
+      // Ensure user exists then retry
+      await page.request.post("/api/testing", {
+        headers: TEST_API_HEADERS,
+        data: {
+          action: "prepare-test-user",
+          email: credentials.email,
+          password: credentials.password,
+          role: "editor",
+          username: "Editor",
+        },
+      });
+      loginRes = await page.request.post("/api/testing", {
+        headers: TEST_API_HEADERS,
+        data: { action: "login", email: credentials.email, password: credentials.password },
+      });
+    }
+    if (loginRes.ok()) {
+      const target = typeof waitForUrl === "string" ? waitForUrl : "/user";
+      await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      if (!page.url().includes("/login")) {
+        return;
+      }
+    }
+  } catch {
+    /* fall through to UI login */
+  }
+
+  await loginAs(page, credentials.email, credentials.password, waitForUrl);
+}
+
+/**
+ * Login as admin user (uses default ADMIN_CREDENTIALS).
+ * Prefers testing-API seed+login (Set-Cookie into page.request jar) so chromium
+ * shards do not depend on UI form + remote CSRF + collectionbuilder redirects.
+ * Falls back to UI loginAs if the testing API is unavailable.
  */
 export async function loginAsAdmin(page: Page, waitForUrl?: string | RegExp) {
-  await loginAs(page, ADMIN_CREDENTIALS.email, ADMIN_CREDENTIALS.password, waitForUrl);
+  const email = ADMIN_CREDENTIALS.email;
+  const password = ADMIN_CREDENTIALS.password;
+
+  // Intercept cross-origin icon CDN requests to strip Playwright's test headers
+  // that cause CORS failures. Applies to all icon CDNs used by iconify-icon.
+  await page.route("https://api.iconify.design/**", async (route) => {
+    try {
+      const response = await route.fetch();
+      await route.fulfill({ response });
+    } catch {
+      // Test may have ended before icon fetch completed — ignore silently
+    }
+  });
+  await page.route("https://api.unisvg.com/**", async (route) => {
+    try {
+      const response = await route.fetch();
+      await route.fulfill({ response });
+    } catch {
+      // Test may have ended before icon fetch completed — ignore silently
+    }
+  });
+  await page.route("https://api.simplesvg.com/**", async (route) => {
+    try {
+      const response = await route.fetch();
+      await route.fulfill({ response });
+    } catch {
+      // Test may have ended before icon fetch completed — ignore silently
+    }
+  });
+
+  // Prefer existing storageState / cookie jar from auth-setup — avoid re-seed races.
+  // Verify session by actually checking for admin shell testid, not just URL (SPA auth
+  // can render auth page without redirect, leaving URL unchanged).
+  let sessionValid = false;
+  try {
+    await page.goto("/config/collectionbuilder", {
+      waitUntil: "domcontentloaded",
+      timeout: 20_000,
+    });
+    const currentUrl = page.url();
+    if (!currentUrl.includes("/login") && !currentUrl.includes("/setup")) {
+      // Double-check by looking for admin shell elements (SPA auth may render auth page at same URL)
+      sessionValid = await page
+        .getByTestId("page-title")
+        .or(page.getByTestId("collection-builder-board"))
+        .or(page.getByTestId("admin-sidebar"))
+        .first()
+        .isVisible({ timeout: 2_000 })
+        .catch(() => false);
+      if (sessionValid) {
+        console.log("[Auth] ✓ Existing session still valid (storageState)");
+        if (waitForUrl != null) {
+          const targetUrl =
+            typeof waitForUrl === "string" ? waitForUrl : "/config/collectionbuilder";
+          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+          const afterNavUrl = page.url();
+          if (afterNavUrl.includes("/login") || afterNavUrl.includes("/setup")) {
+            console.log(
+              `[Auth] StorageState session lost after navigating to ${targetUrl} — re-authenticating`,
+            );
+            sessionValid = false;
+          } else {
+            if (waitForUrl instanceof RegExp) {
+              await page.waitForURL(waitForUrl, { timeout: 10_000 }).catch(() => undefined);
+            }
+            return;
+          }
+        } else {
+          return;
+        }
+      } else {
+        console.log("[Auth] Page loaded but no admin shell detected — session not valid");
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  if (sessionValid) return;
+
+  try {
+    // Login first; seed only if admin missing. Seed must NOT wipe users.
+    const { applySessionCookie } = await import("./test-auth");
+    let loginRes = await page.request.post("/api/testing", {
+      headers: TEST_API_HEADERS,
+      data: { action: "login", email, password },
+    });
+    if (!loginRes.ok()) {
+      await page.request.post("/api/testing", {
+        headers: TEST_API_HEADERS,
+        data: { action: "seed", email, password },
+      });
+      loginRes = await page.request.post("/api/testing", {
+        headers: TEST_API_HEADERS,
+        data: { action: "login", email, password },
+      });
+    }
+    if (loginRes.ok()) {
+      // Force cookie into browser context with port-aware origin (page.request jar
+      // alone is not always enough when storageState was cleared).
+      await applySessionCookie(page, loginRes);
+      console.log("[Auth] ✓ Admin session via testing API");
+      const target = typeof waitForUrl === "string" ? waitForUrl : "/config/collectionbuilder";
+      await page.goto(target, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+      const postAuthUrl = page.url();
+      if (postAuthUrl.includes("/login")) {
+        console.log(`[Auth] API session did not stick — at login page, falling back to UI login`);
+      } else {
+        if (waitForUrl instanceof RegExp) {
+          await page.waitForURL(waitForUrl, { timeout: 15_000 }).catch(() => undefined);
+        }
+        const finalUrl = page.url();
+        if (!finalUrl.includes("/login")) {
+          return;
+        }
+      }
+    } else {
+      console.log(
+        `[Auth] testing API login status=${loginRes.status()} — falling back to UI login`,
+      );
+    }
+  } catch (err) {
+    console.log("[Auth] testing API login failed — falling back to UI login:", err);
+  }
+
+  await loginAs(page, email, password, waitForUrl);
+}
+
+/**
+ * Enable 2FA for a specific user to test the 2FA UI flow
+ * @param page - Playwright page object
+ * @param email - User email
+ */
+export async function enable2FAForTestUser(page: Page, email: string) {
+  // 1. Get user to find ID
+  const userRes = await page.request.post("/api/testing", {
+    headers: TEST_API_HEADERS,
+    data: { action: "get-user", email },
+  });
+  const userData = await userRes.json();
+  if (!userData.success || !userData.user) {
+    throw new Error(`Failed to find user ${email}`);
+  }
+
+  // 2. Update user to enable 2FA
+  const updateRes = await page.request.post("/api/testing", {
+    headers: TEST_API_HEADERS,
+    data: {
+      action: "update",
+      collectionId: "auth_users",
+      id: userData.user._id,
+      data: { is2FAEnabled: true },
+    },
+  });
+  const updateData = await updateRes.json();
+  if (!updateData.success) {
+    throw new Error(`Failed to enable 2FA for user ${email}`);
+  }
 }
 
 /**
@@ -317,4 +692,46 @@ export async function ensureSidebarVisible(page: Page) {
     }
   }
   return false;
+}
+
+/**
+ * Dismiss the cookie consent banner without a full login flow.
+ *
+ * Use this at the start of tests that:
+ * - Use `storageState: { cookies: [], origins: [] }` (blank context)
+ * - Navigate directly to app pages (not through loginAsAdmin)
+ * - Subsequently call `getByRole("dialog")` for application dialogs
+ *
+ * The banner is rendered as `div[role="dialog"]` and causes strict-mode
+ * violations when mixed with native `<dialog>` elements.
+ */
+export async function dismissCookieBanner(page: Page): Promise<void> {
+  // Stamp localStorage so the banner never appears on the next navigation
+  await page
+    .evaluate(() => {
+      try {
+        window.localStorage.setItem(
+          "sveltycms_consent",
+          JSON.stringify({ responded: true, necessary: true }),
+        );
+        window.sessionStorage.setItem("sveltycms_welcome_modal_shown", "true");
+        window.localStorage.setItem("sveltycms-welcome-seen", "true");
+      } catch {
+        // Ignore if storage is restricted
+      }
+    })
+    .catch(() => {});
+
+  // Defense-in-depth: click the accept button if the banner already rendered or
+  // hydrates shortly after the stamp (Svelte hydration race). Bounded to a single
+  // waitFor so tab switches don't burn ~6s polling when the banner is absent.
+  const acceptBtn = page.getByTestId("cookie-accept-all");
+  const shown = await acceptBtn
+    .waitFor({ state: "visible", timeout: 1_500 })
+    .then(() => true)
+    .catch(() => false);
+  if (shown) {
+    await acceptBtn.click({ timeout: 1_000 }).catch(() => {});
+    await page.waitForTimeout(150);
+  }
 }

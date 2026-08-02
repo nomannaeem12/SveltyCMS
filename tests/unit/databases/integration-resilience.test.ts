@@ -9,30 +9,27 @@
  * - Proving dynamic document fields serialize/deserialize perfectly when missing physically.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 
-// Override any pre-existing mock to get real behavior
-vi.mock("@src/databases/db", () => {
-  const actual = vi.importActual("@src/databases/db");
-  return actual;
-});
-
-import { resetDbInitPromise, ensureFullInitialization } from "@src/databases/db";
 import { SQLiteAdapter } from "@src/databases/sqlite/sqlite-adapter";
 import { generateUUID } from "@src/utils/native-utils";
 
 describe("SveltyCMS Integration Resilience & Boundary Audits", () => {
   describe("Pillar 1: System State & Config Validation", () => {
     it("should reject corrupted configurations with a controlled MISSING_CONFIG error", async () => {
+      // Use the real db module (setup.ts mocks @src/databases/db globally).
+      // CORRUPT_CONFIG is checked fail-fast before adapters load.
+      const realDb = await import("@src/databases/db?bun-unmock=" + Date.now());
+
       // 1. Simulate corrupted configuration flag
       process.env.CORRUPT_CONFIG = "true";
       const originalBooted = (globalThis as any).__SVELTY_CMS_BOOTED__;
       (globalThis as any).__SVELTY_CMS_BOOTED__ = false;
-      resetDbInitPromise();
+      realDb.resetDbInitPromise();
 
       try {
         // 2. Expect database boot to fail fast and predictably
-        await ensureFullInitialization();
+        await realDb.ensureFullInitialization();
         expect.unreachable("Boot sequence should have failed for corrupted configuration.");
       } catch (err: any) {
         expect(err).toBeInstanceOf(Error);
@@ -44,7 +41,7 @@ describe("SveltyCMS Integration Resilience & Boundary Audits", () => {
         // 3. Revert state and clear environment
         delete process.env.CORRUPT_CONFIG;
         (globalThis as any).__SVELTY_CMS_BOOTED__ = originalBooted;
-        resetDbInitPromise();
+        realDb.resetDbInitPromise();
       }
     });
   });

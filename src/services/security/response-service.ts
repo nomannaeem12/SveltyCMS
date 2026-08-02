@@ -4,7 +4,7 @@
  */
 
 import { logger } from "@utils/logger";
-import { building } from "$app/environment";
+import { building, dev } from "$app/environment";
 import { metricsService } from "../observability/metrics-service";
 import { AuthGuardService } from "./auth-guard";
 import { securityStore } from "./state-store";
@@ -21,7 +21,7 @@ import type {
   ThreatLevel,
   AnomalyResult,
 } from "./types";
-import { safeFetch } from "@src/utils/http/egress-guard";
+import { safeFetch } from "../../utils/egress-guard";
 
 // ============================================================================
 // CONSTANTS & POLICIES
@@ -82,7 +82,7 @@ const ENDPOINT_RATE_LIMITS: Record<string, number> = {
   "/api/testing": 100,
 };
 
-const GLOBAL_RATE_LIMIT = 100;
+const GLOBAL_RATE_LIMIT = 500;
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const SCAN_BODY_MAX_SIZE = 32768; // 32KB
 
@@ -172,8 +172,17 @@ export class SecurityResponseService {
     const forceSecurity = request.headers.get("x-test-security") === "true";
 
     // 2. Rate Limit check (Basic protection)
-    const rateLimit = await this.checkRateLimit(clientIp, pathname, tenantId, forceSecurity);
-    if (rateLimit.action !== "allow") return rateLimit;
+    // Skip rate limiting for GET/HEAD/OPTIONS requests to non-API paths — these
+    // cannot mutate data and are often burst-heavy (page loads, Vite HMR, assets).
+    const method = request.method.toUpperCase();
+    const isApiPath = pathname.startsWith("/api/");
+    const isReadOnly = method === "GET" || method === "HEAD" || method === "OPTIONS";
+    if (!isApiPath && isReadOnly && !forceSecurity) {
+      // Pass through — read-only asset loads should never be rate-limited
+    } else {
+      const rateLimit = await this.checkRateLimit(clientIp, pathname, tenantId, forceSecurity);
+      if (rateLimit.action !== "allow") return rateLimit;
+    }
 
     // 3. Throttling check
     const throttle = await securityStore.getThrottle(clientIp);
@@ -368,9 +377,24 @@ export class SecurityResponseService {
     const isTest =
       process.env.TEST_MODE === "true" ||
       process.env.VITE_TEST_MODE === "true" ||
+      dev ||
       (globalThis as any).process?.env?.TEST_MODE === "true";
 
     if ((building || isTest) && !forceSecurity) {
+      return { level: "none", action: "allow" };
+    }
+
+    // Skip rate limiting for setup, bootstrap, login, health-check, WebSocket,
+    // static assets, and locale-prefixed routes
+    if (
+      endpoint.startsWith("/setup") ||
+      endpoint.startsWith("/api/system/health") ||
+      endpoint.startsWith("/login") ||
+      endpoint.startsWith("/en/") ||
+      endpoint.startsWith("/ws") ||
+      endpoint.startsWith("/_app/") ||
+      endpoint === "/favicon.ico"
+    ) {
       return { level: "none", action: "allow" };
     }
 

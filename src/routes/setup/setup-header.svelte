@@ -47,12 +47,12 @@ Middle-ground height (h-[38px]), fixed dropdown borders, and right-aligned mobil
 		<!-- Branding: Left on desktop, between on mobile -->
 		<div class="flex items-center justify-between lg:justify-start">
 			<div class="flex items-center gap-2 sm:gap-4">
-				<a href="https://github.com/SveltyCMS/SveltyCMS" target="_blank" rel="noopener noreferrer" class="shrink-0">
+				<a aria-label="SveltyCMS home" href="https://github.com/SveltyCMS/SveltyCMS" target="_blank" rel="noopener noreferrer" class="shrink-0">
 					<img src="/SveltyCMS_Logo.svg" alt="SveltyCMS Logo" class="h-9 w-auto sm:h-12" />
 				</a>
 				<div class="flex min-w-0 flex-col justify-center overflow-hidden">
 					<h1 class="truncate text-lg font-bold leading-none sm:text-2xl lg:text-3xl">
-						<a href="https://github.com/SveltyCMS/SveltyCMS" target="_blank" rel="noopener noreferrer">
+						<a aria-label="Documentation" href="https://github.com/SveltyCMS/SveltyCMS" target="_blank" rel="noopener noreferrer">
 							<SiteName {siteName} highlight="CMS" />
 						</a>
 					</h1>
@@ -110,7 +110,7 @@ Middle-ground height (h-[38px]), fixed dropdown borders, and right-aligned mobil
 				<SystemTooltip title={applayout_systemlanguage?.() || 'Change system language'}>
 					<Dropdown position="bottom-end" closeOnSelect={false} class="p-0! w-64">
 						{#snippet trigger()}
-							<Button variant="outline" type="button" class="h-10 rounded px-3 gap-1 dark:text-white">
+							<Button variant="ghost" type="button" class="h-10 rounded px-3 gap-1 dark:text-white">
 								<span class="text-sm font-bold">{getLanguageName(currentLanguageTag)}</span>
 								<iconify-icon icon="mdi:chevron-down" class="ms-1 h-4 w-4 transition-transform"></iconify-icon>
 							</Button>
@@ -135,7 +135,7 @@ Middle-ground height (h-[38px]), fixed dropdown borders, and right-aligned mobil
 			</div>
 
 			<SystemTooltip title="Accessibility Help">
-				<Button variant="outline" type="button" onclick={() => modalState.trigger(AccessibilityHelp)} aria-label="Accessibility Help" class="h-10 w-10 rounded text-black dark:text-white">
+				<Button variant="ghost" type="button" onclick={() => modalState.trigger(AccessibilityHelp)} aria-label="Accessibility Help" class="h-10 w-10 rounded text-black dark:text-white">
 					<iconify-icon icon="mdi:accessibility" width="20"></iconify-icon>
 				</Button>
 			</SystemTooltip>

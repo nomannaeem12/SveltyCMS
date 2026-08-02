@@ -3,19 +3,37 @@
  * @description Collections namespace for LocalCMS SDK.
  */
 
-import { contentSystem } from "@src/content/index.server";
 import { modifyRequest, modifyStream, type EntryData } from "@utils/modify-request";
+import { validateNumericFields, sanitizeCollectionFields } from "@src/content/content-utils";
 import { cacheService } from "@src/databases/cache/cache-service";
 import { LRUCache } from "lru-cache";
 import { logger } from "@utils/logger";
 import { AppError } from "@utils/error-handling";
-import { getPrivateSettingSync } from "@src/services/core/settings-service";
-import * as crypto from "node:crypto";
+import { isMultiTenantEnabled } from "@utils/tenant";
+import { xxhash64 } from "hash-wasm";
 import type { DatabaseId, IDBAdapter, ISODateString } from "@src/databases/db-interface";
+import type { contentSystem as serverContentSystem } from "@src/content/index.server";
 import type { Schema, FieldInstance } from "@src/content/types";
 import { type LocalApiOptions, type CollectionProxy } from "./types";
 import { pluginRegistry } from "@src/plugins/registry";
+import { copyDataWithFreshRowIds } from "@src/utils/data/copy-data-with-fresh-ids";
+import { resolvePopulatedRelations } from "./populate-resolver";
 import type { PluginContext, PluginLifecycleHooks } from "@src/plugins/types";
+
+type ContentSystem = typeof serverContentSystem;
+
+/** Narrow Schema fields for content-utils helpers (WidgetPlaceholder slots excluded). */
+type CollectionFieldSchema = Parameters<typeof sanitizeCollectionFields>[1];
+
+let resolvedContentSystem: ContentSystem | null = null;
+
+async function getContentSystem(): Promise<ContentSystem> {
+  if (!resolvedContentSystem) {
+    const mod = await import("@src/content/index.server");
+    resolvedContentSystem = mod.contentSystem;
+  }
+  return resolvedContentSystem;
+}
 
 /**
  * Collections Namespace
@@ -36,7 +54,7 @@ export class CollectionsNamespace {
 
   constructor(
     private _dbAdapter: IDBAdapter,
-    private _contentSystemOverride?: any,
+    private _contentSystemOverride?: ContentSystem,
   ) {
     if (!(this._dbAdapter as any).collection) {
       const proto = (this._dbAdapter as any).constructor?.prototype;
@@ -82,8 +100,12 @@ export class CollectionsNamespace {
     });
   }
 
-  private get _contentSystem() {
-    return this._contentSystemOverride || contentSystem;
+  private get _contentSystem(): ContentSystem | null {
+    return this._contentSystemOverride || resolvedContentSystem;
+  }
+
+  private async _resolveContentSystem(): Promise<ContentSystem> {
+    return this._contentSystemOverride || getContentSystem();
   }
 
   private normalizeRelationshipFilter(filter: any): any {
@@ -147,7 +169,8 @@ export class CollectionsNamespace {
 
     let schema = null;
     try {
-      schema = await this._contentSystem.getCollectionById(collectionId, tenantId);
+      const cs = await this._resolveContentSystem();
+      schema = await cs.getCollectionById(collectionId, tenantId);
     } catch {}
 
     const idLower = collectionId.toLowerCase();
@@ -284,7 +307,7 @@ export class CollectionsNamespace {
   ) {
     const { tenantId, includeFields = false, includeStats = false } = options;
 
-    if (getPrivateSettingSync("MULTI_TENANT") === true && !tenantId) {
+    if (isMultiTenantEnabled() && !tenantId) {
       throw new AppError("Tenant ID required", 400, "TENANT_MISSING");
     }
 
@@ -302,7 +325,8 @@ export class CollectionsNamespace {
       }
     } catch {}
 
-    const collections = await this._contentSystem.getCollections(tenantId);
+    const cs = await this._resolveContentSystem();
+    const collections = await cs.getCollections(tenantId);
 
     // Merge in any manually registered schemas from cache
     const prefix = `${tenantId || "global"}:`;
@@ -379,7 +403,8 @@ export class CollectionsNamespace {
     if (collections && collections.length > 0) {
       collectionsToSearch = collections;
     } else {
-      const allCollections = await contentSystem.getCollections(tenantId);
+      const cs = await getContentSystem();
+      const allCollections = await cs.getCollections(tenantId);
       collectionsToSearch = allCollections
         .map((c) => c._id)
         .filter((id): id is string => id !== undefined);
@@ -394,8 +419,9 @@ export class CollectionsNamespace {
       baseFilter.status = status;
     }
 
+    const cs = await getContentSystem();
     const searchPromises = collectionsToSearch.map(async (collectionId) => {
-      const collection = await contentSystem.getCollectionById(collectionId, tenantId);
+      const collection = await cs.getCollectionById(collectionId, tenantId);
       if (!collection) return [];
 
       try {
@@ -517,10 +543,7 @@ export class CollectionsNamespace {
       if (query._id && Object.keys(query).length === 1 && limit === 50 && offset === 0 && !sort) {
         cacheKey = `${tenantPrefix}collection:${schema._id}:find:id:${query._id}`;
       } else {
-        const queryHash = crypto
-          .createHash("md5")
-          .update(JSON.stringify({ query, limit, offset, sort }))
-          .digest("hex");
+        const queryHash = await xxhash64(JSON.stringify({ query, limit, offset, sort }));
         cacheKey = `${tenantPrefix}collection:${schema._id}:find:${queryHash}`;
       }
     }
@@ -548,7 +571,7 @@ export class CollectionsNamespace {
         offset,
         sort,
         fields: options.fields,
-        tenantId: tenantId as DatabaseId,
+        populate: options.populate,
       },
     );
 
@@ -583,6 +606,24 @@ export class CollectionsNamespace {
       for (let i = 0; i < items.length; i++) {
         items[i]._collection = collectionMeta;
       }
+    }
+
+    // Relational population: resolve referenced entries when populate is requested
+    if (
+      result.success &&
+      result.data &&
+      Array.isArray(result.data) &&
+      options.populate &&
+      options.populate.length > 0
+    ) {
+      await resolvePopulatedRelations(
+        result.data,
+        schema,
+        options.populate,
+        tenantId,
+        this._dbAdapter,
+        (id: string) => this.getCollectionName(id),
+      );
     }
 
     if (result.success && !bypassCache && cacheKey) {
@@ -625,7 +666,8 @@ export class CollectionsNamespace {
     } = {},
   ) {
     const { tenantId, user, publicationFilter = "all" } = options;
-    const schema = await contentSystem.getCollectionById(collectionId, tenantId);
+    const cs = await getContentSystem();
+    const schema = await cs.getCollectionById(collectionId, tenantId);
     if (!schema) throw new AppError(`Collection ${collectionId} not found`, 404);
 
     const query: any = {
@@ -709,15 +751,17 @@ export class CollectionsNamespace {
     const freshDb = getDb();
     if (freshDb) this._dbAdapter = freshDb;
 
-    return this._contentSystem.refresh(tenantId as any, skipReconciliation);
+    return this._contentSystem?.refresh(tenantId as any, skipReconciliation);
   }
 
   async getStructure(tenantId?: DatabaseId | null) {
-    return contentSystem.getContentStructure(tenantId);
+    const cs = await getContentSystem();
+    return cs.getContentStructure(tenantId);
   }
 
   async reorderContentNodes(items: any[], tenantId?: DatabaseId | null) {
-    return contentSystem.reorderContentNodes(items, tenantId);
+    const cs = await getContentSystem();
+    return cs.reorderContentNodes(items, tenantId);
   }
 
   async getRevisions(
@@ -869,9 +913,9 @@ export class CollectionsNamespace {
     const formattedUpdates = updates.map((u) => ({
       id: u.id as DatabaseId,
       data: {
-        ...u.data,
+        ...(copyDataWithFreshRowIds(u.data) as Record<string, unknown>),
         updatedBy: user?._id,
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString() as ISODateString,
       },
     }));
 
@@ -891,6 +935,13 @@ export class CollectionsNamespace {
     const { user, tenantId } = options;
     if (!user) throw new AppError("Authentication required", 401, "UNAUTHORIZED");
     const schema = await this.getSchema(collectionId, tenantId);
+    if (schema?.disableBulkDelete) {
+      throw new AppError(
+        `Bulk delete is disabled for collection "${schema.name || collectionId}"`,
+        403,
+        "BULK_DELETE_DISABLED",
+      );
+    }
 
     const result = await this._dbAdapter.batch.bulkDelete(
       this.getCollectionName(schema._id as string),
@@ -1058,15 +1109,45 @@ export class CollectionsNamespace {
     if (!user && !system) throw new AppError("Authentication required", 401, "UNAUTHORIZED");
     const schema = await this.getSchema(collectionId, tenantId);
 
-    const entryData = {
-      ...data,
+    // 🛡️ ACTIVE SANITIZATION: Clean string/html inputs based on field type
+    const sanitizedData = sanitizeCollectionFields(data, schema as CollectionFieldSchema);
+
+    let entryData: Record<string, unknown> = {
+      ...sanitizedData,
       tenantId,
       createdBy: system ? "system" : user?._id,
       createdAt: new Date().toISOString(),
-    };
+    } as Record<string, unknown>;
+
+    // ── Schema Lifecycle Hooks: beforeValidate → range gate → afterValidate ──
+    {
+      const { applyBeforeValidate, applyAfterValidate } = await import("@src/content/schema-hooks");
+      const hookCtx = {
+        schema,
+        operation: "create" as const,
+        tenantId: tenantId as string | undefined,
+        userId: user?._id as string | undefined,
+      };
+      entryData = await applyBeforeValidate(schema.hooks, entryData, {
+        ...hookCtx,
+        document: { ...entryData },
+      });
+
+      // 🛡️ Validate numeric field ranges before they reach the database adapter
+      const rangeErrors = validateNumericFields(entryData, schema as CollectionFieldSchema);
+      if (rangeErrors.length > 0) {
+        throw new AppError(rangeErrors.join("; "), 400, "FIELD_VALIDATION_ERROR");
+      }
+
+      entryData = await applyAfterValidate(schema.hooks, entryData, {
+        ...hookCtx,
+        document: { ...entryData },
+      });
+    }
+
     const effectiveUser = system ? { _id: "system", role: "admin" } : user;
 
-    const finalData = await this.triggerLifecycleHook(
+    let finalData = await this.triggerLifecycleHook(
       "beforeSave",
       collectionId,
       entryData,
@@ -1075,8 +1156,10 @@ export class CollectionsNamespace {
     );
 
     const collectionModel = await this._getModelResilient(schema);
+    // mutate in place so widget/modifyRequest transforms are persisted
+    const payload = [finalData];
     await modifyRequest({
-      data: [finalData],
+      data: payload,
       fields: schema.fields as FieldInstance[],
       collection: collectionModel,
       user: effectiveUser,
@@ -1087,11 +1170,22 @@ export class CollectionsNamespace {
       action: "create",
       system,
     });
+    finalData = payload[0] ?? finalData;
 
     const collectionName = this.getCollectionName(schema._id as string);
-    const result = await this._dbAdapter.crud.insert(collectionName, entryData, {
-      tenantId: tenantId as DatabaseId,
-    });
+    const result = await this.persistWithOutbox(
+      "create",
+      async (txOpts) =>
+        this._dbAdapter.crud.insert(collectionName, finalData, {
+          tenantId: tenantId as DatabaseId,
+          ...txOpts,
+        }),
+      schema,
+      tenantId,
+      effectiveUser,
+      (res) => String(res.data?._id ?? ""),
+      (res) => res.data,
+    );
 
     if (result && result.success && result.data) {
       try {
@@ -1109,6 +1203,7 @@ export class CollectionsNamespace {
         result.data!._id as string,
         result.data,
         effectiveUser,
+        { skipOutbox: true },
       );
       await this.triggerLifecycleHook("afterSave", collectionId, result.data, options, schema);
     }
@@ -1121,14 +1216,43 @@ export class CollectionsNamespace {
     if (!user && !system) throw new AppError("Authentication required", 401, "UNAUTHORIZED");
     const schema = await this.getSchema(collectionId, tenantId);
 
-    const updateData = {
-      ...data,
+    // 🛡️ ACTIVE SANITIZATION: Clean string/html inputs based on field type
+    const sanitizedData = sanitizeCollectionFields(data, schema as CollectionFieldSchema);
+
+    let updateData: Record<string, unknown> = {
+      ...sanitizedData,
       updatedBy: system ? "system" : user?._id,
       updatedAt: new Date().toISOString(),
-    };
+    } as Record<string, unknown>;
+
+    // ── Schema Lifecycle Hooks: beforeValidate → range gate → afterValidate ──
+    {
+      const { applyBeforeValidate, applyAfterValidate } = await import("@src/content/schema-hooks");
+      const hookCtx = {
+        schema,
+        operation: "update" as const,
+        tenantId: tenantId as string | undefined,
+        userId: user?._id as string | undefined,
+      };
+      updateData = await applyBeforeValidate(schema.hooks, updateData, {
+        ...hookCtx,
+        document: { ...updateData },
+      });
+
+      const rangeErrors = validateNumericFields(updateData, schema as CollectionFieldSchema);
+      if (rangeErrors.length > 0) {
+        throw new AppError(rangeErrors.join("; "), 400, "FIELD_VALIDATION_ERROR");
+      }
+
+      updateData = await applyAfterValidate(schema.hooks, updateData, {
+        ...hookCtx,
+        document: { ...updateData },
+      });
+    }
+
     const effectiveUser = system ? { _id: "system", role: "admin" } : user;
 
-    const finalData = await this.triggerLifecycleHook(
+    let finalData = await this.triggerLifecycleHook(
       "beforeSave",
       collectionId,
       updateData,
@@ -1137,8 +1261,10 @@ export class CollectionsNamespace {
     );
 
     const collectionModel = await this._getModelResilient(schema);
+
+    const payload = [finalData];
     await modifyRequest({
-      data: [finalData],
+      data: payload,
       fields: schema.fields as FieldInstance[],
       collection: collectionModel,
       user: effectiveUser,
@@ -1149,16 +1275,28 @@ export class CollectionsNamespace {
       action: "update",
       system,
     });
+    finalData = payload[0] ?? finalData;
 
-    const result = await this._dbAdapter.crud.update(
-      this.getCollectionName(schema._id as string),
-      entryId as DatabaseId,
-      finalData,
-      { tenantId: tenantId as DatabaseId },
+    const result = await this.persistWithOutbox(
+      "update",
+      async (txOpts) =>
+        this._dbAdapter.crud.update(
+          this.getCollectionName(schema._id as string),
+          entryId as DatabaseId,
+          finalData,
+          { tenantId: tenantId as DatabaseId, ...txOpts },
+        ),
+      schema,
+      tenantId,
+      effectiveUser,
+      () => entryId,
+      (res) => res.data,
     );
 
     if (result && result.success && result.data) {
-      await this.afterMutation(schema, tenantId, "update", entryId, result.data, effectiveUser);
+      await this.afterMutation(schema, tenantId, "update", entryId, result.data, effectiveUser, {
+        skipOutbox: true,
+      });
       await this.triggerLifecycleHook("afterSave", collectionId, result.data, options, schema);
     }
 
@@ -1172,14 +1310,28 @@ export class CollectionsNamespace {
 
     const effectiveUser = system ? { _id: "system", role: "admin" } : user;
 
-    const result = await this._dbAdapter.crud.delete(
-      this.getCollectionName(schema._id as string),
-      entryId as DatabaseId,
-      { tenantId: tenantId as DatabaseId },
+    const result = await this.persistWithOutbox(
+      "delete",
+      async (txOpts) =>
+        this._dbAdapter.crud.delete(
+          this.getCollectionName(schema._id as string),
+          entryId as DatabaseId,
+          {
+            tenantId: tenantId as DatabaseId,
+            ...txOpts,
+          },
+        ),
+      schema,
+      tenantId,
+      effectiveUser,
+      () => entryId,
+      () => null,
     );
 
     if (result && result.success) {
-      await this.afterMutation(schema, tenantId, "delete", entryId, null, effectiveUser);
+      await this.afterMutation(schema, tenantId, "delete", entryId, null, effectiveUser, {
+        skipOutbox: true,
+      });
       await this.triggerLifecycleHook("afterDelete", collectionId, entryId, options, schema);
     }
 
@@ -1274,9 +1426,131 @@ export class CollectionsNamespace {
     for (const pattern of patterns) {
       await cacheService
         .clearByPattern(pattern, (tenantId || undefined) as string | undefined)
-        .catch(() => {
-          logger.debug("Cache clearByPattern failed silently");
+        .catch((err) => {
+          logger.warn(`[Cache] L2 clearByPattern failed for "${pattern}": ${err?.message || err}`, {
+            tenantId,
+            collectionId: String(schema._id ?? "unknown"),
+          });
         });
+    }
+    // Fallback: explicit collection invalidation in case pattern-based clear missed keys
+    if (schema._id) {
+      await cacheService
+        .invalidateCollection(String(schema._id), (tenantId || undefined) as string | undefined)
+        .catch((err) =>
+          logger.warn(`[Cache] Collection invalidation fallback failed: ${err?.message || err}`),
+        );
+    }
+  }
+
+  /**
+   * Persist a mutation and emit the outbox event in the **same DB transaction**
+   * when the adapter supports `transaction()`. Falls back to sequential write+emit.
+   */
+  private async persistWithOutbox(
+    action: "create" | "update" | "delete",
+    write: (txOpts: Record<string, unknown>) => Promise<any>,
+    schema: Schema,
+    tenantId: DatabaseId | null | undefined,
+    user: any,
+    getId: (result: any) => string,
+    getData: (result: any) => any,
+  ): Promise<any> {
+    const run = async (txOpts: Record<string, unknown> = {}) => {
+      const result = await write(txOpts);
+      if (result?.success) {
+        const id = getId(result);
+        if (id) {
+          await this.emitOutboxEvent(
+            schema,
+            tenantId,
+            action,
+            id,
+            getData(result),
+            user,
+            txOpts.transaction ? { transaction: txOpts.transaction } : undefined,
+          );
+        }
+      }
+      return result;
+    };
+
+    const adapter = this._dbAdapter as any;
+    if (typeof adapter.transaction === "function") {
+      try {
+        const txResult = await adapter.transaction(async (tx: any) => run({ transaction: tx }));
+        // Adapter may wrap as { success, data } — unwrap if the write result is nested
+        if (txResult && typeof txResult === "object" && "success" in txResult) {
+          // Some adapters (MongoDB standalone) return { success: false } instead of throwing
+          // when transactions are unsupported — fall back to sequential writes
+          if (!txResult.success) {
+            logger.debug(
+              `[Collections] transaction returned ${txResult.code || txResult.message}, falling back for ${action}`,
+            );
+          } else if (
+            txResult.success &&
+            txResult.data &&
+            typeof txResult.data === "object" &&
+            "success" in txResult.data
+          ) {
+            // When transaction wraps the inner DatabaseResult as data, prefer inner
+            return txResult.data;
+          } else {
+            return txResult;
+          }
+        } else {
+          return txResult;
+        }
+      } catch (err) {
+        // Mongo without replica set / unsupported TX → sequential fallback
+        logger.debug(
+          `[Collections] transaction unavailable for ${action}, falling back: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    return run();
+  }
+
+  /** Best-effort outbox emit (never throws to callers). */
+  private async emitOutboxEvent(
+    schema: Schema,
+    tenantId: DatabaseId | null | undefined,
+    action: string,
+    id: string,
+    data: any,
+    user: any,
+    dbOptions?: { transaction?: unknown },
+  ): Promise<void> {
+    try {
+      const eventType =
+        action === "create"
+          ? "entry:create"
+          : action === "update"
+            ? "entry:update"
+            : action === "delete"
+              ? "entry:delete"
+              : `entry:${action}`;
+      const { outboxService } = await import("@src/services/outbox");
+      await outboxService.emit(
+        eventType,
+        "entry",
+        id,
+        {
+          collection: schema.name || (schema._id as string),
+          collectionId: schema._id,
+          id,
+          action,
+          data,
+          userId: user?._id,
+        },
+        String(tenantId ?? "default"),
+        dbOptions as any,
+      );
+    } catch {
+      /* outbox is non-blocking relative to content mutations */
     }
   }
 
@@ -1287,10 +1561,11 @@ export class CollectionsNamespace {
     id: string,
     data: any,
     user: any,
+    opts?: { skipOutbox?: boolean },
   ) {
     await this.invalidateCache(schema, tenantId);
     try {
-      const { contentStore } = await import("@src/stores/content-store.svelte");
+      const { contentStore } = await import("@src/stores/content-registry.svelte");
       contentStore.updateVersion();
     } catch {}
     try {
@@ -1304,5 +1579,9 @@ export class CollectionsNamespace {
         user,
       });
     } catch {}
+
+    if (!opts?.skipOutbox) {
+      await this.emitOutboxEvent(schema, tenantId, action, id, data, user);
+    }
   }
 }

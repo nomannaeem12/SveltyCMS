@@ -59,6 +59,9 @@ export const authUsers = mysqlTable(
     totpSecret: varchar("totpSecret", { length: 255 }),
     backupCodes: json("backupCodes").$type<string[]>(),
     last2FAVerification: datetime("last2FAVerification"),
+    authenticators: json("authenticators").$type<import("../auth/types").Authenticator[]>(),
+    failedAttempts: int("failedAttempts").notNull().default(0),
+    lockoutUntil: datetime("lockoutUntil"),
     tenantId: tenantField(),
     ...timestamps,
   },
@@ -359,6 +362,32 @@ export const auditLogs = mysqlTable(
   }),
 );
 
+// Outbox Events Table — Transactional Outbox Pattern
+// Events are written in the same transaction as the data change,
+// then a background process reads and delivers them reliably.
+export const sveltyOutbox = mysqlTable(
+  "svelty_outbox",
+  {
+    _id: uuidPk(),
+    tenantId: tenantField(),
+    eventType: varchar("eventType", { length: 255 }).notNull(),
+    aggregateType: varchar("aggregateType", { length: 255 }).notNull(),
+    aggregateId: varchar("aggregateId", { length: 255 }).notNull(),
+    payload: json("payload").notNull(),
+    status: varchar("status", { length: 50 }).notNull().default("pending"),
+    deliveredAt: datetime("deliveredAt"),
+    attempts: int("attempts").notNull().default(0),
+    lastError: text("lastError"),
+    ...timestamps,
+  },
+  (table) => ({
+    statusIdx: index("outbox_status_idx").on(table.status),
+    tenantIdx: index("outbox_tenant_idx").on(table.tenantId),
+    eventTypeIdx: index("outbox_event_type_idx").on(table.eventType),
+    createdAtIdx: index("outbox_created_at_idx").on(table.createdAt),
+  }),
+);
+
 // Background Jobs Table
 export const sveltyJobs = mysqlTable(
   "svelty_jobs",
@@ -400,6 +429,7 @@ export const websiteTokens = mysqlTable(
     tokenIdx: unique("token_unique").on(table.token),
     nameIdx: index("name_idx").on(table.name),
     tenantIdx: index("tenant_idx").on(table.tenantId),
+    tenantNameIdx: index("tenant_name_idx").on(table.tenantId, table.name),
   }),
 );
 
@@ -444,6 +474,28 @@ export const pluginStates = mysqlTable(
     pluginIdx: index("plugin_idx").on(table.pluginId),
     tenantIdx: index("tenant_idx").on(table.tenantId),
     pluginTenantUnique: unique("plugin_tenant_unique").on(table.pluginId, table.tenantId),
+  }),
+);
+
+// Plugin Storage Table
+export const pluginStorage = mysqlTable(
+  "plugin_storage",
+  {
+    _id: uuidPk(),
+    plugin: varchar("plugin", { length: 255 }).notNull(),
+    collectionName: varchar("collection", { length: 255 }).notNull(),
+    tenantId: tenantField(),
+    data: json("data").notNull(),
+    ...timestamps,
+  },
+  (table) => ({
+    pluginIdx: index("plugin_storage_plugin_idx").on(table.plugin),
+    collectionIdx: index("plugin_storage_collection_idx").on(table.collectionName),
+    tenantIdx: index("plugin_storage_tenant_idx").on(table.tenantId),
+    pluginCollectionIdx: index("plugin_storage_plugin_collection_idx").on(
+      table.plugin,
+      table.collectionName,
+    ),
   }),
 );
 
@@ -520,6 +572,71 @@ export const redirectsMV = mysqlTable(
   (table) => ({
     tenantIdx: index("tenant_idx").on(table.tenantId),
     activeIdx: index("active_idx").on(table.active),
+    lookupIdx: index("idx_redirects_mv_lookup").on(table.tenantId, table.source, table.active),
+  }),
+);
+
+// Auth API Keys Table
+export const authApiKeys = mysqlTable(
+  "auth_api_keys",
+  {
+    _id: uuidPk(),
+    name: varchar("name", { length: 255 }).notNull(),
+    hash: varchar("hash", { length: 255 }).notNull(),
+    prefix: varchar("prefix", { length: 12 }).notNull(),
+    userId: varchar("userId", { length: 36 }).notNull(),
+    scopes: json("scopes").$type<string[]>().notNull().default([]),
+    permissions: json("permissions").$type<string[]>().notNull().default([]),
+    revoked: boolean("revoked").notNull().default(false),
+    usageCount: int("usageCount").notNull().default(0),
+    lastUsedAt: datetime("lastUsedAt"),
+    lastUsedIp: varchar("lastUsedIp", { length: 45 }),
+    expiresAt: datetime("expiresAt"),
+    tenantId: tenantField(),
+    ...timestamps,
+  },
+  (table) => ({
+    hashIdx: unique("hash_unique").on(table.hash),
+    userIdx: index("api_key_user_idx").on(table.userId),
+    tenantIdx: index("api_key_tenant_idx").on(table.tenantId),
+    tenantHashIdx: index("tenant_hash_idx").on(table.tenantId, table.hash),
+  }),
+);
+
+// Workflow Definitions Table
+export const workflowDefinitions = mysqlTable(
+  "workflow_definitions",
+  {
+    _id: varchar("_id", { length: 36 }).primaryKey(),
+    tenantId: tenantField(),
+    collectionId: varchar("collectionId", { length: 255 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: text("description"),
+    states: json("states").notNull().default([]),
+    transitions: json("transitions").notNull().default([]),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantIdx: index("workflow_def_tenant_idx").on(table.tenantId),
+    collectionIdx: index("workflow_def_collection_idx").on(table.collectionId),
+  }),
+);
+
+// Workflow Instances Table
+export const workflowInstances = mysqlTable(
+  "workflow_instances",
+  {
+    _id: varchar("_id", { length: 36 }).primaryKey(),
+    tenantId: tenantField(),
+    entryId: varchar("entryId", { length: 36 }).notNull(),
+    collectionId: varchar("collectionId", { length: 255 }).notNull(),
+    currentState: varchar("currentState", { length: 100 }).notNull(),
+    history: json("history").notNull().default([]),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantIdx: index("workflow_inst_tenant_idx").on(table.tenantId),
+    entryIdx: index("workflow_inst_entry_idx").on(table.entryId),
   }),
 );
 
@@ -528,6 +645,7 @@ export const schema = {
   authUsers,
   authSessions,
   authTokens,
+  authApiKeys,
   roles,
   contentNodes,
   contentDrafts,
@@ -537,12 +655,16 @@ export const schema = {
   mediaItems,
   systemVirtualFolders,
   systemPreferences,
+  sveltyOutbox,
   sveltyJobs,
   websiteTokens,
   pluginPagespeedResults,
   pluginStates,
+  pluginStorage,
   pluginMigrations,
   tenants,
   auditLogs,
   redirectsMV,
+  workflowDefinitions,
+  workflowInstances,
 };

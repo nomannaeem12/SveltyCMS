@@ -15,11 +15,6 @@
  * - clean state resets for test isolation
  */
 
-import { createRequire } from "node:module";
-if (typeof (globalThis as any).require === "undefined") {
-  (globalThis as any).require = createRequire(import.meta.url);
-}
-
 import { logger } from "@utils/logger";
 import { type DatabaseAdapter, type IDBAdapter } from "./db-interface";
 import {
@@ -31,6 +26,7 @@ import {
 import { getGlobal, setGlobal } from "@src/utils/native-utils";
 import { AppError } from "@src/utils/error-handling";
 import { createSelfHealingProxy } from "./core/proxy-utils";
+import { setSystemState } from "@src/stores/system/state.svelte.ts";
 
 const ADAPTER_KEY = "__DB_ADAPTER_INSTANCE__";
 const INIT_PROMISE_KEY = "__DB_INIT_PROMISE__";
@@ -93,10 +89,10 @@ export const dbAdapter: DatabaseAdapter = createSelfHealingProxy<IDBAdapter>(
 export const auth: any = new Proxy(
   {},
   {
-    get(_, prop) {
+    get(_target: any, prop: string) {
       const instance = getGlobal(AUTH_KEY);
       if (!instance) return undefined;
-      const val = instance[prop];
+      const val = (instance as Record<string, any>)[prop];
       return typeof val === "function" ? val.bind(instance) : val;
     },
   },
@@ -114,6 +110,59 @@ export const dbInitPromise: Promise<any | null> = new Proxy(Promise.resolve(null
 
 // Lazy Holders for Server-Only Modules
 let _dbInit: any = null;
+let _resilienceIntegration: any = null;
+
+// Demo cleanup interval reference (for shutdown)
+let _demoCleanupInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Starts the demo tenant cleanup scheduler.
+ * Runs every 5 minutes, only when DEMO mode is enabled.
+ */
+function startDemoCleanupScheduler() {
+  if (_demoCleanupInterval) return; // Already running
+
+  const env = getEnv();
+  const isDemoEnv = process.env.SVELTYCMS_DEMO === "true";
+  const isDemo = isDemoEnv || env?.DEMO === true;
+
+  if (!isDemo) {
+    logger.debug("[Demo Cleanup] DEMO mode not enabled, skipping scheduler.");
+    return;
+  }
+
+  const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+  logger.info("[Demo Cleanup] Starting cleanup scheduler (every 5 minutes).");
+
+  _demoCleanupInterval = setInterval(async () => {
+    try {
+      const { cleanupExpiredDemoTenants } = await import("@src/utils/demo-cleanup");
+      await cleanupExpiredDemoTenants();
+    } catch (err) {
+      logger.error("[Demo Cleanup] Scheduler error:", err);
+    }
+  }, CLEANUP_INTERVAL_MS);
+
+  // Allow the event loop to exit (don't keep the process alive for cleanup alone)
+  if (
+    _demoCleanupInterval &&
+    typeof _demoCleanupInterval === "object" &&
+    "unref" in _demoCleanupInterval
+  ) {
+    _demoCleanupInterval.unref();
+  }
+}
+
+/**
+ * Stops the demo cleanup scheduler (called during shutdown).
+ */
+function stopDemoCleanupScheduler() {
+  if (_demoCleanupInterval) {
+    clearInterval(_demoCleanupInterval);
+    _demoCleanupInterval = null;
+    logger.debug("[Demo Cleanup] Scheduler stopped.");
+  }
+}
 
 async function getDbInit() {
   if (!_dbInit) {
@@ -122,8 +171,20 @@ async function getDbInit() {
   return _dbInit;
 }
 
+async function getResilienceIntegration() {
+  if (!_resilienceIntegration) {
+    _resilienceIntegration = await import("./resilience-integration");
+  }
+  return _resilienceIntegration;
+}
+
 // Centralized, idempotent system initialization.
 export async function ensureFullInitialization(): Promise<any | null> {
+  // 🚀 SAFETY: Clear the shutdown guard — any call to re-initialize, whether from
+  // reinitializeSystem(), initializeWithConfig(), or a cold start, means the previous
+  // shutdown (if any) is over and auto-reconnection should be re-enabled.
+  (globalThis as any).__SYSTEM_SHUTTING_DOWN__ = false;
+
   // 🚀 HARDENING: Double-Check Locking with Connectivity Guard
   const existingPromise = getGlobal<Promise<any>>(INIT_PROMISE_KEY);
   const phase = getBootPhase();
@@ -148,11 +209,9 @@ export async function ensureFullInitialization(): Promise<any | null> {
     try {
       setGlobal(BOOT_PHASE_KEY, "INITIALIZING");
       logger.info("[Boot] Starting initialization...");
-      const dbInit = await getDbInit();
-      let cfg = await loadConfig();
-      setGlobal("__CACHED_CONFIG__", cfg);
 
-      // 🛡️ STATE VALIDATION (Pillar 1 Focus): Detect corrupted/missing configuration
+      // 🛡️ STATE VALIDATION (Pillar 1 Focus): Fail fast before loading adapters.
+      // CORRUPT_CONFIG is a test/diagnostic gate for controlled MISSING_CONFIG.
       if (process.env.CORRUPT_CONFIG === "true") {
         throw new AppError(
           "Database configuration is corrupted or missing.",
@@ -161,21 +220,27 @@ export async function ensureFullInitialization(): Promise<any | null> {
         );
       }
 
+      const dbInit = await getDbInit();
+      let cfg = await loadConfig();
+      setGlobal("__CACHED_CONFIG__", cfg);
+
       if (
         process.env.TEST_MODE === "true" ||
         process.env.VITEST === "true" ||
-        typeof Bun !== "undefined"
+        process.env.BUN_TEST === "true"
       ) {
         const testEngine = process.env.DATABASE_ENGINE || process.env.DB_TYPE || "sqlite";
         logger.info(`[Boot] Test mode detected. Forcing engine: ${testEngine}`);
 
         // 🚀 INTEGRATION BRIDGE: Use physical file to share data between seeder and server
-        const auditFile = "./config/database/integration_audit.sqlite";
-        const mutableCfg = cfg as any;
+        const auditFile = "./config/test-database/integration_audit.sqlite";
+        // Clone cfg so we can mutate it (config may be frozen/readonly)
+        let mutableCfg: any = cfg ? Object.assign({}, cfg) : null;
         if (!cfg) {
           cfg = { DB_TYPE: testEngine, host: auditFile } as any;
-        } else if (!mutableCfg.DB_TYPE) {
-          mutableCfg.DB_TYPE = testEngine;
+          mutableCfg = cfg as any;
+        } else {
+          if (!mutableCfg.DB_TYPE) mutableCfg.DB_TYPE = testEngine;
           if (
             mutableCfg.DB_TYPE === "sqlite" &&
             (!mutableCfg.host || mutableCfg.host === ":memory:")
@@ -183,6 +248,14 @@ export async function ensureFullInitialization(): Promise<any | null> {
             mutableCfg.host = auditFile;
           }
         }
+
+        // Allow env vars to override connection params at runtime (benchmarks/integration)
+        if (process.env.DB_NAME) mutableCfg.DB_NAME = process.env.DB_NAME;
+        if (process.env.DB_HOST) mutableCfg.DB_HOST = process.env.DB_HOST;
+        if (process.env.DB_PORT) mutableCfg.DB_PORT = Number(process.env.DB_PORT);
+        if (process.env.DB_USER) mutableCfg.DB_USER = process.env.DB_USER;
+        if (process.env.DB_PASSWORD) mutableCfg.DB_PASSWORD = process.env.DB_PASSWORD;
+        cfg = mutableCfg;
       }
 
       logger.info(`[Boot] Loading adapters for ${cfg?.DB_TYPE}...`);
@@ -190,7 +263,46 @@ export async function ensureFullInitialization(): Promise<any | null> {
       if (!adapter) throw new Error("Failed to load database adapter");
       logger.info(`[Boot] Adapter loaded. Connecting...`);
 
-      const connectionResult = await adapter.connect();
+      // 🛡️ Fail-closed tenant guard (MULTI_TENANT): never invent tenantId="global".
+      // Wraps crud + domain namespaces so plugins/widgets cannot run unscoped.
+      // Single-tenant / benchmarks: guard returns inner adapter directly (zero overhead).
+      try {
+        const { createTenantGuardedCrud, createTenantGuardedNamespace } =
+          await import("./crud-tenant-guard");
+        const originalCrud = adapter.crud;
+        (adapter as any).crud = createTenantGuardedCrud(originalCrud, "reject");
+
+        for (const ns of ["auth", "content", "media", "collection", "system"] as const) {
+          const original = (adapter as any)[ns];
+          if (original && typeof original === "object") {
+            const guarded = createTenantGuardedNamespace(original, "reject", ns);
+            // Some adapters define namespaces as getter-only properties.
+            // Use defineProperty to handle both writable and getter-only cases.
+            try {
+              (adapter as any)[ns] = guarded;
+            } catch {
+              try {
+                Object.defineProperty(adapter, ns, {
+                  value: guarded,
+                  writable: true,
+                  configurable: true,
+                  enumerable: true,
+                });
+              } catch {
+                // Keep original; tenant guard won't wrap this namespace
+              }
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn(`[Boot] Tenant guard not applied (non-fatal): ${e}`);
+      }
+
+      const { connectDatabaseWithResilience } = await getResilienceIntegration();
+      const connectionResult = await connectDatabaseWithResilience(
+        adapter,
+        `Database Boot (${cfg?.DB_TYPE || "unknown"})`,
+      );
       logger.info(`[Boot] Connection result: ${connectionResult.success}`);
       if (!connectionResult.success) {
         throw new Error(`Database connection failed: ${connectionResult.message}`);
@@ -205,7 +317,12 @@ export async function ensureFullInitialization(): Promise<any | null> {
         const type = (adapter as any).type || (adapter as any).DB_TYPE || "sqlite";
         const reloaded = await dbInit.loadAdapters({ DB_TYPE: type });
         if (reloaded) {
-          await reloaded.connect();
+          const { connectDatabaseWithResilience: reconnectWithResilience } =
+            await getResilienceIntegration();
+          const rehydrate = await reconnectWithResilience(reloaded, "Database Re-hydration");
+          if (!rehydrate.success) {
+            throw new Error(rehydrate.message || "Database re-hydration failed");
+          }
           adapter = reloaded;
           setGlobal(ADAPTER_KEY, adapter);
         }
@@ -219,6 +336,8 @@ export async function ensureFullInitialization(): Promise<any | null> {
       const authInstance = (adapter as any).authService;
       setGlobal(AUTH_KEY, authInstance);
       setGlobal(BOOT_PHASE_KEY, "READY");
+      // Synchronize the reactive state machine so handleSystemState unblocks immediately
+      setSystemState("READY");
       logger.debug(`[Boot] Services Initialized: ${(performance.now() - phase2).toFixed(2)}ms`);
 
       // Start behavioral learning engine (fire-and-forget, zero-latency)
@@ -232,6 +351,9 @@ export async function ensureFullInitialization(): Promise<any | null> {
           initializeSemanticIndex((cfg as any)?.tenantId || "default"),
         )
         .catch(() => {});
+
+      // Start demo tenant cleanup scheduler (fire-and-forget, only in DEMO mode)
+      startDemoCleanupScheduler();
 
       return { adapter, auth: authInstance };
     } catch (error) {
@@ -253,6 +375,10 @@ export async function initializeDatabase(): Promise<void> {
 
 // AGNOSTIC CORE: Shutdown helper.
 export async function shutdownSystem(): Promise<void> {
+  // 🛡️ Set shutdown guard before disconnecting so resilience hooks don't
+  // schedule competing auto-reconnections during intentional reinitialize.
+  (globalThis as any).__SYSTEM_SHUTTING_DOWN__ = true;
+
   const adapter = getGlobal<IDBAdapter>(ADAPTER_KEY);
   if (adapter && typeof adapter.disconnect === "function") {
     await adapter.disconnect();
@@ -261,6 +387,9 @@ export async function shutdownSystem(): Promise<void> {
   // Flush behavioral learning data before shutdown
   const { stopBehavioralEngine } = await import("@src/services/intelligence/behavioral-learner");
   stopBehavioralEngine();
+
+  // Stop demo cleanup scheduler
+  stopDemoCleanupScheduler();
 
   // 🚀 HARDENING: Clear registries and promises
   const { dbPluginRegistry } = await import("./core/plugin-registry");
@@ -279,6 +408,7 @@ export async function shutdownSystem(): Promise<void> {
 export async function reinitializeSystem(_force = true): Promise<void> {
   await shutdownSystem();
   await ensureFullInitialization();
+  (globalThis as any).__SYSTEM_SHUTTING_DOWN__ = false;
 }
 
 // TEST HELPERS: Manual state control for integration suites.
@@ -290,6 +420,7 @@ export function resetDbInitPromise(): void {
 export async function initializeWithConfig(config: any): Promise<any> {
   // Setup finalization can happen while the preview server is already READY on an
   // older bootstrap adapter. Force a full reconnect against the freshly written config.
+  (globalThis as any).__SYSTEM_SHUTTING_DOWN__ = true;
   clearConfigStateCache(false);
   const baseConfig = (await loadConfig(true).catch(() => null)) ?? {};
   const nextConfig = { ...baseConfig, ...config };
@@ -298,8 +429,29 @@ export async function initializeWithConfig(config: any): Promise<any> {
   setGlobal("__CACHED_CONFIG__", nextConfig);
   setGlobal("__SETTINGS_LOADED__", false);
 
+  // The settings cache may hold a pre-setup snapshot (e.g. merged from the
+  // config file before env overrides were applied). Drop it so the next read
+  // rebuilds from the freshly reloaded config — otherwise sync getters such as
+  // getPrivateSettingSync("PREVIEW_SECRET") keep serving stale empties.
+  await import("@src/services/core/settings-service")
+    .then(({ invalidateSettingsCache }) => invalidateSettingsCache())
+    .catch(() => {});
+
   await shutdownSystem();
-  return ensureFullInitialization();
+  const result = await ensureFullInitialization();
+
+  // Eagerly rebuild the in-memory settings cache from the fresh config + DB
+  // rows so synchronous getters (getPrivateSettingSync) see env-merged values
+  // (e.g. PREVIEW_SECRET) immediately — without waiting for the next page load
+  // to detect the config-stamp mismatch. Setup completion is the last moment
+  // where the private config is replaced, so warm it before returning.
+  await import("@src/services/core/settings-service")
+    .then(({ loadSettingsCache }) => loadSettingsCache())
+    .catch((err) => {
+      logger.debug("Settings cache warm failed after reinit", { error: (err as Error).message });
+    });
+
+  return result;
 }
 
 export function clearPrivateConfigCache(keepPrivateEnv = false): void {

@@ -1,15 +1,21 @@
 /**
  * @file tests/integration/databases/resilience-load.test.ts
- * @description Progressive System Load & Resilience Test
+ * @description Progressive load test of the **resilience wrapper** (in-memory simulated ops).
  *
- * Runs progressive load tests to determine system limits without crashing.
+ * ⚠️ This is NOT a live database adapter test. It stress-tests retry/backoff/
+ * circuit-breaker behavior around a fake async op. For real DB resilience,
+ * use adapter contract suites + benchmarks.
+ *
  * Levels: TINY -> LOW -> MEDIUM -> HIGH -> EXTREME
+ *
+ * @note Prefer renaming to resilience-wrapper.test.ts in a future move;
+ * path kept for CI/test-map stability.
  */
 
-import { beforeAll, describe, expect, it, mock } from "bun:test";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 // Bun integration tests run outside SvelteKit, so mock SvelteKit runtime env.
-mock.module("$app/environment", () => ({
+vi.mock("$app/environment", () => ({
   browser: false,
   dev: false,
   building: false,
@@ -20,7 +26,7 @@ let getDatabaseResilience: any;
 
 // Import after mocking $app/environment.
 beforeAll(async () => {
-  const resilienceModule = await import("../../../src/databases/database-resilience");
+  const resilienceModule = await import("@src/databases/database-resilience");
   getDatabaseResilience = resilienceModule.getDatabaseResilience;
 });
 

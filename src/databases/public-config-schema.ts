@@ -51,15 +51,21 @@ export const publicConfigSchema = object({
   MEDIASERVER_URL: optional(string()),
   MEDIA_BUCKET_NAME: optional(pipe(string(), minLength(1))),
 
-  // --- Cloud Storage Configuration ---
-  MEDIA_CLOUD_REGION: optional(string()),
-  MEDIA_CLOUD_ENDPOINT: optional(string()),
-  MEDIA_CLOUD_PUBLIC_URL: optional(string()),
   IMAGE_SIZES: object({}),
   MAX_FILE_SIZE: optional(pipe(number(), minValue(1))),
   BODY_SIZE_LIMIT: optional(pipe(number(), minValue(1))),
   EXTRACT_DATA_PATH: optional(string()),
   USE_ARCHIVE_ON_DELETE: optional(boolean()),
+
+  // --- Cloud Storage Configuration ---
+  MEDIA_CLOUD_REGION: optional(string()),
+  MEDIA_CLOUD_ENDPOINT: optional(string()),
+  MEDIA_CLOUD_PUBLIC_URL: optional(string()),
+  MEDIA_ACCESS_KEY_ID: optional(string()),
+  MEDIA_SECRET_ACCESS_KEY: optional(string()),
+  CLOUDINARY_CLOUD_NAME: optional(string()),
+  CLOUDINARY_API_KEY: optional(string()),
+  CLOUDINARY_API_SECRET: optional(string()),
 
   // --- Seasons Icons ---
   SEASONS: optional(boolean()),
@@ -93,6 +99,9 @@ export const publicConfigSchema = object({
   LOG_RETENTION_DAYS: optional(pipe(number(), minValue(1))),
   LOG_ROTATION_SIZE: optional(pipe(number(), minValue(1))),
 
+  // --- Site Starter (optional in-repo SvelteKit frontend) ---
+  SITE_STARTER_ENABLED: optional(boolean()),
+
   // --- Demo Mode ---
   USE_GOOGLE_OAUTH: optional(boolean()),
   DEMO_TTL: optional(pipe(number(), minValue(1))),
@@ -102,6 +111,9 @@ export const publicConfigSchema = object({
 
   // --- Maps ---
   GOOGLE_MAPS_API_KEY: optional(pipe(string(), minLength(1))),
+
+  // --- Signed Media URLs ---
+  MEDIA_SIGNED_URL_ENABLED: optional(boolean()),
 });
 
 export type PublicConfig = InferOutput<typeof publicConfigSchema>;

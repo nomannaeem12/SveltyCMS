@@ -1,15 +1,15 @@
 <!--
 @file src/routes/(app)/config/collectionbuilder/[action]/[...contentPath]/+page.svelte
-@component Collection Builder Editor Shell
+@component Collection Builder Editor — 3-tab layout (Define / Widgets / Permissions)
  -->
 <script lang="ts">
 import AdminPageShell from "@components/admin-page-shell.svelte";
 import StickyActions from "@components/ui/sticky-actions.svelte";
 import { StatusTypes, type FieldInstance, type Schema } from "@src/content/types";
 import type { User } from "@src/databases/auth/types";
+import type { Role } from "@src/databases/auth/types";
 import { button_delete, button_save } from "@src/paraglide/messages";
 import {
-	collections,
 	collection,
 	setCollection,
 } from "@src/stores/collection-store.svelte";
@@ -26,12 +26,13 @@ import { onMount, onDestroy } from "svelte";
 import { goto } from "$app/navigation";
 import { page } from "$app/state";
 import CollectionForm from "./tabs/collection-form.svelte";
-import CollectionWidgetOptimized from "./tabs/collection-widget-optimized.svelte";
-import Stepper from "@src/components/ui/stepper.svelte";
-	import Button from '@components/ui/button.svelte';
+import CollectionWidget from "./tabs/collection-widget.svelte";
+import CollectionPermissions from "./tabs/collection-permissions.svelte";
+import Tabs from "@src/components/ui/tabs.svelte";
+import Button from '@components/ui/button.svelte';
 
 const action = $derived(page.params.action);
-const { data } = $props<{ data: { collection?: Schema; user: User } }>();
+const { data } = $props<{ data: { collection?: Schema; user: User; roles?: Role[] } }>();
 useContent();
 
 let originalName = $state("");
@@ -65,22 +66,14 @@ const editorSyncKey = $derived(
 		: `new:${String(page.params.contentPath ?? "")}`,
 );
 
-// Studio Mode Stepper sync
-let activeStep = $derived(collections.stepper.activeStep);
-let completedSteps = $derived(collections.stepper.completedSteps);
-const steps = $derived(collections.stepper.steps);
+// ── Tab state ──
+let activeTab = $state("define");
 
-// Effect: Synchronize step completion with collection name presence
-$effect(() => {
-	if (collection.value?.name && collection.value.name !== "new") {
-		if (!collections.stepper.completedSteps.has(0)) {
-			// Stepper indices are 0-based
-			collections.stepper.completedSteps.add(0);
-		}
-	} else {
-		collections.stepper.completedSteps.delete(0);
-	}
-});
+const editorTabs = [
+	{ id: "define", label: "Define", icon: "mdi:information" },
+	{ id: "widgets", label: "Widgets", icon: "mdi:widgets" },
+	{ id: "permissions", label: "Permissions", icon: "mdi:shield-lock" },
+];
 
 onMount(() => {
 	widgetStoreActions.initializeWidgets();
@@ -104,15 +97,19 @@ onDestroy(() => {
 	ui.setRouteContext({ isCollectionBuilder: false });
 	// Restore global UI when leaving builder
 	ui.toggle("pageheader", "full");
-	ui.toggle("pagefooter", "hidden"); // Default value from ui-store
+	ui.toggle("pagefooter", "hidden");
 });
 
 async function handleCollectionSave(confirmDeletions = false) {
-	if (
-		validationStore.errors &&
-		Object.keys(validationStore.errors).length > 0
-	) {
-		toast.error("Please fix validation errors before saving");
+	// Clear stale validation errors so the save can proceed after
+	// the user has corrected field values (e.g. name validation from
+	// a previous attempt that was dismissed without a page reload).
+	validationStore.clearAllErrors();
+
+	// Validate required name client-side
+	if (!collection.value?.name?.trim()) {
+		validationStore.setError("name", "Collection name is required");
+		toast.error("Collection name is required");
 		return;
 	}
 
@@ -158,33 +155,20 @@ function handleCollectionDelete() {
 	});
 }
 
-// Effect: Synchronize URL params with Collection Store (Svelte 5 style)
+// Effect: Synchronize URL params with Collection Store
 $effect(() => {
 	const syncKey = editorSyncKey;
 	const currentAction = page.params.action;
 
-	if (syncKey === lastCollectionSyncKey) {
-		return;
-	}
+	if (syncKey === lastCollectionSyncKey) return;
 
 	if (currentAction === "edit" && data.collection) {
 		setCollection(data.collection);
 		originalName = String(data.collection.name || "");
-		if (!collections.stepper.completedSteps.has(0)) {
-			collections.stepper.completedSteps.add(0);
-		}
 	} else if (currentAction === "new") {
 		const draftCollection = createDraftCollection(page.params.contentPath);
 		setCollection(draftCollection);
 		originalName = "";
-		if (
-			draftCollection.name !== "new" &&
-			!collections.stepper.completedSteps.has(0)
-		) {
-			collections.stepper.completedSteps.add(0);
-		} else if (draftCollection.name === "new") {
-			collections.stepper.completedSteps.delete(0);
-		}
 	}
 
 	lastCollectionSyncKey = syncKey;
@@ -202,60 +186,65 @@ $effect(() => {
 >
 	{#snippet actions()}
 		<div class="flex gap-2">
-		{#if action === 'edit'}
-			<Button variant="error"
-				onclick={handleCollectionDelete}
-				disabled={isLoading}
-				aria-label="Delete collection"
-			 class="flex items-center gap-1">
-				<iconify-icon icon="mdi:delete" width="20"></iconify-icon>
-				<span class="hidden sm:inline">{button_delete()}</span>
-			</Button>
-		{/if}
-		<StickyActions>
-		<Button variant="tertiary"
-			onclick={() => handleCollectionSave()}
-			disabled={isLoading}
-			aria-label="Save collection"
-			data-testid="save-collection-button"
-		 class="dark: flex items-center gap-1 min-w-25">
-			{#if isLoading}
-				<iconify-icon icon="mdi:loading" width="20" class="animate-spin"></iconify-icon>
-			{:else}
-				<iconify-icon icon="mdi:content-save" width="20"></iconify-icon>
+			{#if action === 'edit'}
+				<Button
+					variant="error"
+					onclick={handleCollectionDelete}
+					disabled={isLoading}
+					aria-label="Delete collection"
+					class="flex items-center gap-1"
+				>
+					<iconify-icon icon="mdi:delete" width="20"></iconify-icon>
+					<span class="hidden sm:inline">{button_delete()}</span>
+				</Button>
 			{/if}
-			<span>{button_save()}</span>
-		</Button>
-		</StickyActions>
+			<StickyActions>
+				<Button
+					variant="tertiary"
+					onclick={() => handleCollectionSave()}
+					disabled={isLoading}
+					aria-label="Save collection"
+					data-testid="save-collection-button"
+					class="dark: flex items-center gap-1 min-w-25"
+				>
+					{#if isLoading}
+						<iconify-icon icon="mdi:loading" width="20" class="animate-spin"></iconify-icon>
+					{:else}
+						<iconify-icon icon="mdi:content-save" width="20"></iconify-icon>
+					{/if}
+					<span>{button_save()}</span>
+				</Button>
+			</StickyActions>
 		</div>
 	{/snippet}
 
-	<!-- Studio stepper — visible on all breakpoints for E2E + keyboard navigation -->
+	<!-- Tab Navigation -->
 	<div
-		class="p-4 border-b border-surface-200 dark:border-surface-800 bg-white dark:bg-surface-900 shadow-sm z-20 shrink-0"
-		data-testid="collection-editor-stepper"
+		class="px-4 pt-4 border-b border-surface-200 dark:border-surface-800 bg-white dark:bg-surface-900 shadow-sm z-20 shrink-0"
+		data-testid="collection-editor-tabs"
 	>
-		<Stepper
-			{steps}
-			currentStep={activeStep - 1}
-			{completedSteps}
-			orientation="horizontal"
-			onStepClick={(index) => {
-				collections.stepper.activeStep = index + 1;
-			}}
+		<Tabs
+			tabs={editorTabs}
+			activeTab={activeTab}
+			onTabChange={(tabId: string) => activeTab = tabId}
+			variant="underline"
 		/>
 	</div>
 
 	<div class="flex min-h-0 flex-1 flex-col overflow-hidden">
 		<div class="flex-1 overflow-y-auto w-full scroll-smooth">
-			<div class="h-full {activeStep === 1 ? 'mx-auto max-w-5xl p-4 sm:p-6 lg:p-10' : 'p-0'}">
-				{#if activeStep === 1}
-					<div class="animate-in fade-in slide-in-from-bottom-4 duration-500">
+			<div class="h-full {activeTab === 'define' ? 'mx-auto max-w-5xl p-4 sm:p-6 lg:p-10' : 'p-0'}">
+				{#if activeTab === 'define'}
+					<div class="animate-in fade-in slide-in-from-bottom-4 duration-500" role="tabpanel" id="tabpanel-define" aria-labelledby="tab-define">
 						<CollectionForm data={collection.value} syncKey={editorSyncKey} />
 					</div>
-				{:else if activeStep === 2}
-					<div class="h-full animate-in fade-in slide-in-from-right-4 duration-700">
-						<CollectionWidgetOptimized fields={(collection.value?.fields as FieldInstance[]) || []} roles={data.roles} />
+				{:else if activeTab === 'widgets'}
+					<div class="h-full animate-in fade-in slide-in-from-right-4 duration-700" role="tabpanel" id="tabpanel-widgets" aria-labelledby="tab-widgets">
+						<CollectionWidget fields={(collection.value?.fields as FieldInstance[]) || []} roles={data.roles || []} />
+					</div>
+				{:else if activeTab === 'permissions'}
+					<div class="animate-in fade-in slide-in-from-right-4 duration-700" role="tabpanel" id="tabpanel-permissions" aria-labelledby="tab-permissions">
+						<CollectionPermissions roles={data.roles as any || []} />
 					</div>
 				{/if}
 			</div>

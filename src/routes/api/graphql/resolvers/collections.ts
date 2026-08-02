@@ -26,7 +26,7 @@ import type { FieldInstance, Schema } from "@src/content/types";
 // Types
 import type { User } from "@src/databases/auth/types";
 import type { DatabaseAdapter } from "@src/databases/db-interface";
-import { getPrivateSettingSync } from "@src/services/core/settings-service";
+import { isMultiTenantEnabled } from "@utils/tenant";
 // Token Engine
 import { replaceTokens } from "@src/services/token/engine";
 import type { TokenContext } from "@src/services/token/types";
@@ -129,16 +129,45 @@ export async function registerCollections(tenantId?: string | null) {
   await contentSystem.initialize(tenantId);
   await widgets.initialize(tenantId || "default");
 
+  const { isMockScanCollection, isBenchmarkRuntime } =
+    await import("@src/routes/setup/preset-collections.server");
+  const isBenchmark = isBenchmarkRuntime();
+
   // 🚀 BENCHMARK HARDENING: Force collection list refresh if in benchmark mode
-  if (process.env.BENCHMARK === "true") {
+  if (isBenchmark) {
     const { getDb } = await import("@src/databases/db");
-    const { refreshCollectionsCache } = await import("@src/content/content-service.server");
-    await refreshCollectionsCache(tenantId, getDb() || undefined);
+    const { refreshContent } = await import("@src/content/engine.server");
+    await refreshContent(tenantId, {
+      mode: "schemas",
+      adapter: getDb() || undefined,
+    });
   }
 
   const collections: Schema[] = await contentSystem.getCollections(tenantId);
+
+  // 🧪 Filter test collections from GraphQL schema registration.
+  // Mock scan artifacts (content-scan benchmark) are ALWAYS excluded — even in
+  // benchmark runtime the matrix would otherwise register 150+ mock types → HTTP 500.
+  // bench_* / test_* remain available in benchmark mode for relational audits.
+  const filtered = collections.filter((c) => {
+    const id = String(c._id || "");
+    const name = typeof c.name === "string" ? c.name : "";
+    if (isMockScanCollection(id, name)) {
+      logger.debug(`[GraphQL] Excluding mock scan artifact: ${c._id}`);
+      return false;
+    }
+    const idLower = id.toLowerCase();
+    const isBenchTestCollection =
+      idLower.startsWith("bench_") || idLower.startsWith("test-") || idLower.startsWith("test_");
+    if (isBenchTestCollection && !isBenchmark) {
+      logger.debug(`[GraphQL] Excluding test collection: ${c._id}`);
+      return false;
+    }
+    return true;
+  });
+
   logger.debug(
-    `[DEBUG] Collections list count: ${collections.length}. IDs: ${collections.map((c) => c._id).join(", ")}`,
+    `[DEBUG] Collections total: ${collections.length}, after test filter: ${filtered.length}. IDs: ${filtered.map((c) => c._id).join(", ")}`,
   );
 
   const typeIDs = new Set<string>();
@@ -152,9 +181,11 @@ export async function registerCollections(tenantId?: string | null) {
     Array<{ otherCollection: Schema; otherField: FieldInstance }>
   >();
 
-  for (const collection of collections) {
+  const iterable = filtered;
+
+  for (const collection of iterable) {
     if (process.env.BENCHMARK_DEBUG === "true") {
-      console.log(
+      logger.debug(
         `[GraphQL Debug] Processing collection: id=${collection._id}, name=${collection.name}`,
       );
     }
@@ -169,7 +200,7 @@ export async function registerCollections(tenantId?: string | null) {
   }
 
   // --- Optimization: Pre-calculate Relations to avoid O(N^2) lookup ---
-  for (const otherCollection of collections) {
+  for (const otherCollection of iterable) {
     if (!otherCollection.name) continue;
     for (const otherField of otherCollection.fields as FieldInstance[]) {
       const otherWidgetName =
@@ -184,9 +215,9 @@ export async function registerCollections(tenantId?: string | null) {
     }
   }
 
-  for (const collection of collections) {
+  for (const collection of iterable) {
     if (process.env.BENCHMARK_DEBUG === "true") {
-      console.log(
+      logger.debug(
         `[GraphQL Debug] Processing collection: id=${collection._id}, name=${collection.name}`,
       );
     }
@@ -305,17 +336,14 @@ export async function registerCollections(tenantId?: string | null) {
         _args: any,
         context: any,
       ) => {
-        const { dbAdapter, tenantId } = context;
-        if (!dbAdapter) return [];
+        const { loaders } = context;
+        if (!loaders) return [];
 
-        const result = await dbAdapter.crud.findMany(
-          typeof otherCollection.name === "string" ? otherCollection.name : "",
-          {
-            [getFieldName(otherField)]: parent._id,
-            ...(tenantId ? { tenantId } : {}),
-          },
-        );
-        return result.success ? result.data : [];
+        const collectionName = typeof otherCollection.name === "string" ? otherCollection.name : "";
+        const fieldName = getFieldName(otherField);
+        const loader = loaders.createInverseLoader(collectionName, fieldName);
+
+        return loader.load(parent._id);
       };
     }
 
@@ -340,8 +368,61 @@ export async function registerCollections(tenantId?: string | null) {
     queryFields.push(`${cleanTypeName}(pagination: PaginationInput): [${cleanTypeName}]`);
   }
 
+  // Add allCollections query for listing all collection schemas.
+  // This is used by the benchmark matrix and is useful for API clients.
+  typeDefsSet.add(`
+	type CollectionInfo {
+		_id: String!
+		name: String!
+		slug: String!
+		icon: String
+		description: String
+		fieldCount: Int!
+	}`);
+  queryFields.push(`allCollections: [CollectionInfo!]!`);
+  const _allCollectionsCache = new Map<string, { data: any[]; ts: number }>();
+  const ALL_COLLECTIONS_CACHE_TTL = 5000; // 5 seconds — schemas rarely change
+
+  resolvers.Query["allCollections"] = async (_parent: unknown, _args: unknown, context: any) => {
+    if (!context.user) {
+      throw new Error("Authentication required");
+    }
+
+    const tenantKey = context.tenantId || "global";
+    const cached = _allCollectionsCache.get(tenantKey);
+    if (cached && Date.now() - cached.ts < ALL_COLLECTIONS_CACHE_TTL) {
+      return cached.data;
+    }
+
+    const { contentSystem } = await import("@src/content/index.server");
+    const all: Schema[] = await contentSystem.getCollections(context.tenantId);
+    const { isMockScanCollection, isBenchmarkRuntime } =
+      await import("@src/routes/setup/preset-collections.server");
+    const isBenchmark = isBenchmarkRuntime();
+    const filtered = all.filter((c) => {
+      const id = String(c._id || "");
+      const name = typeof c.name === "string" ? c.name : "";
+      if (isMockScanCollection(id, name)) return false;
+      const idLower = id.toLowerCase();
+      const isBenchTestCollection =
+        idLower.startsWith("bench_") || idLower.startsWith("test-") || idLower.startsWith("test_");
+      return isBenchmark || !isBenchTestCollection;
+    });
+    const result = filtered.map((col) => ({
+      _id: col._id,
+      name: col.name,
+      slug: col.slug || col.name,
+      icon: col.icon || null,
+      description: col.description || null,
+      fieldCount: (col.fields || []).length,
+    }));
+
+    _allCollectionsCache.set(tenantKey, { data: result, ts: Date.now() });
+    return result;
+  };
+
   if (process.env.BENCHMARK_DEBUG === "true") {
-    console.log(
+    logger.debug(
       `[GraphQL Debug] Registered query fields: ${queryFields.map((f) => f.split("(")[0]).join(", ")}`,
     );
   }
@@ -352,7 +433,7 @@ export async function registerCollections(tenantId?: string | null) {
     typeDefs: finalTypeDefs,
     queryFields,
     resolvers,
-    collections,
+    collections: filtered,
   };
 }
 
@@ -392,13 +473,13 @@ export async function collectionsResolvers(
         throw new Error("Authentication required");
       }
 
-      if (getPrivateSettingSync("MULTI_TENANT") && ctx.tenantId !== tenantId) {
+      if (isMultiTenantEnabled() && ctx.tenantId !== tenantId) {
         logger.error(`Resolver tenantId mismatch. Expected ${tenantId}, got ${ctx.tenantId}`);
         throw new Error("Internal server error: Tenant context mismatch.");
       }
 
       // Check user tenant isolation
-      if (getPrivateSettingSync("MULTI_TENANT") && !ctx.bypassTenantIsolation) {
+      if (isMultiTenantEnabled() && !ctx.bypassTenantIsolation) {
         const userTenantId = ctx.user.tenantId;
         const isGlobalAdmin = !userTenantId || userTenantId === "global";
         if (!isGlobalAdmin && userTenantId !== ctx.tenantId) {
@@ -433,24 +514,23 @@ export async function collectionsResolvers(
 
         const resultArray = (result.data || []) as unknown as DocumentBase[];
 
-        // 🚀 PERFORMANCE: Merge loops and skip token scan if not needed
         const processedResults = await Promise.all(
           resultArray.map(async (doc) => {
-            const tokenContext: TokenContext = { entry: doc, user: ctx.user };
-
-            // 1. Token Replacement (Only if possible)
-            for (const key in doc) {
-              if (!Object.hasOwn(doc, key)) continue;
-              const value = doc[key];
-              if (
-                typeof value === "string" &&
-                value.charCodeAt(0) === 123 &&
-                value.includes("{{")
-              ) {
-                try {
-                  doc[key] = await replaceTokens(value, tokenContext);
-                } catch {
-                  /* ignore */
+            // Whole-document scan: JSON.stringify once, check for {{ marker.
+            // Catches tokens anywhere in the string (start, mid, nested), unlike
+            // charCodeAt(0) which only catches leading-brace tokens.
+            const docBody = JSON.stringify(doc);
+            if (docBody.includes("{{")) {
+              const tokenContext: TokenContext = { entry: doc, user: ctx.user };
+              for (const key in doc) {
+                if (!Object.hasOwn(doc, key)) continue;
+                const value = doc[key];
+                if (typeof value === "string" && value.includes("{{")) {
+                  try {
+                    doc[key] = await replaceTokens(value, tokenContext);
+                  } catch {
+                    /* ignore */
+                  }
                 }
               }
             }

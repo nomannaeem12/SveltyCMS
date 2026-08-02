@@ -14,9 +14,35 @@
 import { AppError } from "@utils/error-handling";
 import type { RequestEvent } from "@sveltejs/kit";
 import type { LocalCMS } from "@src/services/sdk";
-import type { DatabaseId } from "@src/content/types";
+import type { DatabaseId, Schema } from "@src/content/types";
+import { validateFieldConstraints, stripNullRows } from "@src/content/content-utils";
+import { hasPermissionWithRoles } from "@src/databases/auth/permissions";
+import { logger } from "@utils/logger";
 import { successResponse, rawResponse } from "./base";
 import { streamingJsonResponse } from "./streaming";
+import { setCollectionOrder } from "@utils/collection-order.server";
+import { cacheService } from "@src/databases/cache/cache-service";
+
+/**
+ * Sets a lightweight weak-ETag token on event.locals based on entry timestamps.
+ * The gateway uses this to serve 304 responses without cloning the response body.
+ */
+function setApiDataHash(event: RequestEvent, data: any) {
+  if (!data) return;
+  const entries = Array.isArray(data) ? data : data.data ? data.data : [data];
+  if (!Array.isArray(entries) || entries.length === 0) return;
+
+  // Use max updatedAt as the hash token — changes only when entries change
+  let maxTs = "";
+  for (const entry of entries) {
+    if (entry?.updatedAt && entry.updatedAt > maxTs) maxTs = entry.updatedAt;
+  }
+  if (!maxTs) {
+    // Fallback: use entry count as a version indicator
+    maxTs = `count:${entries.length}`;
+  }
+  (event.locals as any).apiDataHash = maxTs;
+}
 
 // ─── Main Dispatcher ─────────────────────────────────────────────────────────
 
@@ -36,6 +62,11 @@ export async function handleCollectionsRoutes(
     // ── Cross-collection search ──
     if (collectionId === "search" && request.method === "GET") {
       return handleCollectionSearch(event, cms, tenantId, user, url, locals);
+    }
+
+    // ── Collection order persistence ──
+    if (collectionId === "reorder" && request.method === "POST") {
+      return handleCollectionReorder(event, tenantId);
     }
 
     // ── Revision history ──
@@ -75,7 +106,7 @@ export async function handleCollectionsRoutes(
     );
   } catch (err: any) {
     if (process.env.SVELTY_BENCHMARK_SUITE !== "true" && process.env.BENCHMARK !== "true") {
-      console.error(`[CollectionsRoute Error] ${segments.join("/")}:`, err);
+      logger.error(`[CollectionsRoute Error] ${segments.join("/")}:`, err);
     }
     if (err instanceof AppError) throw err;
     throw new AppError(
@@ -174,6 +205,7 @@ export async function handleCollectionList(
     includeFields,
     includeStats,
   });
+  setApiDataHash(event, result);
   return url.searchParams.get("raw") === "true"
     ? rawResponse(event, result)
     : successResponse(event, result);
@@ -240,19 +272,27 @@ export async function handleCollectionFind(
   const bypassCache =
     url.searchParams.get("bypassCache") === "true" || url.searchParams.get("nocache") === "true";
 
-  return successResponse(
-    event,
-    await cms.collections.find(collectionId, {
-      tenantId,
-      limit,
-      offset,
-      sortField,
-      sortDirection,
-      filter,
-      publicationFilter,
-      bypassCache,
-    }),
-  );
+  // Parse populate: comma-separated field names
+  const populateRaw = url.searchParams.get("populate");
+  const populate: string[] | undefined = populateRaw
+    ? populateRaw
+        .split(",")
+        .map((f) => f.trim())
+        .filter(Boolean)
+    : undefined;
+  const result = await cms.collections.find(collectionId, {
+    tenantId,
+    limit,
+    offset,
+    sortField,
+    sortDirection,
+    filter,
+    publicationFilter,
+    bypassCache,
+    populate,
+  });
+  setApiDataHash(event, result);
+  return successResponse(event, result);
 }
 
 export async function handleCollectionEntry(
@@ -265,16 +305,71 @@ export async function handleCollectionEntry(
   const bypassCache =
     event.url.searchParams.get("bypassCache") === "true" ||
     event.url.searchParams.get("nocache") === "true";
-  return successResponse(
-    event,
-    await cms.collections.findById(collectionId, entryId, {
-      tenantId,
-      bypassCache,
-    }),
-  );
+  const populateRaw = event.url.searchParams.get("populate");
+  const populate: string[] | undefined = populateRaw
+    ? populateRaw
+        .split(",")
+        .map((f) => f.trim())
+        .filter(Boolean)
+    : undefined;
+  const result = await cms.collections.findById(collectionId, entryId, {
+    tenantId,
+    bypassCache,
+    populate,
+  });
+  setApiDataHash(event, result);
+  return successResponse(event, result);
 }
 
 // ─── Write Handlers ──────────────────────────────────────────────────────────
+
+/**
+ * Shared pre-validation for write payloads: gets schema, applies maxLength
+ * constraints, strips null array rows, and returns the cleaned data.
+ */
+async function validateWritePayload(
+  cms: LocalCMS,
+  collectionId: string,
+  tenantId: DatabaseId,
+  data: Record<string, unknown> | Record<string, unknown>[],
+): Promise<Record<string, unknown> | Record<string, unknown>[]> {
+  const schema = (await cms.collections.getSchema(collectionId, tenantId)) as Schema;
+  if (schema?.fields) {
+    if (Array.isArray(data)) {
+      return data.map(
+        (entry) =>
+          validateFieldConstraints(stripNullRows(entry, schema as any), schema as any) as Record<
+            string,
+            unknown
+          >,
+      );
+    }
+    return validateFieldConstraints(stripNullRows(data, schema as any), schema as any);
+  }
+  return data;
+}
+
+/**
+ * Shared pre-validation for bulk update payloads (Array<{ id: string; data: Record }>).
+ * Validates constraints on each entry's `.data` portion and strips null array rows.
+ */
+async function validateBulkUpdatePayload(
+  cms: LocalCMS,
+  collectionId: string,
+  tenantId: DatabaseId,
+  updates: Array<{ id: string; data: Record<string, unknown> }>,
+): Promise<Array<{ id: string; data: Record<string, unknown> }>> {
+  const schema = (await cms.collections.getSchema(collectionId, tenantId)) as Schema;
+  if (!schema?.fields) return updates;
+
+  return updates.map((entry) => ({
+    ...entry,
+    data: validateFieldConstraints(
+      stripNullRows(entry.data, schema as any),
+      schema as any,
+    ) as Record<string, unknown>,
+  }));
+}
 
 export async function handleCollectionCreate(
   event: RequestEvent,
@@ -283,7 +378,9 @@ export async function handleCollectionCreate(
   user: any,
   collectionId: string,
 ) {
-  const result = await cms.collections.create(collectionId, await event.request.json(), {
+  const rawData = await event.request.json();
+  const data = await validateWritePayload(cms, collectionId, tenantId, rawData);
+  const result = await cms.collections.create(collectionId, data, {
     user: user!,
     tenantId,
   });
@@ -298,9 +395,11 @@ export async function handleCollectionUpdate(
   collectionId: string,
   entryId: string,
 ) {
+  const rawData = await event.request.json();
+  const data = await validateWritePayload(cms, collectionId, tenantId, rawData);
   return successResponse(
     event,
-    await cms.collections.update(collectionId, entryId, await event.request.json(), {
+    await cms.collections.update(collectionId, entryId, data, {
       user: user!,
       tenantId,
     }),
@@ -348,11 +447,22 @@ export async function handleCollectionWarmCache(
     throw new AppError("warm-cache supports at most 20 entryIds per request", 400);
   }
 
-  await Promise.all(
-    entryIds.map((id) =>
-      cms.collections.findById(collectionId, id, { tenantId }).catch(() => null),
-    ),
+  // Single bulk query instead of N individual lookups
+  const sanitizedTable = `collection_${collectionId.replace(/-/g, "")}`;
+  const bulkResult = await cms.db.crud.findMany(
+    sanitizedTable,
+    { _id: { $in: entryIds as DatabaseId[] } },
+    { tenantId, limit: entryIds.length },
   );
+
+  // Fire-and-forget cache backfill
+  if (bulkResult.success && Array.isArray(bulkResult.data)) {
+    for (const doc of bulkResult.data) {
+      if (!doc?._id) continue;
+      const cacheKey = `collection:${collectionId}:${doc._id}`;
+      cacheService.set(cacheKey, doc, 300, tenantId).catch(() => {});
+    }
+  }
 
   return successResponse(event, {
     warmed: entryIds.length,
@@ -370,9 +480,11 @@ export async function handleCollectionBulkCreate(
   user: any,
   collectionId: string,
 ) {
+  const rawData = await event.request.json();
+  const data = await validateWritePayload(cms, collectionId, tenantId, rawData);
   return successResponse(
     event,
-    await cms.collections.bulkCreate(collectionId, await event.request.json(), {
+    await cms.collections.bulkCreate(collectionId, data as any[], {
       user: user!,
       tenantId,
     }),
@@ -397,9 +509,58 @@ export async function handleCollectionBulkUpdate(
       413,
     );
   }
+
+  // 🛡️ BULK UPDATE DELETE GUARD: Prevent bypassing disableBulkDelete via bulk update
+  const schema = await cms.collections.getSchema(collectionId, tenantId);
+  if (schema?.disableBulkDelete && Array.isArray(payload)) {
+    const hasDeleteIntent = payload.some(
+      (entry: { data?: Record<string, unknown> }) =>
+        entry.data?._deleted === true ||
+        entry.data?.status === "deleted" ||
+        entry.data?.status === "trashed",
+    );
+    if (hasDeleteIntent) {
+      throw new AppError(
+        `Bulk delete is disabled for collection "${schema.name || collectionId}". Use individual delete instead.`,
+        403,
+        "BULK_DELETE_DISABLED",
+      );
+    }
+  }
+
+  // 🛡️ Permission check: verify delete permission when bulk update includes deletion markers
+  if (Array.isArray(payload)) {
+    const hasDeleteIntent = payload.some(
+      (entry: { data?: Record<string, unknown> }) =>
+        entry.data?._deleted === true ||
+        entry.data?.status === "deleted" ||
+        entry.data?.status === "trashed",
+    );
+    if (hasDeleteIntent && user) {
+      const roles = event.locals.roles || [];
+      const canDelete =
+        event.locals.isAdmin || hasPermissionWithRoles(user, "collection:delete", roles);
+      if (!canDelete) {
+        logger.warn(
+          `[handleCollectionBulkUpdate] User "${user._id || user.email}" attempted bulk update with delete intent on "${collectionId}" without permission`,
+        );
+        throw new AppError(
+          "You do not have permission to perform bulk delete operations via bulk update",
+          403,
+          "FORBIDDEN",
+        );
+      }
+    }
+  }
+
+  // Validate field constraints and strip null rows from each entry's data
+  const validPayload = Array.isArray(payload)
+    ? await validateBulkUpdatePayload(cms, collectionId, tenantId, payload)
+    : payload;
+
   return successResponse(
     event,
-    await cms.collections.bulkUpdate(collectionId, payload, {
+    await cms.collections.bulkUpdate(collectionId, validPayload, {
       user: user!,
       tenantId,
     }),
@@ -420,6 +581,17 @@ export async function handleCollectionBulkDelete(
       413,
     );
   }
+
+  // 🛡️ BULK DELETE GUARD: Check collection-level disableBulkDelete flag
+  const schema = await cms.collections.getSchema(collectionId, tenantId);
+  if (schema?.disableBulkDelete) {
+    throw new AppError(
+      `Bulk delete is disabled for collection "${schema.name || collectionId}"`,
+      403,
+      "BULK_DELETE_DISABLED",
+    );
+  }
+
   return successResponse(
     event,
     await cms.collections.bulkDelete(collectionId, payload, {
@@ -490,7 +662,7 @@ export async function handleCollectionIncrement(
 
   // Invalidate cache so subsequent reads get the new value
   try {
-    await cms.db.monitoring.cache.invalidateCollection(collectionId, tenantId);
+    await cms.db.monitoring.cache.invalidateCollection(collectionId, { tenantId });
   } catch {
     /* ignore */
   }
@@ -557,4 +729,19 @@ export async function handleCollectionSearch(
       isAdmin: (locals as any).isAdmin,
     }),
   );
+}
+
+// ─── Collection Order Persistence ───────────────────────────────────────────
+
+/**
+ * Persists the sidebar collection display order to the compilation manifest.
+ * POST /api/collections/reorder  { order: { posts: 0, authors: 1, ... } }
+ */
+async function handleCollectionReorder(event: RequestEvent, tenantId: DatabaseId) {
+  const { order } = await event.request.json();
+  if (!order || typeof order !== "object") {
+    throw new AppError("Invalid order payload — expected { order: { [id]: number } }", 400);
+  }
+  await setCollectionOrder(order, tenantId as string | null);
+  return successResponse(event, { success: true, order });
 }

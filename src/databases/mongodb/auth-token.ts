@@ -14,6 +14,7 @@ import mongoose, { Schema, type Model } from "mongoose";
 import { generateId, getOrCreateModel } from "./mongodb-utils";
 import { generateRandomToken } from "@src/databases/auth/constants";
 import { safeQuery } from "@src/utils/security/safe-query";
+import { normalizeEmail } from "@src/utils/normalize-email";
 import { logger } from "@src/utils/logger";
 
 export const TokenSchema = new Schema(
@@ -51,6 +52,19 @@ export class TokenAdapter {
   }
 
   /**
+   * Auth tokens (invite/reset/magic links) must never be stored in plaintext.
+   * Mirrors the relational adapter: SHA-256 (lowercase hex) — cross-adapter parity.
+   */
+  private async _hashToken(token: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(token);
+    const hash = await globalThis.crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(hash))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  /**
    * Explicitly set the model using a specific connection to support isolated adapters.
    */
   public setModel(conn: any) {
@@ -69,11 +83,12 @@ export class TokenAdapter {
   }): Promise<DatabaseResult<string>> {
     try {
       const tokenValue = generateRandomToken(32);
+      const hashedToken = await this._hashToken(tokenValue);
       const Model = this.TokenModel;
       const token = new Model({
         ...data,
-        email: data.email.toLowerCase(),
-        token: tokenValue,
+        email: normalizeEmail(data.email),
+        token: hashedToken,
         _id: generateId(),
       });
       await token.save();
@@ -95,20 +110,47 @@ export class TokenAdapter {
     type?: string,
     options?: BaseQueryOptions,
   ): Promise<
-    DatabaseResult<{ success: boolean; message: string; email?: string; details?: Token }>
+    DatabaseResult<{
+      success: boolean;
+      message: string;
+      email?: string;
+      details?: Token;
+    }>
   > {
     try {
       const tenantId = options?.tenantId;
-      const filter = safeQuery({ token } as any, tenantId as string, { includeDeleted: true });
+      const hashedToken = await this._hashToken(token);
+      let filter = safeQuery({ token: hashedToken } as any, tenantId as string, {
+        includeDeleted: true,
+      });
       if (userId) filter.user_id = userId;
       if (type) filter.type = type;
 
-      const found = await this.TokenModel.findOne(filter).lean();
+      let found = await this.TokenModel.findOne(filter).lean();
+
+      // Legacy plaintext rows (pre-hash) — accept and migrate on use so the row
+      // is no longer at rest in plaintext.
+      if (!found && hashedToken !== token) {
+        const legacyFilter = safeQuery({ token } as any, tenantId as string, {
+          includeDeleted: true,
+        });
+        if (userId) legacyFilter.user_id = userId;
+        if (type) legacyFilter.type = type;
+        const legacy = await this.TokenModel.findOne(legacyFilter).lean();
+        if (legacy) {
+          await this.TokenModel.updateOne({ _id: legacy._id }, { $set: { token: hashedToken } });
+          found = { ...legacy, token: hashedToken };
+        }
+      }
+
       if (!found || found.blocked || new Date(found.expires) < new Date()) {
         return {
           success: false,
           message: "Invalid or expired token",
-          error: { code: "TOKEN_INVALID", message: "Token not found or expired" },
+          error: {
+            code: "TOKEN_INVALID",
+            message: "Token not found or expired",
+          },
         };
       }
       return {
@@ -139,22 +181,77 @@ export class TokenAdapter {
   ): Promise<DatabaseResult<void>> {
     try {
       const tenantId = options?.tenantId;
+      const hashedToken = await this._hashToken(token);
       // Atomic findOneAndDelete fixes TOCTOU race condition
-      const filter = safeQuery({ token } as any, tenantId as string, { includeDeleted: true });
+      let filter = safeQuery({ token: hashedToken } as any, tenantId as string, {
+        includeDeleted: true,
+      });
       if (userId) filter.user_id = userId;
       if (type) filter.type = type;
 
-      const found = await this.TokenModel.findOneAndDelete(filter).lean();
+      // Only claim non-expired tokens (expiry must be in the claim filter)
+      const claimFilter = {
+        ...filter,
+        expires: { $gt: new Date() },
+        blocked: { $ne: true },
+      };
+      let found = await this.TokenModel.findOneAndDelete(claimFilter).lean();
 
-      if (!found || found.blocked || new Date(found.expires) < new Date()) {
-        return {
-          success: false,
-          message: "Invalid or expired token",
-          error: { code: "TOKEN_INVALID", message: "Token not found or expired" },
-        };
+      // Legacy plaintext rows (pre-hash) — claim the same way; deletion removes the
+      // plaintext-at-rest row entirely, so no migrate-on-use is needed here.
+      if (!found && hashedToken !== token) {
+        const legacyFilter = safeQuery({ token } as any, tenantId as string, {
+          includeDeleted: true,
+        });
+        if (userId) legacyFilter.user_id = userId;
+        if (type) legacyFilter.type = type;
+        found = await this.TokenModel.findOneAndDelete({
+          ...legacyFilter,
+          expires: { $gt: new Date() },
+          blocked: { $ne: true },
+        }).lean();
       }
 
-      return { success: true, data: undefined };
+      if (found) {
+        return { success: true, data: undefined };
+      }
+
+      // Diagnose: missing vs expired vs blocked (hashed first, then legacy)
+      let existing = await this.TokenModel.findOne(filter).lean();
+      if (!existing && hashedToken !== token) {
+        const legacyFilter = safeQuery({ token } as any, tenantId as string, {
+          includeDeleted: true,
+        });
+        if (userId) legacyFilter.user_id = userId;
+        if (type) legacyFilter.type = type;
+        existing = await this.TokenModel.findOne(legacyFilter).lean();
+      }
+      if (!existing) {
+        return {
+          success: false,
+          message: "Token not found",
+          error: { code: "TOKEN_NOT_FOUND", message: "Token not found" },
+        };
+      }
+      if (existing.blocked) {
+        return {
+          success: false,
+          message: "Token is blocked",
+          error: { code: "TOKEN_BLOCKED", message: "Token is blocked" },
+        };
+      }
+      if (new Date(existing.expires) < new Date()) {
+        return {
+          success: false,
+          message: "Token has expired. Request a new reset link.",
+          error: { code: "TOKEN_EXPIRED", message: "Token has expired" },
+        };
+      }
+      return {
+        success: false,
+        message: "Invalid or expired token",
+        error: { code: "TOKEN_INVALID", message: "Token not found or expired" },
+      };
     } catch (err) {
       const message = "Token consumption error";
       logger.error(message, err);
@@ -172,9 +269,21 @@ export class TokenAdapter {
   ): Promise<DatabaseResult<Token | null>> {
     try {
       const tenantId = options?.tenantId;
-      const filter: any = { token };
+      const hashedToken = await this._hashToken(token);
+      let filter: any = { token: hashedToken };
       if (tenantId) filter.tenantId = tenantId;
-      const found = await this.TokenModel.findOne(filter).lean();
+      let found = await this.TokenModel.findOne(filter).lean();
+
+      // Legacy plaintext rows (pre-hash) — accept and migrate on use.
+      if (!found && hashedToken !== token) {
+        const legacyFilter: any = { token };
+        if (tenantId) legacyFilter.tenantId = tenantId;
+        const legacy = await this.TokenModel.findOne(legacyFilter).lean();
+        if (legacy) {
+          await this.TokenModel.updateOne({ _id: legacy._id }, { $set: { token: hashedToken } });
+          found = { ...legacy, token: hashedToken };
+        }
+      }
       return { success: true, data: found as Token | null };
     } catch (err) {
       return {
@@ -210,7 +319,9 @@ export class TokenAdapter {
   ): Promise<DatabaseResult<Token[]>> {
     try {
       const tenantId = options?.tenantId;
-      const safeFilter = safeQuery(filter, tenantId as string, { includeDeleted: true });
+      const safeFilter = safeQuery(filter, tenantId as string, {
+        includeDeleted: true,
+      });
       const tokens = await this.TokenModel.find(safeFilter).lean();
       return { success: true, data: tokens as Token[] };
     } catch (err) {
@@ -313,7 +424,9 @@ export class TokenAdapter {
 
   async deleteExpiredTokens(): Promise<DatabaseResult<number>> {
     try {
-      const res = await this.TokenModel.deleteMany({ expires: { $lt: new Date() } } as any);
+      const res = await this.TokenModel.deleteMany({
+        expires: { $lt: new Date() },
+      } as any);
       return { success: true, data: res.deletedCount };
     } catch (err) {
       return {

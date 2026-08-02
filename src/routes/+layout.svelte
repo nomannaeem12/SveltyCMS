@@ -23,6 +23,11 @@ import "../app.css";
 // Register Iconify custom element globally
 import "iconify-icon";
 
+// Plugin UI slot registration MUST run with the app shell — bundlers hoist this
+// side-effect module into lazy route nodes when only route pages import it,
+// leaving plugin workspaces (and other zones) unregistered on first load.
+import "@src/plugins/index";
+
 import { onMount, untrack } from "svelte";
 import { browser } from "$app/environment";
 import { page } from "$app/state";
@@ -35,13 +40,14 @@ import "@mcp-b/webmcp-polyfill";
 import DialogManager from "@src/components/system/dialog-manager.svelte";
 import ToastContainer from "@src/components/toast-container.svelte";
 // Paraglide locale bridge
-import {
-	locales as availableLocales,
-	getLocale,
-	setLocale,
-} from "@src/paraglide/runtime";
+	import {
+		locales as availableLocales,
+		getLocale,
+		setLocale,
+		getTextDirection,
+	} from "@src/paraglide/runtime";
 import CookieConsent from "@src/plugins/cookie-consent/cookie-consent.svelte";
-import { initWebMCP } from "@src/plugins/webmcp/index";
+import { initWebMCP } from "@src/plugins/webmcp/init";
 // Global Settings
 import { initPublicEnv, publicEnv } from "@src/stores/global-settings.svelte";
 import {
@@ -57,7 +63,8 @@ import {
 	initializeThemeStore,
 	themeStore,
 } from "@src/stores/theme-store.svelte";
-
+import { screen } from "@src/stores/screen-size-store.svelte";
+import { logger } from "@utils/logger";
 
 // Props
 interface Props {
@@ -127,7 +134,6 @@ afterNavigate(() => {
 		if (lastFocusedSelector) {
 			const target = document.querySelector(lastFocusedSelector) as HTMLElement;
 			if (target) {
-				console.log(`[A11y] Restoring focus to state-bound selector: ${lastFocusedSelector}`);
 				target.focus();
 			}
 		}
@@ -216,7 +222,9 @@ $effect(() => {
 // ============================================================================
 
 onMount(() => {
-	console.log("[RootLayout] Mounting in", browser ? "browser" : "server");
+	// Initialize screen size tracking (resize listener + window.innerWidth)
+	// Without this, screen.isMobile/isDesktop use SSR defaults (1024px)
+	screen.mount();
 
 	// URL is the source of truth on initial load
 	const urlLocale = getLocale();
@@ -225,11 +233,15 @@ onMount(() => {
 		availableLocales.includes(urlLocale as any) &&
 		app.systemLanguage !== urlLocale
 	) {
-		console.log(
-			`[RootLayout] Aligning store (${app.systemLanguage}) to URL (${urlLocale})`,
-		);
 		app.systemLanguage = urlLocale as any;
 		currentLocale = urlLocale;
+	}
+
+	// Set <html> dir + lang for RTL support on initial load
+	if (browser && document?.documentElement) {
+		const initialLocale = getLocale();
+		document.documentElement.dir = getTextDirection(initialLocale as any);
+		document.documentElement.lang = initialLocale || "en";
 	}
 
 	// Initialize dark mode
@@ -242,12 +254,12 @@ onMount(() => {
 	if (browser) {
 		// Tiny delay to ensure polyfill overrides are settled
 		setTimeout(() => {
-			initWebMCP().catch(console.error);
+			initWebMCP().catch((err) => logger.error("[WebMCP] init failed:", err));
 		}, 100);
 	}
 
 	// Register audit history slot for entry edit sidebar
-	import('@src/plugins/slot-registry').then(({ slotRegistry }) => {
+	import('@src/plugins/slot-registry.svelte.ts').then(({ slotRegistry }) => {
 		slotRegistry.register({
 			id: 'audit-history',
 			zone: 'entry_edit_sidebar',
@@ -275,6 +287,10 @@ onMount(() => {
 			}, 150);
 		}
 	}
+
+	return () => {
+		screen.destroy();
+	};
 });
 
 /**
@@ -297,28 +313,37 @@ $effect(() => {
 // Reactive Locale Syncing
 // ============================================================================
 
-$effect(() => {
-	// Guard: Only sync after mount
-	if (!isMounted) {
-		return;
-	}
+	$effect(() => {
+		// Guard: Only sync after mount
+		if (!isMounted) {
+			return;
+		}
 
-	const desired = app.systemLanguage;
-	const current = untrack(() => currentLocale);
+		const desired = app.systemLanguage;
+		const current = untrack(() => currentLocale);
 
-	// Only update if there's an actual change
-	if (
-		desired &&
-		availableLocales.includes(desired as any) &&
-		current !== desired
-	) {
-		console.log("[RootLayout] Store changed, updating locale:", desired);
+		// Only update if there's an actual change
+		if (
+			desired &&
+			availableLocales.includes(desired as any) &&
+			current !== desired
+		) {
+			// Update Paraglide locale (handles routing internally)
+			setLocale(desired as any, { reload: false });
+			currentLocale = desired as any;
 
-		// Update Paraglide locale (handles routing internally)
-		setLocale(desired as any, { reload: false });
-		currentLocale = desired as any;
-	}
-});
+			// Persist to localStorage so the preference survives sessions
+			if (browser) {
+				globalThis.localStorage.setItem("systemLanguage", desired);
+			}
+
+			// Update <html> dir attribute for RTL language support
+			if (browser && document?.documentElement) {
+				document.documentElement.dir = getTextDirection(desired as any);
+				document.documentElement.lang = desired;
+			}
+		}
+	});
 
 // ============================================================================
 // Theme Auto-Refresh
@@ -331,7 +356,7 @@ $effect(() => {
 
 	const interval = 30 * 60 * 1000; // 30 minutes
 	const intervalId = setInterval(() => {
-		initializeThemeStore().catch(console.error);
+		initializeThemeStore().catch((err) => logger.error("[Theme] init failed:", err));
 	}, interval);
 
 	return () => clearInterval(intervalId);
@@ -411,7 +436,7 @@ onMount(() => {
 				}
 			});
 		} catch (err) {
-			console.error("Failed to setup global keyboard shortcuts:", err);
+			logger.error("Failed to setup global keyboard shortcuts:", err);
 		}
 	})();
 
@@ -424,6 +449,7 @@ onMount(() => {
 <DialogManager />
 <ToastContainer position="responsive" />
 
+<div class="relative z-0">
 <svelte:boundary>
 	{#snippet failed(error: any, reset: any)}
 		<div class="flex h-screen w-full flex-col items-center justify-center space-y-6 bg-surface-50 text-center dark:bg-surface-900">
@@ -438,7 +464,7 @@ onMount(() => {
 				<p class="text-error-600 dark:text-error-500">{error.message}</p>
 			</div>
 
-			<div class="flex space-x-4">
+			<div class="flex gap-4">
 				<Button variant="primary" onclick={reset}>
 					Try Again
 				</Button>
@@ -453,13 +479,14 @@ onMount(() => {
 		{@render children?.()}
 	{/key}
 </svelte:boundary>
+</div>
 
 <CookieConsent />
 
 <!-- Progressive Session Timeout Warning Overlay/Banners -->
 {#if sessionPhase === 'warning'}
 	<div
-		class="fixed bottom-4 end-4 z-50 flex max-w-sm items-center justify-between gap-4 rounded border border-warning-500/30 bg-surface-100/80 p-4 shadow-xl backdrop-blur-md dark:bg-surface-800/80 text-surface-900 dark:text-surface-100"
+		class="fixed bottom-4 inset-e-4 z-50 flex max-w-sm items-center justify-between gap-4 rounded border border-warning-500/30 bg-surface-100/80 p-4 shadow-xl backdrop-blur-md dark:bg-surface-800/80 text-surface-900 dark:text-surface-100"
 		role="status"
 		aria-live="polite"
 	>

@@ -20,12 +20,15 @@
 - `Alt + S`: Save currently edited entry (if focused)
 -->
 <script lang="ts">
+import { tick } from "svelte";
+	import AdminCard from '@components/admin-card.svelte';
 	import Button from '@components/ui/button.svelte';
-	import Badge from '@components/ui/badge.svelte';
-	import Input from '@components/ui/input.svelte';
-	import Loader from '@components/ui/loader.svelte';
-	import Select from '@components/ui/select.svelte';
+		import Badge from '@components/ui/badge.svelte';
+		import Input from '@components/ui/input.svelte';
+		import Loader from '@components/ui/loader.svelte';
+		import Select from '@components/ui/select.svelte';
   import { logger } from "@utils/logger";
+  import { clientJsonHeaders } from "@utils/security/client-csrf";
   import { getFieldName } from "@utils/utils";
 
   // Auth & Page data
@@ -58,7 +61,7 @@
   } from "@src/stores/store.svelte.ts";
   import { toast } from "@src/stores/toast.svelte.ts";
   import { widgets } from "@src/stores/widget-store.svelte";
-  import { collaborationService } from "@src/services/collaboration/collaboration-service";
+  import { collaborationService } from "@src/services/collaboration/collaboration-service.svelte";
   import { showConfirm } from "@utils/modal.svelte";
   import {
     getCachedWidgetInputLoader,
@@ -72,7 +75,7 @@
   let isDiffModalOpen = $state(false);
 
   // Plugin Slot System
-  import { slotRegistry } from "@src/plugins/slot-registry";
+  import { slotRegistry } from "@src/plugins/slot-registry.svelte.ts";
   import { activeInputStore } from "@src/stores/active-input-store.svelte";
 
   // Token Picker
@@ -91,10 +94,22 @@
       el.focus();
       activeInputStore.set({ element: el, field }); // Explicitly open picker on button click
     } else {
-      console.warn("Could not find input for field", field);
+      logger.warn("Could not find input for field", field);
     }
   }
   let widgetFunctions = $derived(widgets.widgetFunctions);
+
+  /** Field icon, or fall back to the registered widget factory Icon. */
+  function resolveFieldIcon(field: {
+    icon?: string;
+    widget?: { Name?: string; Icon?: string };
+  }): string | undefined {
+    if (field.icon) return field.icon;
+    if (field.widget?.Icon) return field.widget.Icon;
+    const name = field.widget?.Name;
+    if (!name) return undefined;
+    return (widgetFunctions[name] as { Icon?: string } | undefined)?.Icon;
+  }
 
   // --- 1. RECEIVE DATA AS PROPS ---
   let {
@@ -172,7 +187,7 @@
     try {
       const res = await fetch("/api/ai/translate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: clientJsonHeaders(),
         body: JSON.stringify({
           text: sourceText,
           sourceLang: sourceLocale,
@@ -405,6 +420,60 @@
     }
   });
 
+  // visual edit click-to-edit event handler
+  $effect(() => {
+    const handleFocusField = async (e: Event) => {
+      const customEvent = e as CustomEvent<{ fieldName: string }>;
+      const fieldName = customEvent.detail?.fieldName;
+      if (!fieldName) return;
+
+      // 1. Switch back to the edit tab (tab "0")
+      localTabSet = "0";
+
+      // 2. Wait for Svelte to flush DOM updates, then wait for browser paint
+      await tick();
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const inputEl = document.getElementById(fieldName) as HTMLElement | null;
+      if (inputEl) {
+        inputEl.focus();
+        inputEl.scrollIntoView({ behavior: "smooth", block: "center" });
+      } else {
+        // Fallback: search by name attribute if ID matches db_fieldName
+        const inputByName = document.querySelector(`[name="${fieldName}"]`) as HTMLElement | null;
+        if (inputByName) {
+          inputByName.focus();
+          inputByName.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
+    };
+
+    window.addEventListener("svelty:focus-field" as any, handleFocusField);
+    return () => window.removeEventListener("svelty:focus-field" as any, handleFocusField);
+  });
+
+  // Bidirectional live preview: merge edits from iframe back into the form
+  $effect(() => {
+    const handlePreviewUpdate = (e: Event) => {
+      const customEvent = e as CustomEvent<{
+        data: Record<string, unknown>;
+        source?: string;
+      }>;
+      const merged = customEvent.detail?.data;
+      if (!merged || typeof merged !== "object") return;
+
+      currentCollectionValue = { ...currentCollectionValue, ...merged };
+      setCollectionValue({ ...(collectionValue.value as Record<string, unknown>), ...merged });
+      dataChangeStore.compareWithCurrent({
+        ...(collectionValue.value as Record<string, unknown>),
+        ...merged,
+      });
+    };
+
+    window.addEventListener("svelty:preview-update" as any, handlePreviewUpdate);
+    return () =>
+      window.removeEventListener("svelty:preview-update" as any, handlePreviewUpdate);
+  });
+
   // --- 7. PLUGIN SLOTS ---
   const entryEditSlots = $derived(
     slotRegistry.getSlots("entry_edit").filter(
@@ -530,6 +599,7 @@
           {#each filteredFields as rawField (rawField.db_fieldName || rawField.id || rawField.label || rawField.name)}
             {#if rawField.widget}
               {const field = ensureFieldProperties(rawField)}
+              {@const fieldIcon = resolveFieldIcon(field)}
               <div
                 class="mx-auto text-center {!field?.width
                   ? 'w-full '
@@ -593,51 +663,52 @@
                       {@const isTranslating = aiTranslatingFields.has(fieldName)}
                       <div class="flex items-center gap-1">
                         <!-- Locale badge / switcher -->
-                        <button
-                          type="button"
+                        <Button
+                          variant="ghost"
                           class="flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-xs font-medium transition-colors hover:bg-tertiary-100 dark:hover:bg-primary-500/20"
                           style="background: var(--color-surface-200, #e5e7eb); color: var(--color-tertiary-500, #6b7280)"
                           onclick={() => cycleFieldLocale(fieldName, currentFieldLocale)}
                           aria-label="Switch locale for {field.label || fieldName}. Current: {currentFieldLocale.toUpperCase()}"
                         >
                           <iconify-icon icon="bi:translate" width="14" aria-hidden="true"></iconify-icon>
-                          <span class="text-tertiary-600 dark:text-primary-400">{currentFieldLocale.toUpperCase()}</span>
+                          <span class="text-tertiary-600 dark:text-primary-500">{currentFieldLocale.toUpperCase()}</span>
                           {#if availableLanguages.length > 1}
                             <iconify-icon icon="mdi:chevron-down" width="10" aria-hidden="true"></iconify-icon>
                           {/if}
-                        </button>
+                        </Button>
                         <!-- AI Translate button -->
                         {#if availableLanguages.length > 1 && currentFieldLocale !== sourceLocale}
-                          <button
-                            type="button"
+                          <Button
+                            variant="ghost"
                             class="flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-xs transition-colors hover:bg-purple-100 dark:hover:bg-purple-500/20"
                             style="color: var(--color-purple-500, #a855f7)"
                             onclick={() => aiTranslateField(field, fieldName, sourceLocale, currentFieldLocale)}
                             disabled={isTranslating}
                             aria-label="AI translate {field.label || fieldName} from {sourceLocale.toUpperCase()} to {currentFieldLocale.toUpperCase()}"
                           >
-                            {#if isTranslating}
-                              <iconify-icon icon="svg-spinners:3-dots-scale" width="14" aria-hidden="true"></iconify-icon>
-                            {:else}
-                              <iconify-icon icon="mdi:auto-fix" width="14" aria-hidden="true"></iconify-icon>
-                            {/if}
-                          </button>
+                          			  {#if isTranslating}
+                          			    <div class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent"></div>
+                          			  {:else}
+                          			    <iconify-icon icon="mdi:auto-fix" width="14" aria-hidden="true"></iconify-icon>
+                          			  {/if}
+                          </Button>
                         {/if}
                       </div>
                     {/if}
-                    <!-- Icon for field type -->
-                    {#if field.icon}
+                    <!-- Icon: field override → widget definition Icon → registry Icon -->
+                    {#if fieldIcon}
                       <iconify-icon
-                        icon={field.icon}
+                        icon={fieldIcon}
                         width="20"
                         class="text-tertiary-500 dark:text-primary-500"
+                        aria-hidden="true"
                       ></iconify-icon>
                     {/if}
                   </div>
                 </div>
 
                 {#if field.widget}
-                  {const widgetName = field.widget.Name}
+                  {const widgetName = field.widget.Name || "Input"}
 
                   {const loadedWidget = getCachedWidgetInputLoader(widgetName, widgetFunctions)}
 
@@ -836,11 +907,11 @@
             Copy
           </Button>
         </div>
-        <div
-          class="card p-4 overflow-x-auto bg-surface-800 text-white font-mono text-sm `max-h-125"
-        >
+        <AdminCard
+                  class="p-4 overflow-x-auto bg-surface-800 text-white font-mono text-sm `max-h-125"
+                >
           <pre>{JSON.stringify((collectionValue as any).value, null, 2)}</pre>
-        </div>
+                  </AdminCard>
       </div>
     </Tabs.Content>
 
@@ -857,19 +928,21 @@
           {#if Component.default}
             <Component.default
               {collection}
-              {currentCollectionValue}
+              currentCollectionValue={currentCollectionValue}
               {user}
               {tenantId}
               contentLanguage={currentContentLanguage}
+              active={localTabSet === slot.id}
               {...slot.props}
             />
           {:else}
             <Component
               {collection}
-              {currentCollectionValue}
+              currentCollectionValue={currentCollectionValue}
               {user}
               {tenantId}
               contentLanguage={currentContentLanguage}
+              active={localTabSet === slot.id}
               {...slot.props}
             />
           {/if}

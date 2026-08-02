@@ -1,12 +1,40 @@
 /**
  * @file tests/unit/databases/soft-delete.test.ts
  * @description Unit tests for the Native Soft Delete engine and Mangle-on-Delete logic.
+ *
+ * Mongoose is fully mocked so this suite runs under Bun (real mongoose → bson →
+ * node:v8 isBuildingSnapshot is not implemented in Bun).
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { MongoCrudMethods } from "@src/databases/mongodb/crud-methods";
-import { safeQuery } from "@src/utils/security/safe-query";
-import type { Model } from "mongoose";
+import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
+
+// ─── Mongoose stub (must be registered before any mongodb/* import) ─────────
+vi.mock("mongoose", () => {
+  class MongoServerError extends Error {
+    code?: number;
+    constructor(message?: string, code?: number) {
+      super(message);
+      this.name = "MongoServerError";
+      this.code = code;
+    }
+  }
+
+  const mongooseStub = {
+    mongo: { MongoServerError },
+    Types: { ObjectId: class ObjectId {} },
+    Schema: class Schema {},
+    model: vi.fn(),
+    connection: {},
+  };
+
+  return {
+    default: mongooseStub,
+    ...mongooseStub,
+    Model: class Model {},
+    Schema: mongooseStub.Schema,
+    Types: mongooseStub.Types,
+  };
+});
 
 // Mock safe-query
 vi.mock("@src/utils/security/safe-query", () => ({
@@ -19,7 +47,7 @@ vi.mock("@src/utils/security/safe-query", () => ({
   }),
 }));
 
-// Mock mongodb-utils
+// Mock mongodb-utils (relative import from crud-methods)
 vi.mock("@src/databases/mongodb/mongodb-utils", () => ({
   createDatabaseError: vi.fn((error, code, message) => ({
     code,
@@ -31,9 +59,28 @@ vi.mock("@src/databases/mongodb/mongodb-utils", () => ({
   processDates: vi.fn((doc) => doc),
 }));
 
+// Relative path used by crud-methods itself (Bun mock.module matches specifier)
+vi.mock("./mongodb-utils", () => ({
+  createDatabaseError: vi.fn((error, code, message) => ({
+    code,
+    message,
+    details: error instanceof Error ? error.message : String(error),
+    originalCode: (error as any)?.code,
+  })),
+  generateId: vi.fn(() => "new-id"),
+  processDates: vi.fn((doc) => doc),
+}));
+
 describe("Soft Delete Engine", () => {
+  let MongoCrudMethods: any;
   let mockModel: any;
-  let crud: MongoCrudMethods<any>;
+  let crud: any;
+
+  beforeAll(async () => {
+    // Dynamic import after mongoose mock is registered
+    const mod = await import("@src/databases/mongodb/crud-methods");
+    MongoCrudMethods = mod.MongoCrudMethods;
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -58,7 +105,7 @@ describe("Soft Delete Engine", () => {
     };
 
     const mockAdapter = { mapQuery: vi.fn((q) => q) };
-    crud = new MongoCrudMethods(mockModel as unknown as Model<any>, mockAdapter);
+    crud = new MongoCrudMethods(mockModel, mockAdapter);
   });
 
   describe("Read Operations", () => {
@@ -74,6 +121,7 @@ describe("Soft Delete Engine", () => {
 
       await crud.findMany({});
 
+      const { safeQuery } = await import("@src/utils/security/safe-query");
       expect(safeQuery).toHaveBeenCalledWith(
         {},
         undefined,
@@ -94,6 +142,7 @@ describe("Soft Delete Engine", () => {
 
       await crud.findOne({}, { includeDeleted: true });
 
+      const { safeQuery } = await import("@src/utils/security/safe-query");
       expect(safeQuery).toHaveBeenCalledWith(
         {},
         undefined,
@@ -203,7 +252,7 @@ describe("Soft Delete Engine", () => {
       const result = await crud.restore("123" as any);
 
       expect(result.success).toBe(false);
-      expect((result as any).error?.code).toBe("COLLISION");
+      expect(result.error?.code).toBe("COLLISION");
     });
   });
 });

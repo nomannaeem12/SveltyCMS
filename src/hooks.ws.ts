@@ -17,9 +17,9 @@
 import { SESSION_COOKIE_NAME } from "@src/databases/auth/constants";
 import { logger } from "@utils/logger";
 import { getDbInitPromise, dbAdapter } from "@src/databases/db";
-import { getTenantIdFromHostname } from "@utils/tenant";
+import { getTenantIdFromHostname, isMultiTenantEnabled } from "@utils/tenant";
 import { getPrivateSettingSync, loadSettingsCache } from "@src/services/core/settings-service";
-import { parseCookies } from "@utils/http/cookie-utils";
+import { parseCookies } from "@utils/cookie-utils";
 import { LRUCache } from "lru-cache";
 import type { User } from "@src/databases/auth/types";
 import type { DatabaseId } from "@src/content/types";
@@ -29,7 +29,7 @@ export { message } from "svelte-realtime/server";
 
 // 🚀 Platform reference lives in src/lib/ws-platform.ts (extracted here
 // to avoid SvelteKit's "unknown export" warning on non-hook exports).
-// Import directly: import { globalPlatform } from "@src/lib/ws-platform";
+// Import directly: import { getGlobalPlatform } from "@src/live/ws-platform";
 import { initWsPlatform } from "@src/live/ws-platform";
 
 /** Initialize platform for global broadcasting */
@@ -133,7 +133,8 @@ export async function upgrade(ctx: WsUpgradeContext): Promise<WsAuthResult | fal
     const tenantIdHeader = getHeader(ctx, "x-tenant-id");
 
     // Cookie name handling (secure prefix)
-    const isSecure = url.protocol === "https:" || url.hostname !== "localhost";
+    const { isSecureCookieContext } = await import("@src/databases/auth/constants");
+    const isSecure = isSecureCookieContext(url.protocol, url.hostname);
     const cookieName = isSecure ? `__Host-${SESSION_COOKIE_NAME}` : SESSION_COOKIE_NAME;
 
     // Extract session ID
@@ -175,7 +176,7 @@ export async function upgrade(ctx: WsUpgradeContext): Promise<WsAuthResult | fal
     }
 
     // Multi-tenant fallback
-    const isMultiTenant = getPrivateSettingSync("MULTI_TENANT") === true;
+    const isMultiTenant = isMultiTenantEnabled();
     if (isMultiTenant && !tenantId) {
       tenantId = getTenantIdFromHostname(url.hostname, true);
     }

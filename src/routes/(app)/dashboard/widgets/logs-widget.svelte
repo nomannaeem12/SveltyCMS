@@ -34,14 +34,16 @@ export const widgetMeta = {
 			.catch(() => {
 				licenseStatus = { active: false, hasLicense: false, daysRemaining: 0 };
 			});
-	});
+		});
+
+		const isLicensed = $derived(licenseStatus?.active || licenseStatus?.hasLicense || false);
 </script>
 
 <script lang="ts">
-	import type { WidgetSize } from '@src/content/types';
-	import BaseWidget from '../base-widget.svelte';
+import type { WidgetSize } from '@src/content/types';
+import BaseWidget from '../base-widget.svelte';
 
-	interface LogEntry {
+interface LogEntry {
 		timestamp: string;
 		level: string;
 		message: string;
@@ -131,24 +133,6 @@ export const widgetMeta = {
 	}
 </script>
 
-{#if licenseStatus && !licenseStatus.active && !licenseStatus.hasLicense}
-	<BaseWidget
-		{label}
-		{theme}
-		{icon}
-		{widgetId}
-		{size}
-		{onSizeChange}
-		onCloseRequest={onRemove}
-	>
-		<div class="flex h-full flex-col items-center justify-center text-center px-4 bg-surface-50 dark:bg-surface-800/50 rounded-lg">
-			<iconify-icon icon="mdi:lock-outline" class="text-4xl text-amber-500 mb-2"></iconify-icon>
-			<h3 class="text-sm font-semibold text-surface-800 dark:text-surface-200">Premium Extension</h3>
-			<p class="text-xs text-surface-500 mt-1 mb-3">Your 14-day trial for this extension has expired. A valid LICENSE_KEY is required.</p>
-			<a href="https://marketplace.sveltycms.com" target="_blank" class="text-xs font-medium text-primary-600 hover:text-primary-700 dark:text-primary-400">Upgrade License &rarr;</a>
-		</div>
-	</BaseWidget>
-{:else}
 <BaseWidget
 	{label}
 	{theme}
@@ -167,40 +151,51 @@ export const widgetMeta = {
 		{#if !isCompact}
 			<!-- Controls (rich layout only) -->
 			<div class="mb-3 flex flex-wrap items-center gap-2">
-				<select
+				<select aria-label="Log level"
 					bind:value={filterLevel}
 					class="rounded border border-surface-200 bg-surface-50 px-3 py-1.5 text-xs text-surface-700 focus:border-primary-400 focus:outline-none dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200"
-					aria-label="Filter by log level"
 				>
-					{#each levels as opt}
+					{#each levels as opt (opt.value)}
 						<option value={opt.value}>{opt.label}</option>
 					{/each}
 				</select>
 
 				<div class="relative flex-1 min-w-30">
-					<input
+					<input aria-label="Search logs"
 						type="text"
 						bind:value={searchTerm}
 						placeholder="Search..."
 						class="w-full rounded border border-surface-200 bg-surface-50 py-1.5 ps-8 pe-3 text-xs text-surface-700 placeholder-surface-400 focus:border-primary-400 focus:outline-none dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200"
-						aria-label="Search log messages"
 					/>
 					<iconify-icon icon="mdi:magnify" width="14" class="absolute inset-s-2.5 top-1/2 -translate-y-1/2 text-surface-400"  ></iconify-icon>
 				</div>
 
-				<input
-					type="date"
-					bind:value={startDate}
-					class="rounded border border-surface-200 bg-surface-50 px-2 py-1.5 text-xs text-surface-700 focus:border-primary-400 focus:outline-none dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200"
-					aria-label="Start date"
-				/>
-				<span class="text-xs text-surface-400">–</span>
-				<input
-					type="date"
-					bind:value={endDate}
-					class="rounded border border-surface-200 bg-surface-50 px-2 py-1.5 text-xs text-surface-700 focus:border-primary-400 focus:outline-none dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200"
-					aria-label="End date"
-				/>
+				{#if isLicensed}
+					<input aria-label="Date from"
+						type="date"
+						bind:value={startDate}
+						class="rounded border border-surface-200 bg-surface-50 px-2 py-1.5 text-xs text-surface-700 focus:border-primary-400 focus:outline-none dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200"
+					/>
+					<span class="text-xs text-surface-400">–</span>
+					<input aria-label="Date to"
+						type="date"
+						bind:value={endDate}
+						class="rounded border border-surface-200 bg-surface-50 px-2 py-1.5 text-xs text-surface-700 focus:border-primary-400 focus:outline-none dark:border-surface-700 dark:bg-surface-800 dark:text-surface-200"
+					/>
+				{/if}
+			</div>
+		{/if}
+
+
+
+			<!-- Premium upgrade banner for date range filtering -->
+			{#if !isLicensed && !isCompact}
+			<div class="mt-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-3 py-2 flex items-center justify-between">
+				<span class="text-xs text-amber-700 dark:text-amber-300">
+					<iconify-icon icon="mdi:crown" class="inline me-1 text-amber-500"></iconify-icon>
+					Date range filtering and export are premium features.
+				</span>
+				<a href="https://marketplace.sveltycms.com" target="_blank" class="text-xs font-medium text-amber-700 dark:text-amber-300 hover:text-amber-800 underline shrink-0 ms-3">Upgrade €6.99 →</a>
 			</div>
 		{/if}
 
@@ -273,9 +268,8 @@ export const widgetMeta = {
 				{/each}
 			</div>
 		{/if}
-	{/snippet}
+		{/snippet}
 </BaseWidget>
-{/if}
 
 <style>
 	.scrollbar-none { scrollbar-width: none; }

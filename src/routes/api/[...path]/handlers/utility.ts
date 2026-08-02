@@ -11,6 +11,7 @@
  * - Debug/diagnostics endpoint (admin-only)
  */
 
+import { logger } from "@utils/logger";
 import { AppError } from "@utils/error-handling";
 import type { RequestEvent } from "@sveltejs/kit";
 import type { LocalCMS } from "@src/services/sdk";
@@ -23,6 +24,7 @@ let apiSpecService: any;
 let cacheService: any;
 let versionCheckService: any;
 let marketplaceService: import("@src/services/core/marketplace-service").MarketplaceService;
+let configService: import("@src/services/core/config-service").ConfigService;
 
 async function getApiSpecService() {
   if (!apiSpecService) {
@@ -52,6 +54,13 @@ async function getMarketplaceService() {
     marketplaceService = mod.marketplaceService;
   }
   return marketplaceService;
+}
+
+async function getConfigService() {
+  if (!configService) {
+    configService = (await import("@src/services/core/config-service")).configService;
+  }
+  return configService;
 }
 
 // ─── Main Dispatcher ─────────────────────────────────────────────────────────
@@ -95,12 +104,30 @@ export async function handleUtilityRoutes(
     }
 
     // ── Config Sync ──
-    if (namespace === "config_sync" && request.method === "GET") {
-      return successResponse(event, {
-        success: true,
-        message: "Configuration synchronized successfully.",
-        timestamp: new Date().toISOString(),
-      });
+    if (namespace === "config_sync") {
+      const service = await getConfigService();
+
+      if (request.method === "GET") {
+        const status = await service.getStatus(tenantId as string);
+        return successResponse(event, status);
+      }
+
+      if (request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const action = typeof body?.action === "string" ? body.action : "";
+
+        if (action === "import") {
+          await service.performImport({ tenantId: tenantId as string });
+          return successResponse(event, {
+            success: true,
+            message: "Configuration imported successfully.",
+          });
+        }
+
+        throw new AppError(`Unknown config_sync action: "${action}". Valid actions: import.`, 400);
+      }
+
+      throw new AppError("Method not allowed", 405);
     }
 
     // ── Email Service ──
@@ -114,13 +141,11 @@ export async function handleUtilityRoutes(
 
       if (request.method === "GET") {
         const type = url.searchParams.get("type") as
-          | import("@src/services/core/marketplace-service").MarketplaceItemType
+          | import("@src/services/core/marketplace-service").MarketplaceItem["type"]
           | null;
         const result = await service.list({
           type: type ?? undefined,
           search: url.searchParams.get("search") || undefined,
-          category: url.searchParams.get("category") || undefined,
-          tenantId,
         });
         return successResponse(event, result);
       }
@@ -133,7 +158,7 @@ export async function handleUtilityRoutes(
         const itemId = typeof body?.itemId === "string" ? body.itemId : "";
         if (!itemId) throw new AppError("itemId is required", 400);
 
-        const installed = await service.installTheme(itemId, tenantId);
+        const installed = await service.installTheme(itemId);
         return successResponse(event, installed);
       }
     }
@@ -153,7 +178,7 @@ export async function handleUtilityRoutes(
       404,
     );
   } catch (err: any) {
-    console.error(`[UtilityRoute Error] ${segments.join("/")}:`, err);
+    logger.error(`[UtilityRoute Error] ${segments.join("/")}:`, err);
     if (err instanceof AppError) throw err;
     throw new AppError(err.message || "Utility operation failed", 500);
   }
@@ -288,30 +313,32 @@ async function handleTrashRoutes(
     const { contentSystem } = await import("@src/content/index.server");
     const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 200);
     const schemas = await contentSystem.getCollections(tenantId);
-    const allDeleted: any[] = [];
 
-    for (const schema of schemas) {
-      if (!schema._id) continue;
-      const collectionName = `collection_${schema._id.replace(/-/g, "")}`;
-      const result = await cms.db.crud.findMany(
-        collectionName,
-        { isDeleted: true },
-        {
-          tenantId: tenantId as DatabaseId,
-          includeDeleted: true,
-          limit: limit * 2,
-        },
-      );
-      if (result.success && result.data) {
-        allDeleted.push(
-          ...result.data.map((item: any) => ({
-            ...item,
-            collectionId: schema._id,
-            collectionName: schema.name || schema._id,
-          })),
+    // Parallelize — fire all DB queries concurrently to eliminate N+1
+    const queries = schemas
+      .filter((s: any) => s._id)
+      .map(async (schema: any) => {
+        const col = `collection_${schema._id.replace(/-/g, "")}`;
+        const r = await cms.db.crud.findMany(
+          col,
+          { isDeleted: true },
+          {
+            tenantId: tenantId as DatabaseId,
+            includeDeleted: true,
+            limit: limit * 2,
+          },
         );
-      }
-    }
+        return r.success && r.data
+          ? r.data.map((item: any) => ({
+              ...item,
+              collectionId: schema._id,
+              collectionName: schema.name || schema._id,
+            }))
+          : [];
+      });
+
+    const results = await Promise.all(queries);
+    const allDeleted: any[] = results.flat();
 
     allDeleted.sort(
       (a, b) => new Date(b.deletedAt || 0).getTime() - new Date(a.deletedAt || 0).getTime(),

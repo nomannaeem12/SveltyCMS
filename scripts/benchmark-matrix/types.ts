@@ -1,9 +1,13 @@
 /**
  * @file scripts/benchmark-matrix/types.ts
- * @description Core TypeScript definitions for the benchmark matrix tool.
+ * @description Central type definitions for the benchmark matrix system.
+ *
+ * Single source of truth for all benchmark-related types used across
+ * scripts/benchmark-matrix/ and tests/benchmarks/modules/.
  */
 
-/** Configuration for a single database instance used in benchmarks */
+// ── Configuration ────────────────────────────────────────────────────────────────
+
 export interface DatabaseConfig {
   type: string;
   port: number;
@@ -11,261 +15,174 @@ export interface DatabaseConfig {
   user: string;
   password: string;
   useRedis?: boolean;
-  /** Optional custom label (e.g. "SQLITE+REDIS") */
   label?: string;
 }
 
-/** Capability flags for database-agnostic benchmark filtering */
-export type DatabaseCapability =
-  | "transactions"
-  | "joins"
-  | "secondaryIndexes"
-  | "aggregations"
-  | "fullTextSearch"
-  | "networked"
-  | "embedded";
-
-/** Metadata about a database engine's capabilities and limits */
 export interface DatabaseCapabilities {
   concurrency: number;
-  capabilities: DatabaseCapability[];
+  capabilities: string[];
   transactional: boolean;
   networked: boolean;
 }
 
-/** Result of a complete database audit run */
-export interface BenchmarkResult {
-  db: string;
-  version?: string;
-  status: "SUCCESS" | "FAILED" | "PENDING" | "RUNNING";
-  coldStartMs?: number;
-  scriptPath?: string;
-  metrics?: Record<string, unknown>;
-  buildTimeMs?: number;
-  hostInfo?: HostInfo;
-  error?: string;
-  /** New: What this test specifically proves */
-  proves?: string;
-  /** New: Path to the test file */
-  file?: string;
-  /** Whether this result comes from history.sqlite instead of current run */
-  isHistorical?: boolean;
-  /** Timing per individual benchmark script */
-  scriptTimings?: Record<string, number>;
-  /** List of performance budget violations for this DB */
-  budgetViolations?: string[];
-  /** Extra metadata for diagnostics */
-  extra?: Record<string, any>;
-}
+// ── Benchmark Scripts ─────────────────────────────────────────────────────────────
 
-/** Host machine information captured during benchmark */
-export interface HostInfo {
-  cpu: string;
-  cores: number;
-  ram: string;
-  os: string;
-  arch: string;
-  runtime: string;
-}
-
-/** Benchmark tags for filtering and heatmap analysis */
-export type BenchmarkTag =
-  | "realtime"
-  | "network"
-  | "cpu"
-  | "memory"
-  | "disk"
-  | "security"
-  | "compliance"
-  | "dx";
-
-/** Definition of a single benchmark script */
 export interface BenchmarkScript {
   path: string;
   label: string;
   shortLabel: string;
-  level: number;
+  level: string | number;
   section: string;
-  desc: string;
-  intensity: "low" | "medium" | "high";
+  intensity: string;
   estimatedMs: number;
-  /** Optional per-script timeout override */
   timeoutMs?: number;
-  /** Timestamp of the last successful run */
-  lastRun?: string;
-  /** Execution strategy: run on all dbs, only SQL dbs, or once as baseline */
+  desc: string;
   strategy: "all" | "sql" | "once";
-  /** Optional performance baseline for anomaly detection */
-  expectedDurationMs?: number;
-  /** 🚀 NEW: Required DB capabilities (replaces brittle strategy:string matching) */
-  requiredCapabilities?: DatabaseCapability[];
-  /** 🚀 NEW: Tags for selective execution and heatmap reporting */
-  tags?: BenchmarkTag[];
-  /** 🚀 NEW: Dependencies on other benchmarks (by shortLabel) */
-  dependsOn?: string[];
-  /** 🚀 NEW: Metric category for correlation engine grouping */
-  metricCategory?: MetricCategory;
-  /** 🚀 NEW: Benchmarks this one correlates with (by shortLabel) */
+  tags: string[];
+  metricCategory: string;
+  requiredCapabilities?: string[];
   correlatedWith?: string[];
-  /** 🚀 NEW: Benchmarks this one should NOT correlate with */
   antiCorrelatedWith?: string[];
-  /** 🚀 NEW: Source files affected by this test (for differential execution) */
   codePaths?: string[];
 }
 
-/** Precomputed display row for zero-allocation rendering */
-export interface PrecomputedScriptDisplay {
-  shortLabel: string;
-  label: string;
-  path: string;
-  level: number;
-  intensity: "low" | "medium" | "high";
-  estimatedMs: number;
-  section: string;
-  /** Pre-formatted for terminal output */
-  line: string;
-}
+// ── Runtime Results ───────────────────────────────────────────────────────────────
 
-/** Parsed CLI configuration */
-export interface RunConfig {
-  parallelMode: "off" | "safe" | "full";
-  skipBuild: boolean;
-  dbFilter: string[] | null;
-  sectionFilter: string[] | null;
-  levelFilter: number | null;
-  onlyFilter: string[] | null;
-  fileFilter: string | null;
-  skipRedis: boolean;
-  retryCount: number;
-  timeoutMs: number;
-  warmup: boolean;
-  ci: boolean;
-  failFast: boolean;
-  forceClean: boolean;
-  list: boolean;
-  /** 🚀 Only run tests affected by recent code changes */
-  differential: boolean;
-  /** Files changed (populated by --differential) */
-  changedFiles: string[];
-}
-
-/** Outcome of running a single benchmark script (with retries) */
-export interface ScriptOutcome {
-  passed: boolean;
-  attempts: number;
-  elapsedMs: number;
-  error?: string;
-}
-
-/** Structured numeric metric exported by individual benchmarks */
-export interface NumericMetric {
-  _type: "numeric-metric";
-  name: string;
-  value: number;
-  unit?: string;
-  timestamp?: string;
-  /** Optional extra context (e.g. breakdown per hook) */
-  breakdown?: Array<{
-    hook: string;
-    avgMs: number;
-    p95Ms: number;
-    rps?: number;
-  }>;
+/** Environment info captured at benchmark time */
+export interface BenchmarkHostInfo {
+  runtime?: string;
+  os?: string;
+  cpu?: string;
+  memoryGB?: number;
+  bunVersion?: string;
+  nodeVersion?: string;
   [key: string]: unknown;
 }
 
-/** Union type for all possible metric shapes */
-export type BenchmarkMetric = Record<string, unknown> | NumericMetric;
+export interface BenchmarkResult {
+  db: string;
+  status: "SUCCESS" | "FAILED" | "PENDING";
+  coldStartMs?: number;
+  metrics?: Record<string, any>;
+  budgetViolations?: string[];
+  hostInfo?: BenchmarkHostInfo;
+  scriptTimings?: Record<string, number>;
+  error?: string;
+  scriptPath?: string;
+}
 
-// ─────────────────────────────────────────────────────────────
-// Trend Intelligence Types (Smart Per-Adapter Analysis)
-// ─────────────────────────────────────────────────────────────
+export interface RunConfig {
+  databases?: string[];
+  scripts?: string[];
+  iterations?: number;
+  concurrency?: number;
+}
 
-/** Direction of a metric trend over historical runs */
-export type TrendDirection = "improving" | "stable" | "degrading" | "critical";
+// ── Statistical Analysis ──────────────────────────────────────────────────────────
 
-/** Model used for forecasting (linear for latency, exponential for memory) */
-export type ForecastModel = "linear" | "exponential";
+/** Trend direction classification */
+export type TrendDirection = "stable" | "improving" | "degrading" | "critical" | "flapping";
 
-/** What kind of alert is this */
-export type AlertKind =
-  | "regression" // metric statistically degraded
-  | "harness_fail" // benchmark harness itself failed
-  | "zero_result" // metric returned 0 when it shouldn't (harness problem)
-  | "budget_exceeded" // metric exceeded hard budget
-  | "spike" // single-run outlier, not a sustained regression
-  | "warming"; // baseline still building after reset
-
-/** Severity levels for alerts */
-export type AlertSeverity = "info" | "warn" | "critical";
-
-/** Category for grouping metrics in correlation analysis */
-export type MetricCategory =
-  | "latency"
-  | "throughput"
-  | "js_memory" // V8 heap (GC-managed)
-  | "native_memory" // RSS, external (sharp, argon2)
-  | "startup"
-  | "scale";
-
-/** Root cause classification for a regression */
-export type RegressionRootCause =
-  | "adapter" // DB raw slowed, downstream affected
-  | "middleware" // Hooks slowed, REST affected, DB raw OK
-  | "scale" // Only appears under high load (index pressure, mixed)
-  | "native" // RSS growing, JS heap stable → native allocator leak
-  | "environment_cpu" // All latency metrics shifted, memory stable
-  | "environment_memory" // RSS and heap shifted, latency stable
-  | "unknown";
-
-/** Per-adapter, per-metric trend snapshot with statistical detail */
+/** Per-metric statistical trend analysis result (Pass 1 of regression detection) */
 export interface MetricTrend {
   adapter: string;
   metric: string;
-  category: MetricCategory;
+  category: "latency" | "native_memory" | "throughput";
   current: number;
-  baseline: number; // weighted historical average
-  stddev: number; // historical variance
-  slope: number; // linear regression slope (ms per run)
-  r2: number; // regression fit quality
-  sampleSize: number; // number of historical runs used
+  baseline: number;
+  stddev: number;
+  slope: number;
+  r2: number;
+  sampleSize: number;
   direction: TrendDirection;
-  confidence: number; // 0-1 how confident in the trend
-  forecastModel: ForecastModel; // which model to use for forecasting
-  forecastRunsToBreach: number | null; // runs until budget exceeded
-}
-
-/** Correlation rule for root cause detection */
-export interface CorrelationRule {
-  name: RegressionRootCause;
-  primaryMetric: string;
-  correlatedMetrics: string[];
-  antiCorrelatedMetrics: string[]; // must NOT be affected for this root cause
-}
-
-/** A smart alert with context, correlation evidence, and recommendation */
-export interface SmartAlert {
-  kind: AlertKind;
-  severity: AlertSeverity;
-  adapter: string;
-  metrics: string[];
-  rootCause: RegressionRootCause;
-  correlationEvidence: string;
-  recommendation: string;
   confidence: number;
-  timestamp: string;
+  forecastModel: "linear" | "exponential";
+  forecastRunsToBreach: number | null;
+  historyValues?: number[];
+  runDirections?: number[];
 }
 
-/** Per-adapter performance budget overrides (learned or set) */
-export interface AdapterBudget {
-  coldStartMs?: number;
-  collections?: number;
-  graphqlAvg?: number;
-  dbRaw?: number;
-  hooks?: number;
-  memGrowth?: number;
-  securityMs?: number;
-  openapiHit?: number;
-  indexPressure?: number;
-  buildDuration?: number;
+/** Detected flapping metric — alternates pass/fail across runs */
+export interface FlappingAlert {
+  adapter: string;
+  metric: string;
+  label: string;
+  flipCount: number;
+  sampleSize: number;
+  reason: string;
+  severity: "warn";
+}
+
+/** Significant performance improvement (negative percentage change) */
+export interface ImprovementNote {
+  adapter: string;
+  metric: string;
+  label: string;
+  current: number;
+  previousAvg: number;
+  changePct: number;
+  direction: string;
+  confidence: number;
+}
+
+/** Cross-DB correlation — same metric degrading across multiple adapters */
+export interface CrossCuttingRegression {
+  metric: string;
+  affectedAdapters: string[];
+  avgChangePct: number;
+  severity: "warn" | "critical";
+  reason: string;
+}
+
+/** Budget breach forecast based on linear regression slope */
+export interface BudgetForecast {
+  adapter: string;
+  metric: string;
+  label: string;
+  current: number;
+  budget: number;
+  slope: number;
+  estimatedRunsUntilBreach: number;
+  projectedBreachValue: number;
+}
+
+// ── Regression Detection Results ──────────────────────────────────────────────────
+
+/** Single regression finding (degradation, improvement, flapping, or budget violation) */
+export interface RegressionResult {
+  db: string;
+  metric: string;
+  current: number;
+  previousAvg: number;
+  changePct: number;
+  isRegression: boolean;
+  reason: string;
+  slope?: number;
+  direction?: string;
+  confidence?: number;
+  rootCause?: string;
+  severity?: "info" | "warn" | "critical";
+  forecastRuns?: number | null;
+  /** True if this metric alternates pass/fail across runs (non-deterministic) */
+  isFlapping?: boolean;
+  /** True if this is a significant improvement (not a regression) */
+  isImprovement?: boolean;
+}
+
+/** Consolidated regression report with full cross-DB intelligence */
+export interface EnhancedRegressionReport {
+  regressions: RegressionResult[];
+  improvements: RegressionResult[];
+  flappingAlerts: RegressionResult[];
+  crossCutting: CrossCuttingRegression[];
+  budgetForecasts: BudgetForecast[];
+}
+
+/**
+ * Return type for detectRegressions().
+ * Callers get both the flat regression list (backward compat) and the structured report.
+ */
+export interface DetectRegressionsResult {
+  regressions: RegressionResult[];
+  report: EnhancedRegressionReport;
 }

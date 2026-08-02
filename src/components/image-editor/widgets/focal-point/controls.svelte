@@ -1,12 +1,10 @@
 <!--
-@file src/components/image-editor/toolbars/FocalPointControls.svelte
+@file src/components/image-editor/widgets/focal-point/controls.svelte
 @component
-Toolbar controls for the FocalPoint widget
+Pintura-style focal point bottom dock controls.
 -->
 
 <script lang="ts">
-	import Button from '@components/ui/button.svelte';
-
 	interface Props {
 		focalX?: number;
 		focalY?: number;
@@ -29,79 +27,50 @@ Toolbar controls for the FocalPoint widget
 	}
 </script>
 
-<div class="flex flex-wrap items-center gap-4 py-1">
-	<!-- Focal Point Coordinates -->
-	<div class="flex items-center gap-4 rounded border border-white/10 bg-white/5 p-2 px-3 backdrop-blur-md">
-		<div class="flex items-center gap-2">
-			<iconify-icon icon="mdi:target" width="18" class="text-tertiary-500 dark:text-primary-500"></iconify-icon>
-			<span class="text-xs font-semibold uppercase tracking-wider text-white/70">Focal Point</span>
+<div class="flex flex-col flex-[0_0_auto] gap-1 items-stretch w-full min-w-0 h-auto leading-none" role="toolbar" aria-label="Focal point controls">
+	<div class="flex gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none flex-nowrap overflow-x-auto overflow-y-hidden pb-0 scrollbar-thin [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full">
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full">
+			<span class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium whitespace-nowrap cursor-default rounded-full text-white bg-white/10 border-white/14" aria-hidden="true">
+				<iconify-icon icon="mdi:target" width="15"></iconify-icon>
+				<span>Focal point</span>
+			</span>
 		</div>
-		
-		<div class="h-4 w-px bg-white/10"></div>
 
-		<div class="flex gap-3">
-			<div class="flex items-center gap-2">
-				<span class="text-[10px] font-bold text-white/40">X</span>
-				<input
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full">
+			<label class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-default bg-transparent border border-transparent rounded-full" for="focal-x">
+				<span>X</span>
+				<input aria-label="Focal X"
 					type="number"
 					id="focal-x"
 					min="0"
 					max="100"
 					value={focalX}
 					oninput={(e) => updateField('x', (e.currentTarget as HTMLInputElement).value)}
-					class="w-12 rounded border-none bg-black/40 p-1 text-center text-xs font-mono font-medium text-white ring-1 ring-white/10 transition-all hover:bg-black/60 focus:bg-black/80 focus:ring-primary-500/50 focus:outline-hidden"
-					aria-label="Focal X percentage"
+					class="h-7 px-2 text-[11px] font-medium text-white bg-white/6 border border-white/10 rounded-md outline-none focus:border-white/25 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:m-0 [&::-webkit-inner-spin-button]:m-0 [[type=number]]:[-moz-appearance:textfield] [[type=number]]:[appearance:textfield] w-10 text-center"
 				/>
-			</div>
-			<div class="flex items-center gap-2">
-				<span class="text-[10px] font-bold text-white/40">Y</span>
-				<input
+			</label>
+			<label class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-default bg-transparent border border-transparent rounded-full" for="focal-y">
+				<span>Y</span>
+				<input aria-label="Focal Y"
 					type="number"
 					id="focal-y"
 					min="0"
 					max="100"
 					value={focalY}
 					oninput={(e) => updateField('y', (e.currentTarget as HTMLInputElement).value)}
-					class="w-12 rounded border-none bg-black/40 p-1 text-center text-xs font-mono font-medium text-white ring-1 ring-white/10 transition-all hover:bg-black/60 focus:bg-black/80 focus:ring-primary-500/50 focus:outline-hidden"
-					aria-label="Focal Y percentage"
+					class="h-7 px-2 text-[11px] font-medium text-white bg-white/6 border border-white/10 rounded-md outline-none focus:border-white/25 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:m-0 [&::-webkit-inner-spin-button]:m-0 [[type=number]]:[-moz-appearance:textfield] [[type=number]]:[appearance:textfield] w-10 text-center"
 				/>
-			</div>
+			</label>
 		</div>
+
+		<span class="text-[10px] italic text-[rgba(255,255,255,0.4)] whitespace-nowrap gap-[0.35rem] items-center hidden sm:inline-flex">
+			<iconify-icon icon="mdi:mouse-left-click-outline" width="14" aria-hidden="true"></iconify-icon>
+			Click image to set focus
+		</span>
+
+		<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/9 hover:not-disabled:border-white/12 disabled:cursor-not-allowed disabled:opacity-35" onclick={onReset} title="Reset to center (50%, 50%)" aria-label="Reset focal point">
+			<iconify-icon icon="mdi:restore" width="15" aria-hidden="true"></iconify-icon>
+			<span>Reset</span>
+		</button>
 	</div>
-
-	<!-- Instructions -->
-	<div class="flex items-center gap-2 text-xs text-white/50 italic">
-		<iconify-icon icon="mdi:mouse-left-click-outline" width="16"></iconify-icon>
-		<span>Click on the image to position the focus area</span>
-	</div>
-
-	<!-- Spacer -->
-	<div class="grow"></div>
-
-	<!-- Actions: Reset -->
-	<Button
-		variant="outline"
-		size="sm"
-		onclick={onReset}
-		class="rounded-full border-white/10 bg-white/5 px-4 py-1.5 text-xs font-medium text-white/80 hover:border-primary-400/30 hover:bg-primary-500/10 hover:text-white active:scale-95 group"
-		title="Reset to center (50%, 50%)"
-		aria-label="Reset focal point"
-	>
-		<iconify-icon icon="mdi:restore" width="18" class="transition-transform group-hover:rotate-180"></iconify-icon>
-		<span>Reset</span>
-	</Button>
 </div>
-
-<style>
-	/* Hide spin buttons for numeric inputs */
-	input::-webkit-outer-spin-button,
-	input::-webkit-inner-spin-button {
-		-webkit-appearance: none;
-		appearance: none;
-		margin: 0;
-	}
-	input[type='number'] {
-		-moz-appearance: textfield;
-		appearance: textfield;
-	}
-</style>

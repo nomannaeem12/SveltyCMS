@@ -1,32 +1,32 @@
 <!--
 @file: src/components/image-editor/widgets/blur/controls.svelte
 @component
-Minimal blur controls focused on drag-resize rectangular regions.
+Pintura-style blur bottom dock — glass pills, aligned slider, no solid CMS buttons.
 -->
 <script lang="ts">
-	import Badge from '@components/ui/badge.svelte';
-	import Button from '@components/ui/button.svelte';
 	let {
-		blurStrength,
-		hasActiveRegion = false,
-		regionCount = 0,
-		onStrengthChange,
-		onAddRegion,
-		onDeleteRegion,
-		onReset,
-		onCancel,
-		onApply
-	}: {
-		blurStrength: number;
-		hasActiveRegion?: boolean;
-		regionCount?: number;
-		onStrengthChange: (value: number) => void;
-		onAddRegion: () => void;
-		onDeleteRegion: () => void;
-		onReset: () => void;
-		onCancel: () => void;
-		onApply: () => void;
-	} = $props();
+			blurStrength,
+			hasActiveRegion = false,
+			regionCount = 0,
+			onStrengthChange,
+			onAddRegion,
+			onDeleteRegion,
+			onReset,
+			onCancel,
+			onApply
+		}: {
+			blurStrength: number;
+			hasActiveRegion?: boolean;
+			regionCount?: number;
+			onStrengthChange: (value: number) => void;
+			onAddRegion: () => void;
+			onDeleteRegion: () => void;
+			onReset: () => void;
+			onCancel: () => void;
+			onApply: () => void;
+		} = $props();
+
+	const sliderProgress = $derived(Math.max(0, Math.min(1, (blurStrength - 5) / 95)));
 
 	function handleStrengthInput(e: Event) {
 		const target = e.currentTarget as HTMLInputElement;
@@ -47,136 +47,72 @@ Minimal blur controls focused on drag-resize rectangular regions.
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<div class="blur-controls" role="toolbar" aria-label="Blur controls">
-	<div class="control-group">
-		<Button variant="tertiary" type="button" onclick={onAddRegion} title="Add blur region" size="sm">
-			<iconify-icon icon="mdi:plus" width="18"></iconify-icon>
-			<span>Add Region</span>
-		</Button>
-		{#if regionCount > 0}
-			<Badge variant="surface">
-				{regionCount}
-				{regionCount === 1 ? 'region' : 'regions'}
-			</Badge>
-		{/if}
-	</div>
-
-	<div class="control-group flex-1">
-		<label class="control-label" for="blur-strength-slider">Blur strength</label>
-		<div class="slider-shell">
-			<input
-				id="blur-strength-slider"
-				type="range"
-				min="5"
-				max="100"
-				step="1"
-				value={blurStrength}
-				oninput={handleStrengthInput}
-				class="slider"
-				aria-label="Blur strength"
-			/>
-			<span class="slider-value">{blurStrength}</span>
+<div class="flex flex-col flex-[0_0_auto] gap-1 items-stretch w-full min-w-0 h-auto leading-none" role="toolbar" aria-label="Blur controls">
+	<div class="flex flex-wrap gap-1.5 items-center justify-center w-full min-w-0 min-h-0 leading-none flex-nowrap overflow-x-auto overflow-y-hidden pb-0 [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.2)_transparent] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:bg-white/20 [&::-webkit-scrollbar-thumb]:rounded-full gap-2 items-center justify-center w-full px-0.5 max-lg:justify-start" role="group" aria-label="Blur regions">
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full">
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35" onclick={onAddRegion} title="Add blur region" aria-label="Add blur region">
+				<iconify-icon icon="mdi:plus" width="15" aria-hidden="true"></iconify-icon>
+				<span>Add region</span>
+			</button>
 		</div>
-	</div>
 
-	<div class="control-group ml-auto">
-		<Button variant="outline" type="button" onclick={onReset} size="sm">
-			<iconify-icon icon="mdi:restore" width="18"></iconify-icon>
-			<span>Reset</span>
-		</Button>
-		<Button variant="error" type="button" onclick={onDeleteRegion} disabled={!hasActiveRegion} size="sm">
-			<iconify-icon icon="mdi:delete" width="18"></iconify-icon>
-			<span>Delete</span>
-		</Button>
-		<Button variant="error" type="button" onclick={onCancel} size="sm">
-			<iconify-icon icon="mdi:close" width="18"></iconify-icon>
-			<span>Cancel</span>
-		</Button>
-		<Button variant="success" type="button" onclick={onApply} size="sm">
-			<iconify-icon icon="mdi:check" width="18"></iconify-icon>
+		{#if regionCount > 0}
+			<span class="text-[9px] font-semibold text-[rgba(255,255,255,0.45)]" aria-live="polite">
+				{regionCount} {regionCount === 1 ? 'region' : 'regions'}
+			</span>
+		{/if}
+
+		<div class="flex flex-[1_1_7rem] items-center justify-center min-w-24 max-w-56 mx-0.5 max-lg:basis-full max-lg:order-3 max-lg:max-w-none max-lg:mx-0">
+			<div class="w-full">
+				<input aria-label="Blur amount"
+					id="blur-strength-slider"
+					type="range"
+					min="5"
+					max="100"
+					step="1"
+					value={blurStrength}
+					oninput={handleStrengthInput}
+					class="flex-1 h-1 m-0 appearance-none cursor-pointer rounded-full [&::-webkit-slider-thumb]:size-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:bg-[--editor-accent-hover,var(--color-warning-400,#ffd43b)] [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:[box-shadow:0_0_0_1px_rgba(0,0,0,0.2)] [&::-moz-range-thumb]:size-3.5 [&::-moz-range-thumb]:cursor-pointer [&::-moz-range-thumb]:bg-[--editor-accent-hover,var(--color-warning-400,#ffd43b)] [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-[rgba(0,0,0,0.15)] [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:[box-shadow:0_0_0_1px_rgba(0,0,0,0.2)]"
+					style:background="linear-gradient(to right, var(--editor-accent, #f5c518) 0%, var(--editor-accent, #f5c518) {sliderProgress * 100}%, rgba(255, 255, 255, 0.16) {sliderProgress * 100}%, rgba(255, 255, 255, 0.16) 100%)"
+					aria-valuemin={5}
+					aria-valuemax={100}
+					aria-valuenow={blurStrength}
+				/>
+			</div>
+		</div>
+
+		<div class="inline-flex flex-[0_0_auto] gap-0.5 items-center h-auto min-h-0 p-0.5 bg-[--editor-chrome-elevated] border border-[--editor-chrome-border] rounded-full shrink-0" role="group" aria-label="Blur actions">
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35"
+				onclick={onReset}
+				disabled={regionCount === 0}
+				title="Reset all regions"
+				aria-label="Reset all blur regions"
+			>
+				<iconify-icon icon="mdi:restore" width="15" aria-hidden="true"></iconify-icon>
+				<span>Reset</span>
+			</button>
+			<button
+				type="button"
+				class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] hover:not-disabled:text-[#fecaca] hover:not-disabled:bg-[rgba(239,68,68,0.12)] hover:not-disabled:border-[rgba(239,68,68,0.22)] disabled:cursor-not-allowed disabled:opacity-35"
+				onclick={onDeleteRegion}
+				disabled={!hasActiveRegion}
+				title="Delete selected region"
+				aria-label="Delete selected blur region"
+			>
+				<iconify-icon icon="mdi:delete-outline" width="15" aria-hidden="true"></iconify-icon>
+				<span>Delete</span>
+			</button>
+			<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium text-[--editor-chrome-text] whitespace-nowrap cursor-pointer bg-transparent border border-transparent rounded-full transition-[background,color,border-color] duration-150 hover:not-disabled:text-[rgba(255,255,255,0.9)] hover:not-disabled:bg-white/[0.09] hover:not-disabled:border-white/[0.12] disabled:cursor-not-allowed disabled:opacity-35" onclick={onCancel} title="Cancel blur" aria-label="Cancel blur">
+				<iconify-icon icon="mdi:close" width="15" aria-hidden="true"></iconify-icon>
+				<span>Cancel</span>
+			</button>
+		</div>
+
+		<button type="button" class="inline-flex flex-[0_0_auto] gap-1.5 items-center h-7 px-2.5 text-[11px] font-medium whitespace-nowrap cursor-pointer rounded-full transition-[background,color,border-color] duration-150 disabled:cursor-not-allowed disabled:opacity-35 text-[rgba(255,255,255,0.92)] bg-white/8 border-white/[0.14] hover:not-disabled:text-[#141414] hover:not-disabled:bg-[--editor-accent] hover:not-disabled:border-transparent shrink-0" onclick={onApply} title="Apply blur" aria-label="Apply blur">
+			<iconify-icon icon="mdi:check" width="15" aria-hidden="true"></iconify-icon>
 			<span>Apply</span>
-		</Button>
+		</button>
 	</div>
 </div>
-
-<style>
-	.blur-controls {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.75rem;
-		align-items: center;
-		width: 100%;
-		padding: 0.75rem;
-		background: rgb(var(--color-surface-100) / 0.94);
-		border-top: 1px solid rgb(var(--color-surface-200) / 1);
-	}
-
-	:global(.dark) .blur-controls {
-		background: rgb(var(--color-surface-800) / 0.96);
-		border-color: rgb(var(--color-surface-700) / 1);
-	}
-
-	.control-group {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		flex-wrap: wrap;
-	}
-
-	.control-label {
-		font-size: 0.875rem;
-		font-weight: 500;
-		white-space: nowrap;
-		color: rgb(var(--color-surface-700) / 1);
-	}
-
-	:global(.dark) .control-label {
-		color: rgb(var(--color-surface-200) / 1);
-	}
-
-	.slider-shell {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		flex: 1;
-		min-width: min(24rem, 100%);
-		padding: 0.45rem 0.75rem;
-		border: 1px solid rgb(var(--color-surface-300) / 1);
-		border-radius: 9999px;
-		background: rgb(var(--color-surface-50) / 0.6);
-	}
-
-	:global(.dark) .slider-shell {
-		background: rgb(var(--color-surface-900) / 0.48);
-		border-color: rgb(var(--color-surface-700) / 1);
-	}
-
-	.slider {
-		flex: 1;
-		margin: 0;
-		accent-color: rgb(var(--color-primary-500) / 1);
-	}
-
-	.slider-value {
-		min-width: 2.5rem;
-		font-family: monospace;
-		font-size: 0.75rem;
-		font-weight: 600;
-		text-align: right;
-		color: rgb(var(--color-primary-500) / 1);
-	}
-
-	@media (max-width: 1024px) {
-		.blur-controls {
-			padding: 0.5rem;
-		}
-
-		.control-group {
-			gap: 0.35rem;
-		}
-
-		.slider-shell {
-			min-width: 100%;
-		}
-	}
-</style>

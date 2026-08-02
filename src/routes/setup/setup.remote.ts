@@ -66,8 +66,9 @@ export const completeSetup = command(
     if (result.success && result.sessionCookie) {
       try {
         const event = getRequestEvent();
-        const { getSessionCookieName } = await import("@src/databases/auth/constants");
-        const isSecure = event.url.protocol === "https:" || event.url.hostname !== "localhost";
+        const { getSessionCookieName, isSecureCookieContext } =
+          await import("@src/databases/auth/constants");
+        const isSecure = isSecureCookieContext(event.url.protocol, event.url.hostname);
         const cookieName = getSessionCookieName(isSecure);
         event.cookies.set(cookieName, result.sessionCookie.value, {
           ...result.sessionCookie.attributes,
@@ -75,7 +76,7 @@ export const completeSetup = command(
           path: "/",
         } as any);
         // Also invalidate setup cache immediately so handleSystemState allows requests
-        const { invalidateSetupCache } = await import("@src/utils/setup-check");
+        const { invalidateSetupCache } = await import("@src/utils/server/setup-check");
         invalidateSetupCache(false, true);
       } catch (err) {
         const { logger } = await import("@src/utils/logger");

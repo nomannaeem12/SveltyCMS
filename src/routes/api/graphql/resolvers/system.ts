@@ -11,6 +11,7 @@ interface GraphQLContext {
   locale?: string;
   tenantId?: string | null;
   user?: User;
+  cms?: any;
 }
 
 export const systemTypeDefs = `
@@ -96,12 +97,18 @@ export const systemTypeDefs = `
 		warnings: [String!]!
 	}
 
+	type AnyEntry {
+		_id: String!
+		title: String
+	}
+
 	extend type Query {
 		collectionStats(collectionId: String!): CollectionStats
-		allCollectionStats: [CollectionStats!]!
-		navigationStructure(options: NavigationOptions): [NavigationNode!]!
-		nodeChildren(nodeId: String!): [NavigationNode!]!
-		breadcrumb(path: String!): [BreadcrumbItem!]!
+		allCollectionStats: [CollectionStats!]
+		entries(collection: String!, limit: Int!): [AnyEntry!]
+		navigationStructure(options: NavigationOptions): [NavigationNode!]
+		nodeChildren(nodeId: String!): [NavigationNode!]
+		breadcrumb(path: String!): [BreadcrumbItem!]
 		contentSystemHealth: contentSystemHealth
 		contentSystemDiagnostics: contentSystemDiagnostics
 		contentSystemMetrics: contentSystemMetrics
@@ -157,6 +164,39 @@ export const systemResolvers = {
           tenantId: context.tenantId,
         });
         throw new Error("Failed to fetch all collection stats");
+      }
+    },
+
+    entries: async (
+      _: unknown,
+      args: { collection: string; limit: number },
+      context: GraphQLContext,
+    ) => {
+      if (!context.user) {
+        throw new Error("Authentication required");
+      }
+      try {
+        const cms = context.cms;
+        if (!cms) {
+          throw new Error("CMS instance not available in context");
+        }
+        const result = await cms.collections.find(args.collection, {
+          tenantId: context.tenantId,
+          limit: args.limit,
+        });
+        if (!result.success) {
+          throw new Error(
+            `Failed to query collection "${args.collection}": ${result.error?.message || "Unknown error"}`,
+          );
+        }
+        return (result.data || []).map((entry: any) => ({
+          _id: entry._id,
+          title: entry.title || entry.name || null,
+        }));
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : "Unknown error";
+        logger.error(`Error fetching entries for ${args.collection}: ${msg}`);
+        throw new Error(`Failed to fetch entries: ${msg}`);
       }
     },
 
@@ -260,7 +300,7 @@ export const systemResolvers = {
       }
       try {
         await contentSystem.refresh();
-        return { success: true, message: "Structure reconciled successfully." };
+        return { valid: true, errors: [], warnings: [] };
       } catch (error) {
         logger.error("Error in validateContentStructure:", { error });
         throw new Error("Failed to validate structure");

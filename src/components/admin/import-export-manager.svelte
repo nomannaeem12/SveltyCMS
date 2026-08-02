@@ -17,10 +17,13 @@
 	import Progress from '@components/ui/progress.svelte';
 	import Input from '@components/ui/input.svelte';
 	import Toggle from '@components/ui/toggle.svelte';
+	import Select from '@components/ui/select.svelte';
+	import Checkbox from '@components/ui/checkbox.svelte';
 	import type { Schema } from '@src/content/types';
 	// Utils
 	import { getCollections } from '@utils/api';
 	import { logger } from '@utils/logger';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	// Native UI Components
 	import { toast } from '@src/stores/toast.svelte.ts';
 
@@ -246,9 +249,7 @@
 			// Import data
 			const response = await fetch('/api/importData', {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json'
-				},
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({
 					collections: importData,
 					options: importOptions
@@ -436,17 +437,13 @@
 			</div>
 			<div class="max-h-[calc(80vh-140px)] space-y-6 overflow-y-auto p-6">
 				<div>
-					<label for="export-format" class="mb-2 block text-sm font-medium">Export Format</label>
-					<select id="export-format" class="select" bind:value={exportOptions.format}>
-						<option value="json">JSON</option>
-						<option value="csv">CSV</option>
-					</select>
+					<Select id="export-format" bind:value={exportOptions.format} label="Export Format" options={[{value: 'json', label: 'JSON'}, {value: 'csv', label: 'CSV'}]} />
 				</div>
 
 				<div>
 					<div class="mb-3 flex items-center justify-between">
 						<p class="block text-sm font-medium">Select Collections</p>
-						<div class="space-x-2">
+						<div class="flex gap-2">
 							<Button variant="outline" onclick={selectAllCollections} aria-label="Select all collections">Select All</Button>
 							<Button variant="outline" onclick={clearCollectionSelection} aria-label="Clear collection selection">Clear All</Button>
 						</div>
@@ -454,9 +451,8 @@
 
 					<div class="max-h-48 overflow-y-auto rounded border border-gray-200 p-3 dark:border-gray-700">
 						{#each collections as collection (collection.id)}
-							{const inputId = `export-collection-${collection.id}`}
-							<label for={inputId} class="flex cursor-pointer items-center space-x-3 py-2">
-								<input id={inputId} type="checkbox" checked={exportOptions.collections.includes(String(collection.id))} onchange={() => toggleCollectionSelection(String(collection.id))} class="rounded" />
+							<label class="flex cursor-pointer items-center gap-3 py-2">
+								<Checkbox checked={exportOptions.collections.includes(String(collection.id))} onchange={() => toggleCollectionSelection(String(collection.id))} />
 
 								<div class="font-medium">
 									{collection.label}
@@ -479,7 +475,7 @@
 				</div>
 			</div>
 
-			<div class="flex justify-end space-x-3 border-t bg-surface-100 p-6 dark:bg-surface-700">
+			<div class="flex justify-end gap-3 border-t bg-surface-100 p-6 dark:bg-surface-700">
 				<Button variant="outline" onclick={() => (showExportModal = false)} aria-label="Cancel export">Cancel</Button>
 				<Button variant="tertiary" aria-label="Export selected collections"
 					onclick={exportSelectedCollections}
@@ -514,11 +510,7 @@
 				</div>
 
 				<div>
-					<label for="import-format" class="mb-2 block text-sm font-medium">Data Format</label>
-					<select id="import-format" class="select" bind:value={importOptions.format}>
-						<option value="json">JSON</option>
-						<option value="csv">CSV</option>
-					</select>
+					<Select id="import-format" bind:value={importOptions.format} label="Data Format" options={[{value: 'json', label: 'JSON'}, {value: 'csv', label: 'CSV'}]} />
 				</div>
 
 				<div class="space-y-4">
@@ -532,7 +524,7 @@
 				</div>
 			</div>
 
-			<div class="flex justify-end space-x-3 border-t bg-surface-100 p-6 dark:bg-surface-700">
+			<div class="flex justify-end gap-3 border-t bg-surface-100 p-6 dark:bg-surface-700">
 				<Button variant="outline" onclick={() => (showImportModal = false)} aria-label="Cancel import">Cancel</Button>
 				<Button variant="tertiary" onclick={handleImport} disabled={loading || !importFiles} aria-label="Import data from file" class="dark:">Import Data</Button>
 			</div>
@@ -577,7 +569,7 @@
 								<div class="rounded border border-gray-200 p-3 dark:border-gray-700">
 									<div class="mb-2 flex items-center justify-between">
 										<h4 class="font-medium">{result.collection}</h4>
-										<div class="flex space-x-4 text-sm">
+										<div class="flex gap-4 text-sm">
 											<span class="text-tertiary-500 dark:text-primary-500">+{result.imported}</span>
 											<span class="text-waring-500">~{result.skipped}</span>
 											<span class="text-error-500">!{result.errors.length}</span>

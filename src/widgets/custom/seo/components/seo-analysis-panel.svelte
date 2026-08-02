@@ -7,11 +7,13 @@ Designed to be used in a dashboard layout (e.g. side-by-side with preview).
 -->
 
 <script lang="ts">
+import { logger } from "@utils/logger";
 	import Button from '@components/ui/button.svelte';
 	import { slide } from 'svelte/transition';
 	import SystemTooltip from '@src/components/system/system-tooltip.svelte';
 	import type { SeoAnalysisResult } from '../seo-types';
-	import { getReadingEaseDescription } from '@src/utils/seo/readability';
+	import { getReadingEaseDescription } from '@src/utils/readability';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	interface Props {
 		analysisResult: SeoAnalysisResult | null;
 		content?: string;
@@ -42,7 +44,7 @@ Designed to be used in a dashboard layout (e.g. side-by-side with preview).
 		try {
 			const response = await fetch('/api/seo/link-suggestions', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({ content, currentId, collectionId }),
 				signal: abortController.signal
 			});
@@ -53,9 +55,9 @@ Designed to be used in a dashboard layout (e.g. side-by-side with preview).
 			linkSuggestions = data.suggestions || [];
 		} catch (err: unknown) {
 			if ((err as any).name === 'AbortError') {
-				console.log('Fetch aborted');
+				logger.debug('Fetch aborted');
 			} else {
-				console.error('Failed to fetch link suggestions', err);
+				logger.error('Failed to fetch link suggestions', err);
 			}
 		} finally {
 			isFetchingLinks = false;
@@ -67,7 +69,7 @@ Designed to be used in a dashboard layout (e.g. side-by-side with preview).
 <div class="card pt-1 preset-tonal-surface flex flex-col overflow-hidden {className} transition-all duration-300 {expanded ? 'h-125' : 'h-16'}">
 	<button
 		type="button"
-		class="flex items-center gap-4 w-full p-3 bg-surface-100-800-token hover:bg-surface-200 dark:hover:bg-surface-700 transition-colors text-start"
+		class="flex items-center gap-4 w-full p-3 bg-white dark:bg-surface-900 hover:bg-surface-200 dark:hover:bg-surface-700 transition-colors text-start"
 		onclick={() => (expanded = !expanded)}
 		aria-label="Toggle SEO analysis"
 		aria-expanded={expanded}
@@ -203,13 +205,13 @@ Designed to be used in a dashboard layout (e.g. side-by-side with preview).
 
 					{#if linkSuggestions.length > 0}
 						<div class="space-y-2">
-							{#each linkSuggestions as link}
+							{#each linkSuggestions as link (link.url)}
 								<div class="card p-2 preset-soft-surface text-xs flex items-center justify-between gap-2 group">
 									<div class="truncate flex-1">
 										<div class="font-bold truncate">{link.title}</div>
 										<div class="opacity-50 text-[10px] truncate">{link.url}</div>
 									</div>
-									<Button variant="ghost" size="sm" class="p-1 opacity-0 group-hover:opacity-100 transition-opacity" title="Copy relative URL" onclick={() => { navigator.clipboard.writeText(link.url); }}>
+									<Button variant="ghost" size="sm" class="p-1 opacity-0 group-hover:opacity-100 transition-opacity" title="Copy relative URL" aria-label="Copy relative URL" onclick={() => { navigator.clipboard.writeText(link.url); }}>
 										<iconify-icon icon="mdi:content-copy" width="14"></iconify-icon>
 									</Button>
 								</div>
@@ -236,7 +238,7 @@ Designed to be used in a dashboard layout (e.g. side-by-side with preview).
 		background: transparent;
 	}
 	.custom-scrollbar::-webkit-scrollbar-thumb {
-		background-color: rgba(156, 163, 175, 0.5);
+		background-color: var(--color-surface-400, rgba(156, 163, 175, 0.5));
 		border-radius: 20px;
 	}
 </style>

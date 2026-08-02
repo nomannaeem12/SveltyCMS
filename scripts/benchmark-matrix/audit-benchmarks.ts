@@ -4,7 +4,14 @@
  */
 
 import { spawnSync } from "child_process";
-import chalk from "chalk";
+
+// Lightweight ANSI color helpers — no dependency needed for 4 colors
+const c = {
+  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
+  red: (s: string) => `\x1b[31m${s}\x1b[0m`,
+  gray: (s: string) => `\x1b[90m${s}\x1b[0m`,
+  boldBlue: (s: string) => `\x1b[1m\x1b[34m${s}\x1b[0m`,
+};
 
 const benchmarks = [
   "tests/benchmarks/admin-ux-vitality.test.ts",
@@ -39,29 +46,31 @@ const benchmarks = [
 const results: any[] = [];
 
 console.log(
-  chalk.bold.blue(
+  c.boldBlue(
     "\n🚀 SveltyCMS Systematic Benchmark Audit (Memory Leak & Seeding Fix Verification)\n",
   ),
 );
 
-for (const b of benchmarks) {
-  process.stdout.write(chalk.gray(`Running [${b}] ... `));
+const targetDbType = process.env.DB_TYPE ?? "sqlite";
+const baseEnv = Object.freeze({
+  ...process.env,
+  DB_TYPE: targetDbType,
+  SVELTY_BENCHMARK_SUITE: "true",
+  BENCHMARK_DEV: "true",
+  QUIET: "true",
+});
 
-  const start = Date.now();
+for (let i = 0; i < benchmarks.length; i++) {
+  const b = benchmarks[i]!;
+  process.stdout.write(c.gray(`Running [${b}] ... `));
+
+  const start = performance.now();
   const res = spawnSync("bun", ["test", b], {
     encoding: "utf-8",
-    shell: true,
-    env: {
-      ...process.env,
-      // 🚀 DATABASE-AGNOSTIC: Inherit DB_TYPE from environment (set by --db flag).
-      // Falls back to "sqlite" only if no DB_TYPE is set.
-      DB_TYPE: process.env.DB_TYPE ?? "sqlite",
-      SVELTY_BENCHMARK_SUITE: "true",
-      BENCHMARK_DEV: "true", // Run against source for latest fixes
-      QUIET: "true",
-    },
+    shell: false,
+    env: baseEnv as Record<string, string>,
   });
-  const duration = Date.now() - start;
+  const duration = performance.now() - start;
 
   const success = res.status === 0;
 
@@ -73,16 +82,16 @@ for (const b of benchmarks) {
   });
 
   if (success) {
-    console.log(chalk.green(`PASSED (${(duration / 1000).toFixed(1)}s)`));
+    console.log(c.green(`PASSED (${(duration / 1000).toFixed(1)}s)`));
   } else {
-    console.log(chalk.red("FAILED"));
+    console.log(c.red("FAILED"));
     const errorLines = (res.stderr || res.stdout).split("\n").slice(0, 10).join("\n");
-    console.log(chalk.red(errorLines));
-    console.log(chalk.gray("--------------------------------------------------"));
+    console.log(c.red(errorLines));
+    console.log(c.gray("--------------------------------------------------"));
   }
 }
 
-console.log(chalk.bold.blue("\n--- AUDIT SUMMARY ---\n"));
+console.log(c.boldBlue("\n--- AUDIT SUMMARY ---\n"));
 
 console.table(
   results.map((r) => ({
@@ -95,7 +104,7 @@ console.table(
 const passed = results.filter((r) => r.success).length;
 const total = results.length;
 console.log(
-  `\nResult: ${passed === total ? chalk.green("ALL PASSED") : chalk.red(`${total - passed} FAILED`)} (${passed}/${total})\n`,
+  `\nResult: ${passed === total ? c.green("ALL PASSED") : c.red(`${total - passed} FAILED`)} (${passed}/${total})\n`,
 );
 
 if (passed < total) process.exit(1);

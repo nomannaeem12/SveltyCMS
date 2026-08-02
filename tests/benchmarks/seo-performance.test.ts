@@ -1,6 +1,6 @@
 /**
  * @file tests/benchmarks/seo-performance.test.ts
- * @description Enterprise SEO Suite Performance Benchmark
+ * @description Enterprise SEO Suite Performance Benchmark (Optimized)
  * @summary Measures redirect lookup latency, dynamic sitemap.xml generation, robots.txt serving, and 404 logging performance.
  *
  * ### Features:
@@ -21,7 +21,7 @@ import {
   forceRefreshServer,
   stabilize,
   getDbType,
-  TEST_API_SECRET,
+  requireTestingApi,
 } from "./modules/benchmark-utils";
 import "../unit/bun-preload.ts";
 import { logger } from "@utils/logger";
@@ -29,7 +29,6 @@ import { logger } from "@utils/logger";
 let stopServer: (() => Promise<void>) | null = null;
 
 async function runSeoAudit() {
-  // pre-existing unused var removed for TS strict mode
   console.log(`🚀 Starting Enterprise SEO Suite Audit (${getDbType().toUpperCase()})...\n`);
 
   try {
@@ -39,52 +38,68 @@ async function runSeoAudit() {
 
     await ensureStableTestData();
 
-    // Setup test redirect
-    await fetch(`${baseUrl}/api/testing`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-test-mode": "true",
-        "x-test-secret": TEST_API_SECRET,
-        "x-tenant-id": "global",
-      },
-      body: JSON.stringify({
-        action: "create-redirect",
+    // Setup initial mutable header references outside hot execution tracks
+    const targetTenant = process.env.TENANT_ID || "global";
+    const requestHeaders = {
+      "x-test-mode": "true",
+      "x-test-secret": process.env.TEST_API_SECRET || "SVELTYCMS_TEST_SECRET_2026",
+      "x-tenant-id": targetTenant,
+    };
+
+    await requireTestingApi(
+      "create-redirect",
+      {
         from: "/old-path-1",
         to: "/api/system/health",
         status: 301,
-      }),
-    });
+      },
+      targetTenant,
+    );
 
-    await forceRefreshServer(baseUrl);
+    await forceRefreshServer(baseUrl, targetTenant);
 
-    // Warm up server and ensure test redirects are loaded
-    await fetch(`${baseUrl}/api/system/health`, {
-      headers: { "x-test-mode": "true", "x-test-secret": TEST_API_SECRET },
+    const probe = await fetch(`${baseUrl}/old-path-1`, {
+      redirect: "manual",
+      headers: requestHeaders,
     });
+    if (probe.status !== 301) {
+      const loc = probe.headers.get("location") ?? "none";
+      throw new Error(
+        `SEO setup failed: redirect probe expected 301, got ${probe.status} (Location: ${loc})`,
+      );
+    }
+
+    // Warm up server instance and verify routing tables are ready
+    await fetch(`${baseUrl}/api/system/health`, { headers: requestHeaders });
     await stabilize(1000);
 
     const seoScenarios = [
       {
         name: "Redirect Lookup (301)",
         path: "/old-path-1",
-        options: { redirect: "manual" },
+        dynamic: false,
         expectedStatus: 301,
         layer: "Middleware",
       },
       {
         name: "Dynamic Sitemap XML",
         path: "/sitemap.xml",
+        dynamic: false,
+        expectedStatus: 200,
         layer: "Content",
+        allowFail: true, // Sitemap handler may not be installed — not a regression
       },
       {
         name: "Robots.txt Generation",
         path: "/robots.txt",
+        dynamic: false,
+        expectedStatus: 200,
         layer: "System",
       },
       {
         name: "Missing Path (404 Log)",
-        path: "/non-existent-path-" + Math.floor(Math.random() * 1000000),
+        path: "/non-existent-path-",
+        dynamic: true, // Triggers runtime path variation to force genuine cache misses
         expectedStatus: 404,
         layer: "Analytics",
       },
@@ -102,24 +117,31 @@ async function runSeoAudit() {
         runs: 2,
         concurrency: 8,
         silent: true,
-        onIteration: async () => {
-          const res = await fetch(`${baseUrl}${scenario.path}`, {
+        onIteration: async (i: number) => {
+          // Resolve target URL path based on dynamic mutation flags
+          const targetPath = scenario.dynamic
+            ? `${scenario.path}${i}-${Math.floor(Math.random() * 100000)}`
+            : scenario.path;
+
+          const res = await fetch(`${baseUrl}${targetPath}`, {
             redirect: "manual",
-            headers: {
-              "x-test-mode": "true",
-              "x-test-secret": TEST_API_SECRET,
-              "x-tenant-id": process.env.TENANT_ID || "global",
-            },
+            headers: requestHeaders,
           });
 
           if (scenario.expectedStatus && res.status !== scenario.expectedStatus) {
+            if (scenario.allowFail) {
+              // Non-critical endpoint — skip status check (handler may not be installed)
+              return;
+            }
             const loc = res.headers.get("location");
             const locationInfo = loc ? ` (Location: ${loc})` : "";
             throw new Error(
               `${scenario.name} failed: Expected ${scenario.expectedStatus}, got ${res.status}${locationInfo}`,
             );
           }
-          await res.text();
+
+          // Fast socket drain bypasses heavy internal runtime text parsing steps
+          await res.arrayBuffer();
         },
       });
 

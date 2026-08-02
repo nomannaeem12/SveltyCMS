@@ -17,6 +17,7 @@ export const widgetMeta = {
 	import Badge from '@components/ui/badge.svelte';
 	import type { WidgetSize } from '@src/content/types';
 	import { toast } from '@src/stores/toast.svelte.ts';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	import BaseWidget from '../base-widget.svelte';
 
 	const {
@@ -104,7 +105,7 @@ export const widgetMeta = {
 
 			const res = await fetch('/api/system/reinitialize', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({ force: true })
 			});
 
@@ -177,7 +178,7 @@ export const widgetMeta = {
 						</div>
 
 						<div class="flex items-center gap-2 font-medium text-surface-600 dark:text-surface-300">
-							{#each Object.entries(healthData.components).slice(0, 3) as [name, service]}
+							{#each Object.entries(healthData.components).slice(0, 3) as [name, service] (name)}
 								<div class="flex items-center gap-1" title={`${formatServiceName(name)}: ${service.status}`}>
 									<span class="relative flex h-1.5 w-1.5">
 										<span class="relative inline-flex rounded-full h-1.5 w-1.5

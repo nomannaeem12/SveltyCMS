@@ -34,16 +34,19 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 -->
 
 <script lang="ts">
-	import Button from '@components/ui/button.svelte';
-	import Checkbox from '@components/ui/checkbox.svelte';
-	import Select from '@components/ui/select.svelte';
+	import AdminCard from '@components/admin-card.svelte';
+			import Button from '@components/ui/button.svelte';
+			import Checkbox from '@components/ui/checkbox.svelte';
+			import Input from '@components/ui/input.svelte';
+			import Select from '@components/ui/select.svelte';
 	import { mediagallery_nomedia } from '@src/paraglide/messages';
 	import { logger } from '@utils/logger';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	import type { MediaImage } from '@utils/media/media-models';
 	// Removed axios import
 	import { onDestroy, onMount } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
-	import { fade, scale } from 'svelte/transition';
+	import { fade } from 'svelte/transition';
 
 	type ThumbnailSize = 'sm' | 'md' | 'lg';
 	type ViewMode = 'grid' | 'list';
@@ -203,6 +206,57 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 		onselect(selected);
 	}
 
+	// Bulk delete selected files with controlled concurrency.
+	let isDeleting = $state(false);
+	let deleteProgress = $state(0);
+	const BULK_DELETE_CONCURRENCY = 4; // Parallel requests to avoid overwhelming the server
+
+	async function bulkDelete(): Promise<void> {
+		if (selectedCount === 0) return;
+		const confirmed = confirm(
+			`Delete ${selectedCount} file${selectedCount !== 1 ? 's' : ''}? This cannot be undone.`
+		);
+		if (!confirmed) return;
+
+		isDeleting = true;
+		deleteProgress = 0;
+		const toDelete = files.filter((f) => selectedFiles.has(f.filename));
+
+		// Process in chunks with controlled concurrency
+		for (let i = 0; i < toDelete.length; i += BULK_DELETE_CONCURRENCY) {
+			const chunk = toDelete.slice(i, i + BULK_DELETE_CONCURRENCY);
+			const results = await Promise.allSettled(
+				chunk.map(async (file) => {
+					const res = await fetch('/api/media/delete', {
+						method: 'POST',
+						headers: clientJsonHeaders(),
+						body: JSON.stringify({ id: file._id || file.filename }),
+					});
+					if (!res.ok) throw new Error(`HTTP ${res.status}`);
+					return file.filename;
+				})
+			);
+
+			for (const result of results) {
+				if (result.status === 'fulfilled') {
+					selectedFiles.delete(result.value);
+					deleteProgress++;
+				} else {
+					deleteProgress++;
+					logger.error(`Bulk delete failed:`, result.reason);
+				}
+			}
+		}
+
+		const succeeded = [...toDelete].filter((f) => !selectedFiles.has(f.filename)).length;
+		isDeleting = false;
+		if (succeeded < toDelete.length) {
+			alert(`Deleted ${succeeded} of ${toDelete.length} files. ${toDelete.length - succeeded} failed.`);
+		}
+		// Refresh the file list
+		await fetchMedia();
+	}
+
 	// Clear selection
 	function clearSelection(): void {
 		selectedFiles.clear();
@@ -271,16 +325,15 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 		</label>
 
 		<!-- Search -->
-		<input
-			type="search"
-			bind:value={search}
-			oninput={handleSearch}
-			placeholder="Search files..."
-			class="input flex-1"
-			id="media-search"
-			aria-label="Search media files"
-			disabled={isLoading}
-		/>
+		<Input aria-label="Search media"
+				type="search"
+				bind:value={search}
+				oninput={handleSearch}
+				placeholder="Search files..."
+				inputClass="input flex-1"
+				id="media-search"
+				disabled={isLoading}
+			/>
 
 		<!-- View mode toggle -->
 		<div class="flex gap-1 rounded border border-surface-300 p-1 dark:border-surface-600" role="group" aria-label="View mode">
@@ -332,6 +385,16 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 			<div class="flex gap-2">
 				<Button variant="outline" onclick={clearSelection} size="sm">Clear</Button>
 				<Button variant="tertiary" onclick={confirmSelection} size="sm" class="dark:">Confirm Selection</Button>
+				<Button
+					variant="error"
+					onclick={bulkDelete}
+					disabled={isDeleting}
+					size="sm"
+					aria-label="Delete selected files"
+				>
+					<iconify-icon icon={isDeleting ? 'mdi:loading' : 'mdi:delete'} width="16" class={isDeleting && !prefersReducedMotion ? 'animate-spin' : ''}></iconify-icon>
+					{isDeleting ? `Deleting ${deleteProgress}/${selectedCount}...` : 'Delete'}
+				</Button>
 			</div>
 		</div>
 	{/if}
@@ -372,13 +435,12 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 		>
 			{#each filteredFiles as file, index (file.filename)}
 				{const selected = isSelected(file.filename)}
-				<div
-					class="group card relative flex {currentViewMode.value === 'list'
-						? 'flex-row items-center'
-						: 'flex-col'} overflow-hidden transition-all duration-200 {selected ? 'ring-4 ring-primary-500' : ''}"
-					role="listitem"
-					transition:scale={{ duration: prefersReducedMotion ? 0 : 200, start: 0.95 }}
-				>
+				<AdminCard
+						class="group relative flex {currentViewMode.value === 'list'
+							? 'flex-row items-center'
+							: 'flex-col'} overflow-hidden transition-all duration-200 {selected ? 'ring-4 ring-primary-500' : ''}"
+						role="listitem"
+					>
 					{#if multiple}
 						<!-- Selection checkbox -->
 						<div class="absolute inset-s-2 top-2 z-10">
@@ -405,13 +467,14 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 					</div>
 
 					<!-- Content -->
-					<button
-						onclick={() => toggleSelection(file)}
-						onkeydown={(e) => handleKeydown(e, file)}
-						aria-label={`${selected ? 'Deselect' : 'Select'} ${file.filename}`}
-						class="flex flex-1 items-center justify-center p-4 transition-transform hover:scale-[1.02] focus:scale-[1.02] focus:outline-2 focus:outline-primary-500"
-						type="button"
-					>
+					<Button
+							variant="ghost"
+							onclick={() => toggleSelection(file)}
+							onkeydown={(e: KeyboardEvent) => handleKeydown(e, file)}
+							aria-label={`${selected ? 'Deselect' : 'Select'} ${file.filename}`}
+							class="flex flex-1 items-center justify-center p-4 transition-transform hover:scale-[1.02] focus:scale-[1.02] focus:outline-2 focus:outline-primary-500"
+							type="button"
+						>
 						{#if !isInfoShown(index)}
 							<!-- Thumbnail view -->
 							<img
@@ -444,8 +507,8 @@ Advanced media gallery with search, thumbnails, grid/list views, and selection.
 								</table>
 							</div>
 						{/if}
-					</button>
-				</div>
+					</Button>
+				</AdminCard>
 			{/each}
 		</div>
 	{/if}

@@ -14,6 +14,7 @@ import { isRedirect, type Actions, fail, redirect } from "@sveltejs/kit";
 import { RateLimiter } from "sveltekit-rate-limiter/server";
 import type { PageServerLoad } from "./$types";
 import type { ISODateString, DatabaseId } from "@src/content/types";
+import { isMultiTenantEnabled } from "@utils/tenant";
 import {
   getPrivateSettingSync,
   getPublicSetting,
@@ -24,7 +25,7 @@ import { resolveLoginBranding } from "@utils/theme-merge";
 import { publicEnv } from "@src/stores/global-settings.svelte";
 import { logger } from "@utils/logger";
 import { sendMail } from "@utils/email.server";
-import { getCachedFirstCollectionPath } from "@utils/server/collection-utils.server";
+
 import { getSystemState } from "@src/stores/system/state.svelte.ts";
 import pkg from "../../../package.json";
 
@@ -89,13 +90,9 @@ async function checkDatabaseHealth(): Promise<{
 
   try {
     if (auth && typeof auth.getUserCount === "function") {
-      const roleCount = await auth.getUserCount({}, { bypassTenantCheck: true });
-      if (roleCount === 0) {
-        const reason = "Database is empty — setup may not have completed";
-        _dbHealthCache = { healthy: false, reason, timestamp: now };
-        return { healthy: false, reason };
-      }
-      // roleCount > 0 — users exist, DB is healthy
+      await auth.getUserCount({}, { bypassTenantCheck: true });
+      // Users exist or DB is empty — neither is an error.
+      // An empty database is the normal state for first-user signup.
       _dbHealthCache = { healthy: true, timestamp: now };
       return { healthy: true };
     }
@@ -124,16 +121,9 @@ async function waitForAuthService(): Promise<boolean> {
   return !!(auth && typeof auth.getUserCount === "function");
 }
 
-async function shouldShowGoogleOAuth(hasInvite?: boolean): Promise<boolean> {
+async function shouldShowGoogleOAuth(_hasInvite?: boolean): Promise<boolean> {
   if (!getPrivateSettingSync("GOOGLE_CLIENT_ID")) return false;
-  if (hasInvite) return true;
-  if (!auth || typeof auth.getUserCount !== "function") return false;
-  try {
-    const count = await auth.getUserCount({}, { bypassTenantCheck: true });
-    return count > 0;
-  } catch {
-    return false;
-  }
+  return true;
 }
 
 async function loadLoginBranding(tenantId?: string | null) {
@@ -154,16 +144,9 @@ async function loadLoginBranding(tenantId?: string | null) {
   }
 }
 
-async function shouldShowGithubOAuth(hasInvite?: boolean): Promise<boolean> {
+async function shouldShowGithubOAuth(_hasInvite?: boolean): Promise<boolean> {
   if (!getPrivateSettingSync("GITHUB_CLIENT_ID")) return false;
-  if (hasInvite) return true;
-  if (!auth || typeof auth.getUserCount !== "function") return false;
-  try {
-    const count = await auth.getUserCount({}, { bypassTenantCheck: true });
-    return count > 0;
-  } catch {
-    return false;
-  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,17 +154,21 @@ async function shouldShowGithubOAuth(hasInvite?: boolean): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 export const load: PageServerLoad = async ({ url, cookies, fetch, request, locals }) => {
-  const demoMode = getPrivateSettingSync("DEMO");
-  const multiTenant = getPrivateSettingSync("MULTI_TENANT");
   const userLanguage = getUserLanguage();
-  const isOpenSignup = !!(multiTenant && demoMode);
 
   const defaultBranding = await loadLoginBranding(locals?.tenantId);
+
+  // Default values — updated after DB init once settings cache is loaded
+  let demoMode = false;
+  let multiTenant = false;
+  let isOpenSignup = false;
 
   const errorDefaults = {
     hasAdminUser: true,
     showGoogleOAuth: false,
     showGithubOAuth: false,
+    showPasskey: false,
+    showMagicLink: false,
     hasExistingOAuthUsers: false,
     isOpenSignup,
     loginForm: {},
@@ -189,8 +176,9 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
     resetForm: {},
     signUpForm: {},
     demoMode,
+    redirectTo: "",
     loginBranding: defaultBranding,
-  } as const;
+  };
 
   try {
     const systemState = getSystemState();
@@ -211,6 +199,12 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
     }
 
     await dbInitPromise;
+
+    // Re-read multi-tenancy and demo mode from settings cache (now guaranteed loaded)
+    demoMode = !!getPrivateSettingSync("DEMO");
+    multiTenant = isMultiTenantEnabled();
+    isOpenSignup = multiTenant && demoMode;
+
     const dbHealth = await checkDatabaseHealth();
     if (!dbHealth.healthy) {
       return {
@@ -225,7 +219,7 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
 
     const authReady = await waitForAuthService();
     if (!(authReady && auth)) {
-      const { isSetupCompleteAsync } = await import("@utils/setup-check");
+      const { isSetupCompleteAsync } = await import("@utils/server/setup-check");
       const setupComplete = await isSetupCompleteAsync();
       if (!setupComplete) {
         return {
@@ -243,18 +237,36 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
 
     if (!locals) locals = {} as App.Locals;
 
+    // If already authenticated, redirect to the intended destination or default
     if (locals.user) {
-      let finalCollectionPath: string | null = null;
-      try {
-        finalCollectionPath = await getCachedFirstCollectionPath(userLanguage as any);
-      } catch {
-        throw redirect(302, "/");
-      }
-      throw redirect(302, finalCollectionPath ?? "/config/collectionbuilder");
+      const returnTo = url.searchParams.get("redirect") || "/config/collectionbuilder";
+      throw redirect(302, returnTo);
     }
 
     if (limiter.cookieLimiter?.preflight) {
       await limiter.cookieLimiter.preflight({ request, cookies } as any);
+    }
+
+    // Magic Link Verification
+    const magicToken = url.searchParams.get("magic_token");
+    const magicEmail = url.searchParams.get("email");
+    if (magicToken && magicEmail) {
+      const { verifyMagicLink } = await import("@src/databases/auth/magic-link");
+      const result = await verifyMagicLink({
+        token: magicToken,
+        email: magicEmail,
+        cookies,
+        request,
+        userLanguage: userLanguage || "en",
+      });
+      if (result.success && result.redirectPath) {
+        throw redirect(303, result.redirectPath);
+      } else {
+        return {
+          ...errorDefaults,
+          error: result.message || "Invalid or expired magic link.",
+        };
+      }
     }
 
     // Invite flow
@@ -365,7 +377,11 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
             user_id: existingUser._id as DatabaseId,
             expires: new Date(Date.now() + SESSION_DURATION_MS).toISOString() as ISODateString,
           });
-          const sessionCookie = auth.createSessionCookie(session._id as DatabaseId);
+          const isSecure = (await import("@src/databases/auth/constants")).isSecureCookieContext(
+            url.protocol,
+            url.hostname,
+          );
+          const sessionCookie = auth.createSessionCookie(session._id as DatabaseId, isSecure);
           cookies.set(sessionCookie.name, sessionCookie.value, {
             ...(sessionCookie.attributes as Record<string, unknown>),
             path: "/",
@@ -384,11 +400,7 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
               logger.debug("Google user attribute update failed silently");
             });
 
-          let finalCollectionPath: string | null = null;
-          try {
-            finalCollectionPath = await getCachedFirstCollectionPath(userLanguage as any);
-          } catch {}
-          throw redirect(303, finalCollectionPath ?? "/config/collectionbuilder");
+          throw redirect(303, "/config/collectionbuilder");
         }
       } catch (err: any) {
         if (isRedirect(err)) throw err;
@@ -404,31 +416,45 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
 
     const showGoogleOAuth = await shouldShowGoogleOAuth();
     const showGithubOAuth = await shouldShowGithubOAuth();
-
-    let firstCollectionPath: string | null = null;
-    try {
-      firstCollectionPath = await getCachedFirstCollectionPath(userLanguage as any);
-    } catch {}
+    const showPasskey = !!(
+      (await getUntypedSetting("WEBAUTHN_RP_ID", "private")) ||
+      (await getUntypedSetting("PASSKEY_ENABLED", "private"))
+    );
+    const showMagicLink = !!(
+      (await getUntypedSetting("SMTP_HOST", "private")) ||
+      (await getUntypedSetting("MAGIC_LINK_ENABLED", "private"))
+    );
 
     const pkgVersion = pkg.version;
     const loginBranding = await loadLoginBranding(locals.tenantId);
 
     return {
       ...errorDefaults,
+      demoMode,
+      isOpenSignup,
       hasAdminUser,
       showGoogleOAuth,
       showGithubOAuth,
+      showPasskey,
+      showMagicLink,
       hasExistingOAuthUsers: false,
-      firstCollectionPath,
+      firstCollectionPath: "/config/collectionbuilder",
       pkgVersion,
       loginBranding,
+      redirectTo: url.searchParams.get("redirect") || "",
       // Returning user: handle-authentication sets locals.returningUser when a session cookie was
       // present but invalid/expired (then deletes the dead cookie). Fall back to raw cookie presence
       // for any path that bypasses that branch. A valid session is already redirected away by hooks,
       // so this only flags lapsed sessions → default to the Sign In form (no extra cookie needed).
       returningUser: Boolean(
         locals.returningUser ??
-        readSessionCookie(cookies, url.protocol === "https:" || url.hostname !== "localhost"),
+        readSessionCookie(
+          cookies,
+          (await import("@src/databases/auth/constants")).isSecureCookieContext(
+            url.protocol,
+            url.hostname,
+          ),
+        ),
       ),
     };
   } catch (err: any) {
@@ -446,8 +472,19 @@ export const load: PageServerLoad = async ({ url, cookies, fetch, request, local
 // ---------------------------------------------------------------------------
 
 export const actions: Actions = {
-  // Auth actions delegate to auth.remote.ts
-  signIn: signInFn,
+  signIn: async (event) => {
+    const formData = await event.request.formData();
+    const data: Record<string, unknown> = {};
+    formData.forEach((v, k) => {
+      data[k] = v;
+    });
+    const result = await signInFn(data);
+    logger.info(`[SignInAction] result: ${JSON.stringify(result)}`);
+    if (result?.success && result?.redirectPath) {
+      throw redirect(303, result.redirectPath);
+    }
+    return fail(401, result ?? { success: false, message: "Sign in failed" });
+  },
   signUp: signUpFn,
   forgotPW: forgotPWFn,
   resetPW: resetPWFn,

@@ -1,6 +1,6 @@
 /**
  * @file tests/benchmarks/cold-start-phased.test.ts
- * @description Phased Cold Start Audit
+ * @description Phased Cold Start Audit (Optimized)
  * @summary Measures server cold-start latency to READY state, using the built server.
  *
  * ### Features:
@@ -32,19 +32,31 @@ async function runColdStartPhasedAudit() {
   }
 
   const coldStarts: number[] = [];
+  const TOTAL_ITERATIONS = 5;
 
-  for (let i = 0; i < 5; i++) {
-    console.log(`   → Cold start iteration ${i + 1}/5...`);
+  // oxlint-disable-next-line eslint/no-unreachable-loop
+  for (let i = 0; i < TOTAL_ITERATIONS; i++) {
+    console.log(`   → Cold start iteration ${i + 1}/${TOTAL_ITERATIONS}...`);
     const start = performance.now();
-    const server = await setupBenchmarkServer();
-    coldStarts.push(performance.now() - start);
-    await server.stop();
-    await stabilize(500);
+    let server: any = null;
+
+    try {
+      server = await setupBenchmarkServer();
+      coldStarts.push(performance.now() - start);
+    } finally {
+      // Ensure the background infrastructure process is dropped cleanly before proceeding
+      if (server && typeof server.stop === "function") {
+        await server.stop().catch(() => {});
+      }
+      await stabilize(500);
+    }
   }
 
   const avgCold = coldStarts.reduce((a, b) => a + b, 0) / coldStarts.length;
   const sorted = [...coldStarts].sort((a, b) => a - b);
-  const p95Cold = sorted[Math.floor(sorted.length * 0.95)];
+
+  // Guard mathematical precision boundary for non-destructive p95 resolution mapping
+  const p95Cold = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1]!;
 
   printTruthTable({
     title: "SVELTYCMS — PHASED COLD START AUDIT",

@@ -6,7 +6,7 @@ order: 4
 icon: "mdi:database-check"
 author: "SveltyCMS Team"
 created: "2025-11-08"
-updated: "2026-06-17"
+updated: "2026-07-05"
 tags:
   - "testing"
   - "database"
@@ -58,10 +58,10 @@ To maximize performance, SveltyCMS supports parallel E2E testing using a **Datab
 
 SveltyCMS enforces a hard boundary between production and testing:
 
-1. **TEST_MODE**: Automatically enabled during `bun run test:*`.
-2. **Config Redirect**: The system is hard-coded to look for `config/private.test.ts` when testing.
-3. **Safety Guard**: `src/databases/db.ts` will throw a fatal error if it detects `config/private.ts` (Live) being loaded while in test mode.
-4. **Triple-Lock Security**: Testing routes are physically removed from production builds and require a cryptographic handshake for activation.
+1. **TEST_MODE**: Enabled for integration / E2E / local harnesses (`private-config-policy.ts`).
+2. **Config Redirect**: Automated runs load **`config/private.test.ts` only** — never the developer's live `config/private.ts` (user DB risk).
+3. **Safety Guard**: `config-state.ts` fails if `TEST_MODE` uses a non-isolated `DB_NAME` or a name equal to live `private.ts`.
+4. **Triple-Lock Security**: Testing routes are stripped from production builds and require a cryptographic handshake for activation.
 
 ### Database Test Sequence
 
@@ -105,21 +105,63 @@ sequenceDiagram
 
 ## Running Database Tests
 
-### 1. The Standard Suite (SQLite)
+### 1. Standard Suite (SQLite, No Docker)
 
-This is the recommended way to test locally:
+SQLite is the fastest local path and uses `config/private.test.ts` plus test database names only:
 
+```bash
+bun test --timeout 300000 tests/integration/
+bun test --timeout 300000 tests/integration/api/
+bun test --timeout 300000 tests/integration/databases/
 ```
-bun run test:integration
-```text
 
-### 2. Parallel E2E Testing
+### 2. Docker-Backed Adapter Suites
 
-Run the full browser suite with 4 workers:
+Start the matching profile from `tests/docker-compose.yml` before running a networked adapter:
 
+```bash
+docker compose -f tests/docker-compose.yml --profile mongodb up -d
+docker compose -f tests/docker-compose.yml --profile postgresql up -d
+docker compose -f tests/docker-compose.yml --profile mariadb up -d
+docker compose -f tests/docker-compose.yml --profile redis up -d
 ```
-npx playwright test --workers=4
-```text
+
+| Adapter | Compose profile | Default test credentials |
+| :------ | :-------------- | :----------------------- |
+| MongoDB | `mongodb` | no auth on port `27017` (official image default) |
+| PostgreSQL | `postgresql` | `postgres` / `postgres` on port `5432` |
+| MariaDB | `mariadb` | `root` / `mariadb` on port `3306` |
+| Redis | `redis` | no password on port `6379`; benchmark cache variants only |
+
+Then run:
+
+```bash
+DB_TYPE=mongodb bun test --timeout 300000 tests/integration/
+DB_TYPE=postgresql bun test --timeout 300000 tests/integration/
+DB_TYPE=mariadb bun test --timeout 300000 tests/integration/
+```
+
+### 3. 4-DB Matrix (CI by default)
+
+The **4-adapter integration + bench-core matrix runs in GitHub CI** (`ci.yml` `db-tests` / `bench-core`). Local pre-push does **not** run it by default (keeps the gate fast and avoids accidental live-config misuse).
+
+```bash
+bun run gate                                           # local push gate (build + SQLite)
+# Multi-DB local matrix (Docker profiles required; CI is authoritative)
+DB_TYPE=postgresql bun test --timeout 300000 tests/integration/
+bun run test:doctor                                    # unit + SQLite integration + gate map
+```
+
+Env blocks and credentials: `src/utils/test-db-credentials.ts` (`sveltycms_test` / `benchmark_shared` — never the live `sveltycms.db` from `private.ts`).
+
+### 4. Parallel E2E Testing
+
+Playwright local runs use `playwright.config.ts`; it starts the ready server on `127.0.0.1:4173` and setup server on `127.0.0.1:4174` when `CI` is not set:
+
+```bash
+bun run build
+bun x playwright test --workers=4
+```
 
 ---
 
@@ -132,7 +174,7 @@ This usually happens if multiple workers share the same database file.
 
 ### "Database connection failed"
 
-Ensure your `config/private.test.ts` has the correct credentials. Always use `127.0.0.1` instead of `localhost` to avoid IPv6 resolution issues.
+Ensure `config/private.test.ts` has a test-scoped `DB_NAME` and credentials matching `tests/docker-compose.yml`. Prefer `127.0.0.1` in env overrides to avoid IPv6 resolution differences.
 
 ---
 
@@ -147,6 +189,92 @@ We use the **Enterprise Benchmark Matrix** to validate database adapter performa
 - **Cross-Database Leaderboard**: Aggregated metrics in `docs/project/benchmarks/README.mdx` for side-by-side "Showdown" analysis.
 
 **Tools**: `scripts/benchmark-matrix/index.ts`, `tests/benchmarks/migration-scale.test.ts`, `tests/benchmarks/index-pressure.test.ts`
+
+---
+
+## Cross-Adapter Contract Tests (July 2026)
+
+To ensure identical behavior across all 4 database adapters, SveltyCMS now runs **95 contract tests** across 10 test suites. Every `IDBAdapter` method is validated for consistent return shapes, error handling, and data integrity:
+
+| Suite | Tests | Coverage |
+|---|---|---|
+| `adapter-parity.test.ts` | 15 | insert, findOne, findMany, update, delete, count, upsert |
+| `error-contract.test.ts` | 11 | Duplicate keys, missing records, invalid input, error shapes |
+| `cache-contract.test.ts` | 9 | L1 set/get/delete, TTL, tenant isolation, negative cache |
+| `transaction-contract.test.ts` | 5 | Commit, rollback, orphan prevention |
+| `bulk-operations-contract.test.ts` | 10 | insertMany, updateMany, deleteMany, upsertMany, atomicIncrement |
+| `advanced-crud-contract.test.ts` | 9 | streamMany, findByIds, aggregate, restore, exists |
+| `health-contract.test.ts` | 12 | Connection health, pool stats, queryBuilder, tenant policy |
+
+**Run against a specific adapter**:
+```bash
+DB=sqlite      bun test tests/integration/databases/*-contract.test.ts
+DB=mongodb     bun test tests/integration/databases/*-contract.test.ts
+DB=postgresql  bun test tests/integration/databases/*-contract.test.ts
+DB=mariadb     bun test tests/integration/databases/*-contract.test.ts
+```
+
+**Benchmark harness** (`benchmark-harness.test.ts`, 11 tests) validates the benchmark framework itself: warmup isolation, `assertSuccess()` on all CRUD operations, and >50% warmup failure guard. A pre-flight sanitizer (`benchmark-sanitizer.ts`) runs before every benchmark to verify collection cleanliness, seed integrity, and warmup isolation.
+
+**Result validation** (`result-validator.ts`) enforces the `DatabaseResult<T>` contract at runtime across all integration and benchmark tests.
+
+---
+
+## Benchmark Execution Strategy
+
+### Multi-Database Runner
+
+Each benchmark test can now run across **all 8 database variants** (SQLite, SQLite+Redis, MariaDB, MariaDB+Redis, PostgreSQL, PostgreSQL+Redis, MongoDB, MongoDB+Redis) in a single `bun test` invocation.
+
+```typescript
+import { runOnAllDatabases } from "./modules/benchmark-utils";
+
+test("my test", async () => {
+  await runOnAllDatabases(async (dbKey, baseUrl, dbType) => {
+    // Runs once per database variant
+    // Each variant gets its own fresh server
+  });
+}, 600000);
+```
+
+This replaces the previous matrix approach where the orchestrator spawned 8 separate `bun test` subprocesses per test file. Benefits:
+
+| Before | After |
+|--------|-------|
+| 464 total subprocess spawns (61 tests × 8 DBs) | 61 total subprocess spawns (1 per test file) |
+| 8 servers per test (each test started its own) | 8 servers per test (same, but one `bun test` process) |
+| Failure cascades across database variants | Each database is isolated — failure stops only that variant |
+| Redis connection accumulation across subprocesses | Redis connections cleaned up per variant |
+
+### Known-Incompatible Tests
+
+Some tests are incompatible with specific database engines. The `skipOn` field in `scripts/benchmark-matrix/benchmark-scripts.ts` prevents them from running on broken combinations:
+
+```typescript
+{
+  path: "tests/benchmarks/state-machine-transition.test.ts",
+  skipOn: ["mongodb"],  // MongoDB connection drops during 50-cycle reinitialize stress
+}
+```
+
+| Test | Skipped On | Reason |
+|------|-----------|--------|
+| `state-machine-transition` | MongoDB | Connection drops during self-healing stress cycles |
+| `data-residency-failover` | MongoDB | `ConnectionRefused` after failover simulation |
+| `database-failover` | MongoDB | Connection doesn't recover cleanly enough for failover timing |
+
+### Bun Runtime Alignment
+
+All 4 database adapters now run natively under `bun test` — no vitest/Node.js special case for MongoDB:
+
+| Adapter | Driver | Previously | Now |
+|---------|--------|-----------|-----|
+| SQLite | `bun:sqlite` (native) | `bun test` | `bun test` |
+| MariaDB | `mysql2` (pure JS) | `bun test` | `bun test` |
+| PostgreSQL | `postgres` (pure JS) | `bun test` | `bun test` |
+| MongoDB | `mongoose` → `bson` | `vitest` (Node.js) | `bun test` ✅ |
+
+The `bson` package calls `v8.isBuildingSnapshot()` at module load time, which Bun (JavaScriptCore) doesn't implement. A shim in `src/utils/v8-shim.ts` patches `process.getBuiltinModule('v8')` to return a safe stub.
 
 ---
 

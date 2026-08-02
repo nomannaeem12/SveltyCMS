@@ -12,16 +12,15 @@ latest version available on GitHub with comprehensive status reporting.
 - `children` (Snippet): Custom rendering function for headless mode
 
 ### Features
-- Fetches latest version from GitHub with caching
-- Semantic version comparison (major, minor, patch)
-- Security vulnerability detection
-- Visual states: critical (red), update (yellow), current (green)
-- Headless/renderless mode with Svelte 5 snippets
-- Accessible with proper ARIA attributes
-- Error handling with retry logic
-- Reduced motion support
+	- Fetches latest version from GitHub via the version service API
+	- Visual states: update available (yellow), up to date (green)
+	- Headless/renderless mode with Svelte 5 snippets
+	- Accessible with proper ARIA attributes
+	- Error handling with retry logic
+	- Reduced motion support
 -->
 <script lang="ts">
+	import Badge from '@components/ui/badge.svelte';
 	import { publicEnv } from '@src/stores/global-settings.svelte';
 	import { onDestroy, onMount } from 'svelte';
 	import { browser } from '$app/environment';
@@ -100,86 +99,58 @@ latest version available on GitHub with comprehensive status reporting.
 		return 'bg-surface-900/10 dark:text-white';
 	});
 
-	// Parse semantic version
-	function parseVersion(version: string): [number, number, number] {
-		const parts = version.split('.').map(Number);
-		return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
-	}
-
-	// Compare versions
-	function compareVersions(local: string, remote: string): 'major' | 'minor' | 'patch' | 'current' {
-		const [localMajor, localMinor, localPatch] = parseVersion(local);
-		const [remoteMajor, remoteMinor, remotePatch] = parseVersion(remote);
-
-		if (remoteMajor > localMajor) {
-			return 'major';
-		}
-		if (remoteMajor === localMajor && remoteMinor > localMinor) {
-			return 'minor';
-		}
-		if (remoteMajor === localMajor && remoteMinor === localMinor && remotePatch > localPatch) {
-			return 'patch';
-		}
-		return 'current';
+	interface UpdateCheckData {
+		currentVersion: string;
+		latestVersion: string | null;
+		updateAvailable: boolean;
+		checkedAt: string;
+		error?: string;
 	}
 
 	interface VersionApiResponse {
-		error?: string;
-		latest?: string;
+		success: boolean;
+		data?: UpdateCheckData;
 		message?: string;
-		security_issue?: boolean;
-		status: 'disabled' | 'error' | 'success';
 	}
 
-	// Update status based on version comparison
-	function updateStatus(data: VersionApiResponse) {
-		if (data.status === 'disabled') {
+	// Update status based on /api/system/version/check response
+	function updateStatus(raw: VersionApiResponse) {
+		const check = raw?.data;
+
+		if (!check) {
 			githubVersion = pkg;
 			badgeVariant = 'variant-filled';
 			badgeColor = 'bg-surface-500 text-white';
-			versionStatusMessage = 'Version check disabled';
+			versionStatusMessage = 'Version check unavailable';
 			statusIcon = 'mdi:shield-off';
 			statusSeverity = 'info';
-			error = null;
-		} else if (data.status === 'error') {
-			githubVersion = pkg;
+			error = 'No data received';
+			lastChecked = Date.now();
+			return;
+		}
+
+		if (check.error) {
+			githubVersion = check.currentVersion || pkg;
 			badgeVariant = 'variant-filled';
 			badgeColor = 'bg-warning-500 text-white';
 			versionStatusMessage = 'Could not check for updates';
 			statusIcon = 'mdi:wifi-off';
 			statusSeverity = 'warning';
-			error = data.error || 'Network error';
+			error = check.error;
+		} else if (check.latestVersion && check.updateAvailable) {
+			githubVersion = check.latestVersion;
+			badgeVariant = 'variant-filled';
+			badgeColor = 'bg-warning-500 text-black';
+			versionStatusMessage = `Update to v${check.latestVersion} recommended`;
+			statusIcon = 'mdi:information';
+			statusSeverity = 'warning';
 		} else {
-			githubVersion = data.latest || pkg;
-			const comparison = compareVersions(pkg, githubVersion);
-
-			// Security issue takes priority
-			if (data.security_issue) {
-				badgeVariant = 'variant-filled';
-				badgeColor = 'bg-error-500 text-white';
-				versionStatusMessage = data.message || `Critical security update to v${githubVersion} available!`;
-				statusIcon = 'mdi:shield-alert';
-				statusSeverity = 'critical';
-			} else if (comparison === 'major') {
-				badgeVariant = 'variant-filled';
-				badgeColor = 'bg-error-500 text-white';
-				versionStatusMessage = `Major update to v${githubVersion} available`;
-				statusIcon = 'mdi:alert-circle';
-				statusSeverity = 'critical';
-			} else if (comparison === 'minor' || comparison === 'patch') {
-				badgeVariant = 'variant-filled';
-				badgeColor = 'bg-warning-500 text-black';
-				versionStatusMessage = `Update to v${githubVersion} recommended`;
-				statusIcon = 'mdi:information';
-				statusSeverity = 'warning';
-			} else {
-				badgeVariant = 'variant-filled';
-				badgeColor = 'bg-tertiary-500 dark:bg-primary-500 text-white';
-				versionStatusMessage = 'You are up to date';
-				statusIcon = 'mdi:check-circle';
-				statusSeverity = 'success';
-			}
-			error = null;
+			githubVersion = check.currentVersion || pkg;
+			badgeVariant = 'variant-filled';
+			badgeColor = 'bg-tertiary-500 dark:bg-primary-500 text-white';
+			versionStatusMessage = 'You are up to date';
+			statusIcon = 'mdi:check-circle';
+			statusSeverity = 'success';
 		}
 
 		lastChecked = Date.now();
@@ -198,7 +169,7 @@ latest version available on GitHub with comprehensive status reporting.
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 10_000); // 10s timeout
 
-			const response = await fetch('/api/system/version', {
+			const response = await fetch('/api/system/version/check', {
 				signal: controller.signal,
 				headers: {
 					'Content-Type': 'application/json'
@@ -272,6 +243,17 @@ latest version available on GitHub with comprehensive status reporting.
 		}
 		return `Application version ${pkg}. ${versionStatusMessage}`;
 	});
+
+	// Map statusSeverity to Badge variant
+	const severityVariant = $derived.by(() => {
+		switch (statusSeverity) {
+			case 'success': return 'success' as const;
+			case 'warning': return 'warning' as const;
+			case 'critical': return 'error' as const;
+			case 'info': return 'surface' as const;
+			default: return 'surface' as const;
+		}
+	});
 </script>
 
 {#if children}
@@ -300,13 +282,15 @@ latest version available on GitHub with comprehensive status reporting.
 		</a>
 	{:else}
 		<SystemTooltip title={versionStatusMessage}>
-			<a
+			<Badge
 				href={GITHUB_RELEASES_URL}
 				target="_blank"
 				rel="noopener noreferrer"
+				variant={severityVariant}
+				size="md"
 				class={compact
-					? `inline-flex items-center gap-1 text-xs font-medium transition-colors hover:opacity-80 focus:opacity-80 badge ${badgeVariant} ${badgeColor} rounded-full px-2 py-0.5 focus:outline-none focus:ring-2 focus:ring-primary-500`
-					: `inline-flex items-center gap-1.5 text-xs font-medium transition-colors hover:opacity-80 focus:opacity-80 badge ${badgeVariant} ${badgeColor} rounded-full focus:outline-none focus:ring-2 focus:ring-primary-500`}
+					? 'inline-flex items-center gap-1 text-xs font-medium transition-colors hover:opacity-80 focus:opacity-80 px-2 py-0.5 focus:outline-none focus:ring-2 focus:ring-primary-500'
+					: 'inline-flex items-center gap-1.5 text-xs font-medium transition-colors hover:opacity-80 focus:opacity-80 focus:outline-none focus:ring-2 focus:ring-primary-500'}
 				aria-label={statusAriaLabel}
 				aria-live="polite"
 			>
@@ -335,7 +319,7 @@ latest version available on GitHub with comprehensive status reporting.
 						aria-hidden="true"
 					></span>
 				{/if}
-			</a>
+			</Badge>
 		</SystemTooltip>
 	{/if}
 

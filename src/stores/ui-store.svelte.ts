@@ -57,12 +57,24 @@ class UIStore {
   // UI toggles
   manualOverrideActive = $state(false);
   headerShowMore = $state(false);
+  /** @deprecated Prefer isCommandBarVisible — kept in sync for legacy callers */
   isSearchVisible = $state(false);
+  /** Unified global search / command palette visibility */
   isCommandBarVisible = $state(false);
-  userPreferred = $state<UIVisibility>("collapsed");
-
   // Sticky action bar: pages set their action buttons here
   stickyActionContent = $state<import("svelte").Snippet | null>(null);
+
+  /** Open/close the Gin-style global search (Alt+G / Mod+K). */
+  toggleGlobalSearch(force?: boolean): void {
+    const next = force ?? !this.isCommandBarVisible;
+    this.isCommandBarVisible = next;
+    this.isSearchVisible = next;
+  }
+
+  closeGlobalSearch(): void {
+    this.isCommandBarVisible = false;
+    this.isSearchVisible = false;
+  }
 
   // Internal state
   private manualTimer: ReturnType<typeof setTimeout> | null = null;
@@ -155,9 +167,9 @@ class UIStore {
 
     const showPageHeader = ["edit", "create", "modify"].includes(currentMode);
 
-    // Mobile
+    // Mobile — sidebar is hidden by default, user opens via hamburger overlay
     if (size === ScreenSize.XS || size === ScreenSize.SM) {
-      this.state.leftSidebar = "collapsed";
+      this.state.leftSidebar = "hidden";
       this.state.rightSidebar = "hidden";
       this.state.pageheader = showPageHeader ? "full" : "hidden";
       this.state.pagefooter = "hidden";
@@ -291,24 +303,6 @@ export const uiStateManager = {
   toggle: ui.toggle.bind(ui),
   show: (element: keyof UIState) => ui.toggle(element, "full"),
   hide: (element: keyof UIState) => ui.toggle(element, "hidden"),
-};
-
-// Compatibility export for userPreferredState - wraps ui.state
-export const userPreferredState = {
-  get leftSidebar() {
-    return ui.state.leftSidebar;
-  },
-  get rightSidebar() {
-    return ui.state.rightSidebar;
-  },
-  get pageheader() {
-    return ui.state.pageheader;
-  },
-  set(state: UIVisibility) {
-    // No-op or map to something?
-    // Theme branch likely set a preference.
-    ui.userPreferred = state;
-  },
 };
 
 export const setRouteContext = ui.setRouteContext.bind(ui);

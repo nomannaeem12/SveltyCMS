@@ -15,6 +15,9 @@ export interface LocalApiOptions {
   system?: boolean;
   skipValidation?: boolean;
   disableErrors?: boolean;
+  populate?: string[];
+  /** Passed through to session creation for device deduplication. */
+  sessionMeta?: { userAgent?: string; ipAddress?: string };
 }
 
 export interface TokenOptions extends LocalApiOptions {

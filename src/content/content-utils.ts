@@ -4,9 +4,10 @@
  * Shared utility functions, navigation logic, and performance metrics.
  * Safe for both client-side UI and server-side reconciliation.
  */
-import { contentStore } from "@stores/content-store.svelte";
+import { contentStore } from "@stores/content-registry.svelte";
 import type { ContentNode, NavigationNode, Schema } from "./types";
 import { logger } from "@utils/logger";
+import { sanitizeHtml, stripHtml } from "@src/utils/sanitize-html";
 
 // --- PURE UTILITIES ---
 
@@ -113,7 +114,10 @@ export const contentNavigation = {
     const nodesMap = new Map<string, ContentNode>();
     for (const node of filteredNodes) {
       // Fix: getContentStructure key/lookup type mismatch between _id and parentId
-      nodesMap.set(node._id.toString(), { ...node, children: [] as ContentNode[] });
+      nodesMap.set(node._id.toString(), {
+        ...node,
+        children: [] as ContentNode[],
+      });
     }
 
     const tree: ContentNode[] = [];
@@ -166,17 +170,13 @@ export const contentNavigation = {
     if (typeof window === "undefined" && import.meta.env.SSR) {
       try {
         const { cacheService } = await import("@src/databases/cache/cache-service");
-        const { navigationCacheTags, NAVIGATION_CACHE_TTL_S } =
-          await import("./content-cache.server");
         const { CacheCategory } = await import("@src/databases/cache/types");
-        await cacheService.set(
-          cacheKey,
-          result,
-          NAVIGATION_CACHE_TTL_S,
-          tenantId,
-          CacheCategory.CONTENT,
-          navigationCacheTags(tenantId),
-        );
+        const tid = tenantId || "global";
+        await cacheService.set(cacheKey, result, 300, tenantId, CacheCategory.CONTENT, [
+          "navigation",
+          "navigation:tree",
+          `navigation:tree:${tid}`,
+        ]);
       } catch {
         logger.trace("[NavigationCache] Write failed or skipped");
       }
@@ -329,3 +329,202 @@ export const contentMetrics = {
   },
   // Fix: getDiagnostics is a strict subset of getHealthStatus — removed it (deprecated placeholder)
 };
+
+// ─────────────────────────────────────────────────────────────
+// Numeric Field Range Validation
+// ─────────────────────────────────────────────────────────────
+
+const MAX_SAFE_SQL_INT = 2_147_483_647; // MariaDB/PostgreSQL INT max
+const MIN_SAFE_SQL_INT = -2_147_483_648;
+
+/**
+ * Validates numeric field values against schema-defined min/max ranges.
+ * Prevents integer overflow errors at the database layer (500 errors)
+ * by catching out-of-range values before they reach the adapter.
+ *
+ * @returns Array of validation error messages (empty = all valid)
+ */
+export function validateNumericFields(
+  data: Record<string, unknown>,
+  schema: {
+    fields?: Array<{
+      db_fieldName: string;
+      type?: string;
+      min?: number;
+      max?: number;
+    }>;
+  },
+): string[] {
+  const errors: string[] = [];
+  if (!schema.fields) return errors;
+
+  for (const field of schema.fields) {
+    if (field.type !== "number") continue;
+    const value = data[field.db_fieldName];
+    if (value === undefined || value === null) continue;
+
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+      errors.push(`Field "${field.db_fieldName}": value "${value}" is not a valid number`);
+      continue;
+    }
+
+    // Check schema-defined range
+    if (field.min !== undefined && num < field.min) {
+      errors.push(
+        `Field "${field.db_fieldName}": ${num} is below minimum allowed value (${field.min})`,
+      );
+    }
+    if (field.max !== undefined && num > field.max) {
+      errors.push(
+        `Field "${field.db_fieldName}": ${num} exceeds maximum allowed value (${field.max})`,
+      );
+    }
+
+    // Guard against SQL integer overflow (even if no min/max defined)
+    if (num > MAX_SAFE_SQL_INT || num < MIN_SAFE_SQL_INT) {
+      errors.push(
+        `Field "${field.db_fieldName}": ${num} is outside the safe integer range for the database (${MIN_SAFE_SQL_INT} to ${MAX_SAFE_SQL_INT})`,
+      );
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Sanitizes input data fields before database persistence.
+ * - Fields of type "richtext" or "markdown" are run through HTML sanitization (retaining safe tags).
+ * - Fields of type "text" or "textarea" have all HTML tags stripped out to prevent HTML/XSS injection.
+ * - This actively prevents database pollution and stored XSS inside collections.
+ */
+export function sanitizeCollectionFields(
+  data: Record<string, unknown>,
+  schema: {
+    fields?: Array<{
+      db_fieldName: string;
+      type?: string;
+    }>;
+  },
+): Record<string, unknown> {
+  if (!schema.fields) return data;
+  const sanitized = { ...data };
+
+  for (const field of schema.fields) {
+    const value = sanitized[field.db_fieldName];
+    if (typeof value !== "string") continue;
+
+    if (field.type === "richtext" || field.type === "markdown") {
+      sanitized[field.db_fieldName] = sanitizeHtml(value);
+    } else if (field.type === "text" || field.type === "textarea") {
+      sanitized[field.db_fieldName] = stripHtml(value);
+    }
+  }
+
+  return sanitized;
+}
+
+// ─────────────────────────────────────────────────────────────
+// String Field MaxLength Validation
+// ─────────────────────────────────────────────────────────────
+
+/** String-like field types that should respect maxLength constraints. */
+const STRING_FIELD_TYPES = new Set([
+  "string",
+  "text",
+  "textarea",
+  "slug",
+  "email",
+  "url",
+  "password",
+]);
+
+/**
+ * Validates string field values against schema-defined maxLength constraints.
+ * Values exceeding the limit are truncated to maxLength (default 255).
+ * Logs a warning when truncation occurs.
+ *
+ * @returns A new data object with truncated string values (shallow clone).
+ */
+export function validateFieldConstraints(
+  data: Record<string, unknown>,
+  schema: {
+    fields?: Array<{
+      db_fieldName: string;
+      type?: string;
+      maxLength?: number;
+    }>;
+  },
+): Record<string, unknown> {
+  if (!schema.fields) return data;
+  const validated = { ...data };
+
+  for (const field of schema.fields) {
+    const value = validated[field.db_fieldName];
+    if (typeof value !== "string") continue;
+
+    // Only enforce maxLength for fields that hold string-like content
+    if (field.type && !STRING_FIELD_TYPES.has(field.type)) continue;
+
+    const maxLen = field.maxLength ?? 255;
+    if (value.length > maxLen) {
+      validated[field.db_fieldName] = value.slice(0, maxLen);
+      logger.warn(
+        `[validateFieldConstraints] Field "${field.db_fieldName}" (type: ${field.type}) ` +
+          `truncated from ${value.length} to ${maxLen} characters`,
+      );
+    }
+  }
+
+  return validated;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Array / Block Null Row Stripping
+// ─────────────────────────────────────────────────────────────
+
+/** Widget types that represent array/repeating data. */
+const ARRAY_WIDGET_TYPES = new Set(["array", "blocks", "group", "repeater"]);
+
+/**
+ * Walks schema fields and removes null/undefined entries from array/block
+ * typed fields, preventing DB pollution from empty rows in repeating widgets.
+ *
+ * @returns A new data object with null rows stripped (shallow clone).
+ */
+export function stripNullRows(
+  data: Record<string, unknown>,
+  schema: {
+    fields?: Array<{
+      db_fieldName: string;
+      type?: string;
+      widget?: { Name?: string };
+    }>;
+  },
+): Record<string, unknown> {
+  if (!schema.fields) return data;
+  const stripped = { ...data };
+
+  for (const field of schema.fields) {
+    const value = stripped[field.db_fieldName];
+    if (!Array.isArray(value)) continue;
+
+    // Identify array/block fields by widget type or field type
+    const isArrayField =
+      (field.type && ARRAY_WIDGET_TYPES.has(field.type)) ||
+      (field.widget?.Name && ARRAY_WIDGET_TYPES.has(field.widget.Name));
+
+    if (!isArrayField) continue;
+
+    const originalLength = value.length;
+    const filtered = value.filter((item) => item != null);
+    if (filtered.length < originalLength) {
+      stripped[field.db_fieldName] = filtered;
+      logger.warn(
+        `[stripNullRows] Field "${field.db_fieldName}" had ${originalLength - filtered.length} null entries removed`,
+      );
+    }
+  }
+
+  return stripped;
+}

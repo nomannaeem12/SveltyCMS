@@ -1,6 +1,7 @@
 /**
  * @file src/hooks/handle-turbo-pipeline.server.ts
- * @description Consolidated high-performance middleware pipeline for SveltyCMS.
+ * @description
+ * Consolidated high-performance middleware pipeline for SveltyCMS.
  *
  * ### Pipeline (in order of execution cost)
  * 1. Static Asset Fast Exit      — regex match + zero logic
@@ -8,12 +9,19 @@
  * 3. System State Gate           — block if FAILED or INITIALIZING
  * 4. Setup Completeness Gate     — redirect to /setup if config missing
  * 5. CORS Preflight Fast Exit    — handle OPTIONS requests
+ * 6. Post-resolve security headers + immutable static cache headers
  *
  * Optimized to minimize work for hot paths and static content.
+ * All post-resolve header writes use `withMutableHeaders` (immutable Response safety).
  */
 
 import { dev } from "$app/environment";
-import { getSetupState, SetupState, isSetupComplete, getTestSecret } from "@src/utils/setup-check";
+import {
+  getSetupState,
+  SetupState,
+  isSetupComplete,
+  getTestSecret,
+} from "@utils/server/setup-check";
 import { getSystemState } from "@src/stores/system/state.svelte.ts";
 import { isRedirect, isHttpError, type Handle } from "@sveltejs/kit";
 import { SESSION_COOKIE_NAME } from "@src/databases/auth/constants";
@@ -25,8 +33,13 @@ import {
   STATIC_ASSET_REGEX,
   restrictedResponse,
   boundaryResponse,
+  withMutableHeaders,
 } from "@src/utils/hook-utils";
-import { API_CONTENT_SECURITY_POLICY, BASE_HEADERS } from "@src/utils/security-constants";
+import {
+  API_CONTENT_SECURITY_POLICY,
+  BASE_HEADERS,
+  MEDIA_RESOURCE_HEADERS,
+} from "../utils/security/constants";
 import { applyAllSecurityHeaders } from "./handle-security-headers";
 import { logger } from "@src/utils/logger";
 // Hook is initialized lazily
@@ -39,7 +52,8 @@ let healthHeaders: Record<string, string> | null = null;
 let requestIdCounter = 0;
 const generateRequestId = () => {
   if (IS_BENCHMARK) return ++requestIdCounter;
-  return Math.random().toString(36).substring(2, 9) + Date.now().toString(36);
+  // Use CSPRNG for all trace IDs (security hardening)
+  return globalThis.crypto.randomUUID().slice(0, 8) + Date.now().toString(36);
 };
 
 /** Logs request performance — ONLY in development mode to avoid string interpolation overhead in production */
@@ -67,6 +81,19 @@ function buildHealthResponse(db: any, searchParams: URLSearchParams): Response {
     };
   }
 
+  // 🚀 PERFORMANCE FAST-PATH: Avoid allocating system info & calling process.memoryUsage() / process.uptime()
+  // which are heavy system/V8 operations, unless verbose is requested during benchmark/health checks.
+  if (IS_BENCHMARK && !searchParams.has("verbose")) {
+    return new Response(
+      JSON.stringify({
+        status: db ? "healthy" : "initializing",
+        overallStatus: db ? "READY" : "SETUP",
+        database: !!db,
+      }),
+      { status: 200, headers: healthHeaders },
+    );
+  }
+
   const health = {
     status: db ? "healthy" : "initializing",
     overallStatus: db ? "READY" : "SETUP",
@@ -77,23 +104,12 @@ function buildHealthResponse(db: any, searchParams: URLSearchParams): Response {
     memory: (() => {
       if (searchParams.has("gc")) {
         if (typeof global !== "undefined" && (global as any).gc) (global as any).gc();
-        if (typeof Bun !== "undefined" && Bun.gc) Bun.gc(true);
+        if (typeof (globalThis as any).Bun !== "undefined" && (globalThis as any).Bun.gc)
+          (globalThis as any).Bun.gc(true);
       }
       return process.memoryUsage();
     })(),
   };
-
-  // Fast path for benchmarks: skip memory and extra fields unless verbose
-  if (IS_BENCHMARK && !searchParams.has("verbose")) {
-    return new Response(
-      JSON.stringify({
-        status: health.status,
-        overallStatus: health.overallStatus,
-        database: health.database,
-      }),
-      { status: 200, headers: healthHeaders },
-    );
-  }
 
   return new Response(JSON.stringify(health), {
     status: 200,
@@ -101,7 +117,13 @@ function buildHealthResponse(db: any, searchParams: URLSearchParams): Response {
   });
 }
 
-/** Simplified inline getCorsHeaders to avoid circular dependencies */
+/**
+ * Inline CORS header generator that reads origins from the database
+ * (private settings). This differs from the canonical getCorsHeaders in
+ * cors-utils.ts which uses hardcoded/env-var origins.
+ * Both are used in the pipeline: this for the preflight fast exit,
+ * getCorsHeaders (via applyAllSecurityHeaders) for post-resolve headers.
+ */
 async function getCorsHeadersInline(
   origin: string | null,
   isApiRoute: boolean,
@@ -156,17 +178,20 @@ async function getCorsHeadersInline(
 }
 
 // ✨ PERFORMANCE: Cache environment lookups to avoid process.env overhead on every request
-const IS_BENCHMARK = typeof process !== "undefined" && process.env.BENCHMARK === "true";
+const IS_BENCHMARK =
+  typeof globalThis !== "undefined" && (globalThis as any).process?.env?.BENCHMARK === "true";
 
 const IS_TEST_MODE =
-  typeof process !== "undefined" &&
+  typeof globalThis !== "undefined" &&
   !IS_BENCHMARK && // 🚀 Benchmarks run real middleware, not test bypass
-  (String(process.env.TEST_MODE) === "true" ||
-    String(process.env.VITE_TEST_MODE) === "true" ||
-    process.env.NODE_ENV === "test");
-const DB_TYPE = typeof process !== "undefined" ? process.env.DB_TYPE : "unknown";
+  (String((globalThis as any).process?.env?.TEST_MODE) === "true" ||
+    String((globalThis as any).process?.env?.VITE_TEST_MODE) === "true" ||
+    (globalThis as any).process?.env?.NODE_ENV === "test");
+const DB_TYPE =
+  typeof globalThis !== "undefined" ? (globalThis as any).process?.env?.DB_TYPE : "unknown";
 const IS_STRICT_SETUP_CHECK =
-  typeof process !== "undefined" && process.env.STRICT_SETUP_CHECK === "true";
+  typeof globalThis !== "undefined" &&
+  (globalThis as any).process?.env?.STRICT_SETUP_CHECK === "true";
 
 // Main Turbo Pipeline Hook
 export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
@@ -179,22 +204,25 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
 
   // 🚀 ONE-SHOT CLASSIFICATION: Computes isStatic/isApi/isBootstrap/isPublic once.
   // All downstream hooks read from locals.__flags via getRequestFlags().
-  classifyRequest(pathname, event.locals as any);
+  const flags = classifyRequest(pathname, event.locals as any);
 
   // ── 0. STATIC ASSET DELEGATION (before test bypass) ─────────────────────
   // Playwright attaches x-test-secret to every request; test bypass must not
   // skip CORP/cache headers or setup gates for uploaded media at /files/.
-  if (pathname.length > 1 && isStaticOrInternalRequest(pathname)) {
+  // Uses the already-computed flags (no second regex/prefix walk per request).
+  if (pathname.length > 1 && flags.isStatic) {
     const response = await resolve(event);
-    response.headers.set("Cache-Control", "public, max-age=31536000, immutable");
-    if (pathname.startsWith("/files/")) {
-      const { MEDIA_RESOURCE_HEADERS } = await import("@utils/security-constants");
-      for (const [key, value] of Object.entries(MEDIA_RESOURCE_HEADERS)) {
-        response.headers.set(key, value);
+    // Clone headers — resolve() Responses can be immutable
+    const out = withMutableHeaders(response, (headers) => {
+      headers.set("Cache-Control", "public, max-age=31536000, immutable");
+      if (pathname.startsWith("/files/")) {
+        for (const [key, value] of Object.entries(MEDIA_RESOURCE_HEADERS)) {
+          headers.set(key, value);
+        }
       }
-    }
-    if (dev) logRequest(event, performance.now() - requestStart, response.status);
-    return response;
+    });
+    if (dev) logRequest(event, performance.now() - requestStart, out.status);
+    return out;
   }
 
   // ── 0a. TERMINAL TEST BYPASS ──────────────────────────────────────────
@@ -245,7 +273,12 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
 
             if (user && user._id) {
               (event.locals as any).user = user;
-              (event.locals as any).tenantId = user.tenantId || null;
+              // Allow x-test-tenant-id header to override the user's default tenant
+              // for tenant-isolation integration tests (e.g. bulk-seed under tenant A/B).
+              const testTenantHeader =
+                event.request.headers.get("x-test-tenant-id") ||
+                event.request.headers.get("x-tenant-id");
+              (event.locals as any).tenantId = testTenantHeader || user.tenantId || null;
               if (!IS_BENCHMARK) logger.debug(`[Turbo] Resolved REAL user: ${user.email}`);
             }
           } catch {
@@ -274,7 +307,9 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
 
           // 🚀 TENANT SYNC: Extract tenantId from header if provided (critical for benchmarks)
           const headerTenant =
-            event.request.headers.get("x-tenant-id") || event.request.headers.get("X-Tenant-Id");
+            event.request.headers.get("x-tenant-id") ||
+            event.request.headers.get("x-test-tenant-id") ||
+            event.request.headers.get("X-Tenant-Id");
           (event.locals as any).tenantId = headerTenant || null;
 
           if (!IS_BENCHMARK) {
@@ -295,7 +330,9 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
       // Benchmarks inject a real user but still run the FULL middleware chain
       // (rate limiting, RBAC, audit logging) for honest performance measurement.
       if (!IS_BENCHMARK && event.request.headers.get("x-test-security") !== "true") {
-        (event.locals as any).__testBypass = true;
+        if (event.locals.user) {
+          (event.locals as any).__testBypass = true;
+        }
       }
 
       // If it's a health check, return the health response (shared builder)
@@ -357,21 +394,6 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
 
   // Base security header map
   const baseHeaderMap = BASE_HEADERS;
-
-  // ── 1. STATIC ASSET DELEGATION ───────────────────────────────────────────
-  // Must include /files/ (uploaded media) — see isStaticOrInternalRequest().
-  if (pathname.length > 1 && isStaticOrInternalRequest(pathname)) {
-    const response = await resolve(event);
-    response.headers.set("Cache-Control", "public, max-age=31536000, immutable");
-    if (pathname.startsWith("/files/")) {
-      const { MEDIA_RESOURCE_HEADERS } = await import("@utils/security-constants");
-      for (const [key, value] of Object.entries(MEDIA_RESOURCE_HEADERS)) {
-        response.headers.set(key, value);
-      }
-    }
-    if (dev) logRequest(event, performance.now() - requestStart, response.status);
-    return response;
-  }
 
   try {
     // ── 2. STATE DISCOVERY (ONE-TIME) ────────────────────────────────────────
@@ -523,8 +545,12 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
         return restrictedResponse("FAILED", isApiRoute, baseHeaderMap);
       }
     } else if (systemState.overallState === "FAILED" && !pathname.includes("/health")) {
-      const response = restrictedResponse("FAILED", isApiRoute, baseHeaderMap);
-      response.headers.set("X-Request-ID", requestId.toString());
+      const response = withMutableHeaders(
+        restrictedResponse("FAILED", isApiRoute, baseHeaderMap),
+        (headers) => {
+          headers.set("X-Request-ID", requestId.toString());
+        },
+      );
       if (dev) logRequest(event, performance.now() - requestStart, response.status);
       return response;
     }
@@ -589,19 +615,24 @@ export const handleTurboPipeline: Handle = async ({ event, resolve }) => {
 
     // ── 10. POST-RESOLVE: Security Headers + Static Asset Caching ──────────
     // Consolidated here to reduce Promise chain depth by 2 hooks.
-    if (!STATIC_ASSET_REGEX.test(pathname)) {
-      applyAllSecurityHeaders(response.headers, isHttps, origin, pathname);
-    } else {
-      response.headers.set("Cache-Control", "public, max-age=31536000, immutable");
-    }
+    // Always clone headers — resolve() Responses are often immutable.
+    const out = withMutableHeaders(response, (headers) => {
+      if (!STATIC_ASSET_REGEX.test(pathname)) {
+        applyAllSecurityHeaders(headers, isHttps, origin, pathname);
+      } else {
+        headers.set("Cache-Control", "public, max-age=31536000, immutable");
+      }
+      headers.set("X-Request-ID", requestId.toString());
+    });
 
-    if (dev) logRequest(event, performance.now() - requestStart, response.status);
-    return response;
+    if (dev) logRequest(event, performance.now() - requestStart, out.status);
+    return out;
   } catch (err: unknown) {
     if (isRedirect(err) || isHttpError(err)) throw err;
     logger.error(`[Turbo] Pipeline error:`, err);
     const fallback = boundaryResponse(err, isHttps);
-    fallback.headers.set("X-Request-ID", requestId.toString());
-    return fallback;
+    return withMutableHeaders(fallback, (headers) => {
+      headers.set("X-Request-ID", requestId.toString());
+    });
   }
 };

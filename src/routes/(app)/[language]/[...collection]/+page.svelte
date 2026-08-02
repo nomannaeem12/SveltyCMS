@@ -17,13 +17,17 @@ This page dynamically switches between List views and Field editors based on the
 - Save or Cancel edits (triggers auto-save/draft logic).
 -->
 <script lang="ts">
-import AdminPageShell from "@components/admin-page-shell.svelte";
 import EntryList from "@src/components/collection-display/entry-list.svelte";
 import Fields from "@src/components/collection-display/fields.svelte";
 import WorkflowActions from "@src/components/collection-display/workflow-actions.svelte";
 import type { Schema } from "@src/content/types";
 import { collections } from "@src/stores/collection-store.svelte";
 import { widgets } from "@src/stores/widget-store.svelte";
+
+function getCsrfToken(): string {
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+  return match ? match[1] : '';
+}
 import { app, validationStore } from "@src/stores/store.svelte.ts";
 import { logger } from "@utils/logger";
 import { parseURLToMode } from "@utils/navigation";
@@ -44,6 +48,8 @@ interface PageData {
 		pageSize: number;
 	};
 	revisions: any[];
+	statusFacets?: Record<string, number>;
+	listMetrics?: Record<string, unknown> | null;
 }
 
 const { data }: { data: PageData } = $props();
@@ -95,7 +101,6 @@ $effect.pre(() => {
 
 		// Initialize validation for all required fields
 		const fields = collectionSchema.fields || [];
-		let errorCount = 0;
 		for (const field of fields) {
 			const fieldDef = field as any;
 			if (fieldDef.required) {
@@ -104,25 +109,13 @@ $effect.pre(() => {
 					fieldName,
 					`${fieldDef.label || fieldName} is required`,
 				);
-				errorCount++;
-				console.log(
-					"🔴 [Validation Init] Set error for required field:",
-					fieldName,
-				);
 			}
 		}
 
 		validationInitialized = true;
-		console.log(
-			"✅ [Validation Init] Initialized",
-			errorCount,
-			"required field errors, isValid:",
-			validationStore.isValid,
-		);
 	} else if (createParam !== "true") {
 		// Reset flag when leaving create mode
 		if (validationInitialized) {
-			console.log("🔄 [Validation Init] Resetting validation flag");
 			validationInitialized = false;
 		}
 	}
@@ -229,10 +222,6 @@ $effect(() => {
 
 	// CASE 1: Initial page load with ?edit=id
 	if (!hasInitiallyLoaded && editParam && entries && entries.length === 1) {
-		console.log("✅ [Debug Case 1] Edit mode detected", {
-			editParam,
-			entriesLen: entries.length,
-		});
 		hasInitiallyLoaded = true;
 		lastEditParam = editParam;
 		const entryData = entries[0];
@@ -246,15 +235,6 @@ $effect(() => {
 		initialCollectionValue = JSON.stringify(entryData);
 		lastUrlString = currentUrl;
 		return; // Exit early to avoid triggering URL change logic
-	}
-	if (!hasInitiallyLoaded && editParam) {
-		console.log("❌ [Debug Case 1] Failed condition", {
-			hasInitiallyLoaded,
-			editParam,
-			entriesExist: !!entries,
-			entriesLen: entries?.length,
-			entry0: entries?.[0],
-		});
 	}
 
 	// CASE 1b: Initial page load with ?create=true
@@ -435,6 +415,7 @@ async function autoSaveDraft(): Promise<boolean> {
 			method,
 			headers: {
 				"Content-Type": "application/json",
+				"X-CSRF-Token": getCsrfToken(),
 			},
 			body: JSON.stringify({
 				data: draftData,
@@ -531,18 +512,10 @@ beforeNavigate(async ({ cancel }) => {
 
 <svelte:head><title>{collectionSchema?.name ?? 'Collection'} - SveltyCMS</title></svelte:head>
 
-<AdminPageShell
-		title={collectionSchema?.name ?? 'Collection'}
-		icon={collectionSchema?.icon ?? 'bi:collection'}
-		fullHeight={true}
-		animate={false}
-		showBackButton={true}
-		backUrl="/"
-	>
 <div class="content min-h-0 flex-1">
 	<!-- Auto-save indicator -->
 	{#if isSavingDraft}
-		<div class="fixed end-4 top-20 z-50 flex items-center gap-2 rounded bg-warning-500 px-4 py-2 text-white shadow-lg">
+		<div class="fixed inset-e-4-4 top-20 z-50 flex items-center gap-2 rounded bg-warning-500 px-4 py-2 text-white shadow-lg">
 			<div class="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
 			<span class="text-sm font-medium">Auto-saving draft...</span>
 		</div>
@@ -565,7 +538,14 @@ beforeNavigate(async ({ cancel }) => {
 	{:else if collections.mode === 'view' || collections.mode === 'modify'}
 		<!-- Key block forces EntryList to remount when collection changes -->
 		{#key collectionSchema?._id}
-			<EntryList {entries} {pagination} contentLanguage={serverContentLanguage} />
+		{@const listMetrics = data?.listMetrics as { count: number; hitRate: number; p50Ms: number; p95Ms: number; avgMs: number; } | null ?? null}
+			<EntryList
+				{entries}
+				{pagination}
+				contentLanguage={serverContentLanguage}
+				statusFacets={data?.statusFacets ?? {}}
+				{listMetrics}
+			/>
 		{/key}
 	{:else if ['edit', 'create'].includes(collections.mode)}
 		<div id="fields_container" class="fields max-h-[calc(100vh-100px)] overflow-y-auto overflow-x-visible max-md:max-h-[calc(100vh-120px)] space-y-6">
@@ -579,5 +559,4 @@ beforeNavigate(async ({ cancel }) => {
 			<Fields fields={collections.active.fields} {revisions} contentLanguage={serverContentLanguage} />
 		</div>
 	{/if}
-</div>
-</AdminPageShell>
+	</div>

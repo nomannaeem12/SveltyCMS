@@ -6,11 +6,19 @@
 
 <script lang="ts">
 import AdminPageShell from "@components/admin-page-shell.svelte";
+import Slot from "@components/system/slot.svelte";
 import PermissionGuard from "@src/components/permission-guard.svelte";
 import { collections } from "@src/stores/collection-store.svelte";
 import { ui } from "@src/stores/ui-store.svelte.ts";
 import { onMount } from "svelte";
 import { fade, fly } from "svelte/transition";
+import { page } from "$app/state";
+
+let { data } = $props();
+
+const showTenantsTile = $derived(
+	(page.data.isMultiTenant as boolean) && data.isAdmin && !page.data.tenantId,
+);
 
 onMount(() => {
 	collections.setCollection(null);
@@ -45,18 +53,19 @@ const configItems = [
 		},
 	},
 	{
-		id: "appearance",
-		href: "/config/appearance",
-		label: "Appearance",
-		icon: "mdi:palette-outline",
-		iconColor: "",
+		id: "tenants",
+		href: "/admin/tenants",
+		label: "Tenants",
+		icon: "mdi:office-building",
+		iconColor: "text-tertiary-500",
+		visible: () => showTenantsTile,
 		permission: {
-			contextId: "config:appearance",
-			name: "Appearance",
-			description: "Admin theme, density, and visual customization",
+			contextId: "config:settings",
+			name: "Tenant Management",
+			description: "Manage multi-tenant workspaces and provisioning",
 			requiredRole: "admin",
 			action: "manage",
-			contextType: "configuration",
+			contextType: "system",
 		},
 	},
 	{
@@ -68,9 +77,9 @@ const configItems = [
 		permission: {
 			contextId: "config:appearance",
 			name: "Design System",
-			description: "Interactive native UI component playground",
+			description: "Appearance, themes, personal overrides, density, and live component preview",
 			requiredRole: "admin",
-			action: "view",
+			action: "manage",
 			contextType: "configuration",
 		},
 	},
@@ -285,12 +294,12 @@ const configItems = [
 	<h2 class="h2 mb-4 text-center font-bold text-tertiary-600 dark:text-primary-500" in:fly={{ y: -10, duration: 300 }}>Manage your system configuration</h2>
 
 	<div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-		{#each configItems as item, idx (item.id || item.label)}
+		{#each configItems.filter((item) => !('visible' in item) || item.visible?.()) as item, idx (item.id || item.label)}
 			{const usePermissionGuard = !!item.permission}
 
 			{#if usePermissionGuard}
 				<div in:fly={{ y: 20, delay: idx * 50, duration: 300 }}>
-				<PermissionGuard config={item.permission}>
+				<PermissionGuard {...({ config: item.permission } as any)}>
 					<a
 						href={item.href}
 						class="flex h-24 flex-col items-center justify-center gap-2 rounded border border-surface-200 bg-white p-2 text-center shadow-sm transition-all duration-300 ease-out hover:-translate-y-1 hover:border-tertiary-500 hover:bg-primary-50 hover:shadow-xl  dark:bg-surface-800 dark:hover:border-tertiary-500 dark:border-primary-500 dark:hover:bg-surface-700 lg:h-32"
@@ -336,6 +345,31 @@ const configItems = [
 				</div>
 			{/if}
 		{/each}
+
+		<!-- Plugin config_grid slots (each plugin supplies its own tile GUI) -->
+		<div class="contents" in:fly={{ y: 20, delay: configItems.length * 50, duration: 300 }}>
+			<PermissionGuard {...({
+				config: {
+				contextId: "config:extensions",
+				name: "Plugin Extensions",
+				description: "Plugin-owned config tiles and tools",
+				requiredRole: "admin",
+				action: "manage",
+				contextType: "configuration",
+			}} as any)}>
+				<Slot
+					name="config_grid"
+					inline={true}
+					props={{
+						pluginStates: data?.pluginStates ?? {},
+						isPro: false,
+						enabled: data?.pluginStates?.['smart-importer'] ?? true,
+					}}
+				/>
+			</PermissionGuard>
+		</div>
+
+		<Slot name="config" props={{ pluginStates: data?.pluginStates ?? {} }} />
 	</div>
 </div>
 </AdminPageShell>

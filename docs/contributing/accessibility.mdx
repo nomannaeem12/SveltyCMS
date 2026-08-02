@@ -1,191 +1,182 @@
 ---
-path: docs/contributing/accessibility.mdx
-title: Accessibility Guide
-description: Validating and maintaining accessibility standards in SveltyCMS.
+path: "docs/contributing/accessibility.mdx"
+title: "Accessibility Guide"
+description: "Validating and maintaining accessibility standards in SveltyCMS."
 order: 3
-icon: mdi:human-wheelchair
+icon: "mdi:human-wheelchair"
 author: "SveltyCMS Team"
-created: 2026-01-27
-updated: "2026-06-21"
+created: "2026-01-27"
+updated: "2026-07-15"
 tags:
-  - accessibility
-  - wcag
-  - atag
-  - guide
+  - "accessibility"
+  - "wcag"
+  - "atag"
+  - "guide"
+  - "css-ui"
+  - "cursor"
 ---
 
-# Accessibility Guide
+## Standards Compliance
 
-SveltyCMS strives to be accessible to all users. We strictly enforce **WCAG 2.2 AA** for compliance testing, but we **always aim for WCAG 3.0 (Functional Performance)** principles. This means prioritizing the actual human experience—cognitive load, error recovery, and clear navigation—over simple checkbox compliance.
+SveltyCMS targets **WCAG 2.2 AA** and **ATAG 2.0** compliance, with
+forward-looking alignment to **WCAG 3.0 Functional Performance** standards.
+All interactive components must be keyboard-navigable, ARIA-compliant, and
+respect user preferences for motion and contrast.
 
-## WCAG 3.0 First: Cognitive & Functional Focus
+## Cursor Semantics (CSS3-UI)
 
-When building features, ask "Does this work for everyone?" before "Does it pass the validator?".
+Per the [CSS Basic User Interface Module Level 3 (CSS3-UI)](https://www.w3.org/TR/css-ui-3/#cursor),
+the `cursor` property defines visual pointers for pointing devices. The
+predefined cursor values have specific semantic meanings that must be
+respected:
 
-- **Clear Language**: Use plain English. Avoid jargon.
-- **Error Prevention**: Help users fix mistakes (e.g., "Password must contain..." instead of "Invalid password").
-- **Consistent Navigation**: predictable patterns across the app.
+| Cursor value        | Meaning (per spec)                         | Correct usage                                        |
+| ------------------- | ------------------------------------------ | ---------------------------------------------------- |
+| `pointer`           | Indicates a **link**                       | `<a>` elements, navigation items that act as links   |
+| `default`           | Platform-dependent default (arrow)         | Buttons, form controls, generic interactive elements |
+| `auto`              | UA determines context (text over editable) | All other elements (browser default)                 |
+| `text`              | Indicates selectable text                  | Text nodes, content areas                            |
+| `not-allowed`       | Action will not be carried out             | Disabled controls                                    |
+| `wait`              | Program is busy, user should wait          | Loading states                                       |
+| `grab` / `grabbing` | Something can be / is being dragged        | Drag handles, reorderable items                      |
 
-## WCAG 2.2 AA Checklist
+### Implementation rules
 
-When developing new features, ensure:
+- **Never** use `cursor: pointer` on `<button>` elements. The CSS3-UI spec
+  defines `pointer` exclusively for links. Buttons use the default cursor.
+  The browser already applies `cursor: pointer` to `<a>` elements via its
+  default UA stylesheet — the `btn` class should not override this.
+- **Only** use `cursor: pointer` on `<a>` elements or elements styled to
+  behave as navigation links.
+- Use `cursor: grab` / `cursor: grabbing` for draggable items (e.g. widget
+  field reordering in the Collection Builder).
+- Disabled controls must use `cursor: not-allowed` to signal non-interactivity.
 
-- [ ] **Color Contrast**: Text has at least 4.5:1 contrast against its background. Large text (18pt+ or 14pt+ bold) needs 3:1.
-- [ ] **Keyboard Navigation**: All interactive elements are reachable and operable via keyboard.
-  - Focus order is logical.
-  - Focus indicators are visible (do not remove `outline` without replacement).
+### Rationale
 
-### Keyboard Navigation and Hotkeys
+Screen reader and switch-device users do not see the cursor, so the
+distinction primarily affects sighted mouse users. However, using the
+correct cursor provides consistent affordances:
 
-SveltyCMS includes a global hotkey system built into `src/utils/hotkeys.ts` to improve navigation and task efficiency, especially for power users and those relying on keyboard navigation.
+- Sighted users learn that `pointer` means "this navigates somewhere"
+  (a link), while `default` means "this performs an action" (a button).
+- Misusing `pointer` on buttons erodes this learned distinction and
+  creates a poor UX for users who rely on visual cues.
 
-### Guidelines for Hotkeys
+## Focus Indicators
 
-- **Discoverability**: When implementing a hotkey for a specific action (like Save or Delete), ensure the corresponding button indicates the shortcut via the `aria-keyshortcuts` attribute or in a tooltip.
-- **Cross-Platform**: The `Mod` modifier automatically maps to `Ctrl` on Windows/Linux and `Cmd` (⌘) on macOS.
-- **Conflict Prevention**: Global hotkeys must not interfere with native browser commands or typing in form fields. The hotkey system automatically ignores events originating from `INPUT`, `TEXTAREA`, `SELECT`, and `contenteditable` elements.
+Every interactive element must show a visible focus indicator when focused
+via keyboard (`:focus-visible`). The project standard is a 2px ring with
+2px offset:
 
-#### Common Standard Shortcuts
+```css
+/* Applied via Tailwind in component classes */
+focus-visible:outline-none
+focus-visible:ring-2
+focus-visible:ring-offset-2
+focus-visible:ring-surface-500
+dark:focus-visible:ring-surface-300
+```
 
-Please adhere to the following standard patterns when adding new hotkeys to SveltyCMS:
+### Requirements
 
-| Action             | Shortcut(s)       | Platforms | Notes / Rationale                        |
-| :----------------- | :---------------- | :-------- | :--------------------------------------- |
-| **Save**           | `Mod + S`         | All       | Universal save (Global, Editor, Builder) |
-| **Cancel / Close** | `Escape`          | All       | Standard for modals, dialogs, and tools  |
-| **Delete**         | `Delete`          | All       | Remove selected items or fields          |
-| **Undo**           | `Mod + Z`         | All       | Native browser + Image Editor standard   |
-| **Redo**           | `Mod + Shift + Z` | All       | Standard pairing with undo               |
-| **Duplicate**      | `Mod + D`         | All       | Clone selected field (BuzzForm)          |
-| **Next Step**      | `Mod + Enter`     | All       | Advance in Steppers / Finish Widget      |
-| **Search**         | `Mod + F`         | All       | Focus search input (Media Gallery)       |
-| **Select All**     | `Mod + A`         | All       | Select all items in current view         |
-| **Open Library**   | `Mod + O`         | All       | Open Media Library (Upload Widget)       |
-| **Help**           | `?`               | All       | Open hotkey cheatsheet                   |
+- **Never** use `outline: none` or `outline: 0` without providing an
+  alternative focus indicator (violates WCAG 2.4.7 Focus Visible).
+- Use `:focus-visible` rather than `:focus` to avoid showing the ring on
+  mouse click, which reduces visual noise for pointing-device users while
+  preserving it for keyboard users.
+- The focus ring must have a contrast ratio of at least **3:1** against
+  the adjacent background (WCAG 2.4.13 Focus Appearance, Level AA).
+- Ensure focus indicators are visible in both light and dark themes.
 
-Example usage:
+## Interactive States
+
+All interactive components should provide visual feedback for the
+following states, using only compositor-friendly properties (transform,
+opacity, filter) to avoid layout thrash:
+
+| State            | Effect                                 | Example                                    |
+| ---------------- | -------------------------------------- | ------------------------------------------ |
+| `:hover`         | `brightness(1.10)` or equivalent lift  | `hover:brightness-110`                     |
+| `:active`        | `scale(0.98)` + slight dim             | `active:scale-[0.98] active:brightness-95` |
+| `:focus-visible` | 2px ring                               | `focus-visible:ring-2`                     |
+| `:disabled`      | `opacity(0.6)` + `cursor: not-allowed` | `opacity-60 cursor-not-allowed`            |
+
+## Motion & Animation
+
+Respect user preferences for reduced motion:
 
 ```svelte
-<button
-	onclick={handleSave}
-	aria-keyshortcuts="Mod+S"
-	aria-label="Save changes (Mod+S)"
->
-	Save
-</button>
+<!-- Use Svelte transitions conditionally -->
+{#if !$prefersReducedMotion}
+  <div in:fly={{ x: 20 }}>
+{/if}
 ```
 
-```
-import { registerHotkey } from "@src/utils/hotkeys";
-import { onMount } from "svelte";
+- Wrap animated elements with a `prefers-reduced-motion` media query or
+  use Tailwind's `motion-reduce:` prefix to disable non-essential animation.
+- Progress bars and loading spinners are considered essential and should
+  continue regardless of motion preference.
+- Toast animations should degrade gracefully (fade instead of fly).
 
-onMount(() => {
-  registerHotkey(
-    "mod+s",
-    () => {
-      handleSave();
-    },
-    "Save changes",
-  );
-});
-```
+## Color & Contrast
 
-- [ ] **Screen Reader Support**:
-  - Interactive elements have accessible names (`aria-label`, `aria-labelledby`, or visible text).
-  - **CRITICAL — Svelte Attribute Placement**: `aria-label`, `role`, `type`, and all HTML attributes MUST be on the **opening tag** of the element. Placing an attribute string between child elements in a Svelte template renders it as **visible plaintext**, not as an HTML attribute.
-    - ✅ `<button aria-label="Save" onclick={...}><icon/> Save</button>`
-    - ❌ `<button onclick={...}><icon/> aria-label="Save" Save</button>` — "aria-label=\"Save\"" appears as visible text in the browser
-  - Status changes are announced via `aria-live` regions.
-  - Page structure uses HTML5 landmarks (`<main>`, `<nav>`, `<aside>`, `<header>`, `<footer>`).
-- [ ] **Forms**:
-  - All inputs have associated labels (`<label for="...">`).
-  - Error messages are associated with inputs via `aria-describedby`.
-  - Required fields are marked with `required` or `aria-required="true"`.
+- All text must meet **4.5:1** contrast ratio (WCAG 1.4.3, Level AA).
+- Large text (≥18px bold or ≥24px regular) must meet **3:1**.
+- Focus indicators must meet **3:1** against adjacent background.
+- Use `dark:` variants for all color tokens to ensure dark mode compliance.
+- Interactive states (hover, active) using `brightness()` or `opacity`
+  must not reduce contrast below the minimum thresholds.
 
-## Future-Proofing: WCAG 3.0 (Draft)
+## Keyboard Navigation
 
-While **WCAG 2.2 AA** is our current strict compliance target, SveltyCMS aspires to the emerging **WCAG 3.0** principles (Functional Performance). To support this modernization:
+- All interactive elements must be reachable and operable via keyboard.
+- Use native `<button>`, `<a>`, `<input>`, and `<select>` elements
+  wherever possible — they provide keyboard semantics for free.
+- Custom interactive components must include `role`, `tabindex`, and
+  keyboard event handlers (Enter/Space for activation, Arrow keys for
+  directional navigation).
+- Tab order must follow a logical DOM sequence (`tabindex` should only
+  be 0 or -1; never use positive values).
 
-- **Focus on functional outcomes**, not just technical pass/fail. Does the feature _work_ for users with disabilities?
-- **Cognitive Accessibility**: Pay extra attention to clear language, consistent navigation, and error prevention, which are emphasized more heavily in WCAG 3.0.
-- **Holistic Rating**: We aim for an overall accessible experience, prioritizing critical user flows (Login, Content Creation, Setup).
+## ARIA
 
-## Progressive Timeout Warning System (Cognitive Load Mitigation)
-
-To prevent cognitive strain and anxiety caused by time constraints (e.g., security session expirations or setup wizard steps), SveltyCMS implements a **Progressive Timeout Warning System**:
-
-1. **Phase 1 (Pre-expiry Warning):** Warns the user when 25% of the session time remains (e.g., "Your session will expire in 15 minutes. Save your changes to avoid losing progress.").
-2. **Phase 2 (Critical Alert):** Shows a persistent alert modal at 5 minutes remaining, allowing the user to extend the session with a single click or keyboard shortcut.
-3. **Phase 3 (Graceful Termination):** Gracefully redirects the user to the log-out screen, preserving any local drafts where possible.
-
-### Implementation Checklist:
-
-- Communicate time-remaining alerts programmatically via `aria-live="polite"` or `aria-live="assertive"`.
-- Buttons to extend timeouts must be keyboard-accessible (reachable via `Tab` and triggerable via `Enter`/`Space`).
-
-## ATAG 2.0 (Authoring Tool) Requirements
-
-Since SveltyCMS is an authoring tool (CMS), we must support authors with disabilities:
-
-1.  **Accessible UI**: The admin interface itself must be accessible (covered by WCAG).
-2.  **Support Accessible Content Creation**:
-    - Prompt users to add alt text for images.
-    - Ensure generated content relies on semantic HTML.
-    - Preserve accessibility information when pasting/importing content.
-
-## Setup Wizard Specific Patterns
-
-The Setup Wizard (`src/routes/setup`) uses specific patterns for accessibility:
-
-### Live Regions
-
-Use `aria-live="polite"` for status messages that appear dynamically without page reload.
-
-```
-<div aria-live="polite" aria-atomic="true">
-	{#if message}{message}{/if}
-</div>
-```
-
-### Focus Management
-
-When using multi-step forms or wizards, move focus programmatically to the new content container when the step changes. This ensures screen reader users are aware of the new context.
-
-```
-import { tick } from "svelte";
-
-async function nextStep() {
-  currentStep++;
-  await tick();
-  document.getElementById("step-content")?.focus();
-}
-```
-
-### Modals
-
-Modals must:
-
-- Have `role="dialog"` and `aria-modal="true"`.
-- Trap focus within the modal.
-- Close on `Escape` key.
-- Return focus to the trigger element on close.
+- Every interactive element must have an accessible name via
+  `aria-label`, `aria-labelledby`, or visible text content.
+- Use `aria-live="polite"` for dynamic content updates (toasts, loading
+  states).
+- Use `aria-atomic="true"` when the entire region should be read on
+  update.
+- Use `role="alert"` for time-sensitive messages that should interrupt
+  the screen reader.
+- Landmarks (`role="region"`, `role="navigation"`, etc.) must have
+  descriptive `aria-label` values.
 
 ## Testing
 
-Before submitting PRs:
+Run the accessibility audit suite before shipping:
 
-1.  **Keyboard Test**: Tab through the interface. Can you do everything without a mouse?
-2.  **Zoom Test**: Zoom to 200%. Does the layout break?
-3.  **Dark Mode Contrast Test**: Toggle dark mode and verify:
-    - All text has ≥4.5:1 contrast (use DevTools → Rendering → CSS Overview, or Lighthouse).
-    - Selected/active states preserve readable text (no invisible icons or unreadable labels).
-    - Outline buttons and low-opacity text remain legible.
-4.  **Automated Test**: Run any available accessibility linters or audit tools (e.g., Lighthouse, Axe).
+```bash
+# Playwright accessibility tests
+bun run test:e2e -- --grep accessibility
 
----
+# Visual regression tests (catches contrast/positioning regressions)
+bun run test:e2e -- --grep visual-regression
+```
 
-## Related
+Reference files:
 
-- [Documentation Standards](./contributing-docs.mdx)
-- [GUI Styling Guide](./style-guide-gui.mdx)
-- [Security Overview](../architecture/security/index.mdx)
+- `tests/e2e/accessibility.spec.ts` — WCAG audit
+- `tests/e2e/visual-regression.spec.ts` — Visual regression
+- `tests/e2e/branding.spec.ts` — Multi-tenancy contrast checks
+- `docs/tests/accessibility-audit.mdx` — Audit methodology
+
+## References
+
+| Specification                           | Link                             |
+| --------------------------------------- | -------------------------------- |
+| CSS Basic User Interface Module Level 3 | https://www.w3.org/TR/css-ui-3/  |
+| WCAG 2.2                                | https://www.w3.org/TR/WCAG22/    |
+| WCAG 3.0 (draft)                        | https://www.w3.org/TR/wcag-3.0/  |
+| ATAG 2.0                                | https://www.w3.org/TR/ATAG20/    |
+| ARIA Authoring Practices                | https://www.w3.org/WAI/ARIA/apg/ |

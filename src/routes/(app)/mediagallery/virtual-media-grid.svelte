@@ -12,7 +12,7 @@ Features:
 import type { MediaBase, MediaImage } from "@utils/media/media-models";
 import { formatBytes } from "@utils/utils";
 import { onMount } from "svelte";
-import type { SvelteSet } from "svelte/reactivity";
+import { SvelteSet } from "svelte/reactivity";
 	import Button from '@components/ui/button.svelte';
 
 interface Props {
@@ -20,6 +20,7 @@ interface Props {
 	gridSize?: "tiny" | "small" | "medium" | "large";
 	isSelectionMode?: boolean;
 	selectedFiles: SvelteSet<string>;
+	publishedMediaIds?: SvelteSet<string>;
 	onEditImage?: (file: MediaImage) => void;
 	onOpenFileDetails?: (file: MediaBase | MediaImage) => void;
 }
@@ -29,6 +30,7 @@ let {
 	gridSize = "medium",
 	isSelectionMode = false,
 	selectedFiles = $bindable(),
+	publishedMediaIds = $bindable(new SvelteSet<string>()),
 	onEditImage = () => {},
 	onOpenFileDetails = () => {},
 }: Props = $props();
@@ -99,7 +101,7 @@ onMount(() => {
 		style:height="{totalRows * itemHeight}px"
 	>
 		<div
-			class="absolute top-0 start-0 w-full grid gap-4 p-4"
+			class="absolute top-0 inset-s-0 w-full grid gap-4 p-4"
 			style:transform="translateY({startRow * itemHeight}px)"
 			style:grid-template-columns="repeat({itemsPerRow}, 1fr)"
 		>
@@ -128,7 +130,7 @@ onMount(() => {
 				>
 					<!-- Selection Overlay -->
 					{#if isSelectionMode || isSelected}
-						<div class="absolute start-2 top-2 z-20">
+						<div class="absolute inset-s-2 top-2 z-20">
 							<div class="h-6 w-6 rounded-full bg-white shadow-md flex items-center justify-center">
 								<input aria-label="Input"
 									type="checkbox"
@@ -144,7 +146,7 @@ onMount(() => {
 					<!-- Main Preview -->
 					<div class="relative flex-1 bg-surface-100 dark:bg-surface-800 overflow-hidden">
 						{#if file.type === 'image'}
-							<img src={file.url} alt="" class="h-full w-full object-cover" loading="lazy" />
+							<img src={file.url} alt="" class="h-full w-full object-cover" loading="lazy" crossorigin="anonymous" />
 						{:else}
 							<div class="h-full w-full flex items-center justify-center opacity-30">
 								<iconify-icon icon="mdi:file-document-outline" width={48}></iconify-icon>
@@ -152,7 +154,7 @@ onMount(() => {
 						{/if}
 
 						<!-- Action Dock (Hover) -->
-						<div class="absolute end-2 top-2 z-30 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+						<div class="absolute inset-e-2 top-2 z-30 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
 							<Button variant="ghost"
 								onclick={(e: MouseEvent) => { e.stopPropagation(); onEditImage(file as MediaImage); }}
 								aria-label="Edit {file.filename}"
@@ -165,7 +167,7 @@ onMount(() => {
 					<!-- Footer -->
 					<div class="p-2 border-t border-surface-100 dark:border-surface-800">
 						<div class="truncate text-[10px] font-bold uppercase tracking-tighter opacity-60 mb-0.5">{file.filename}</div>
-						<div class="text-[9px] font-mono opacity-40">{formatBytes(file.size)}</div>
+						<div class="text-[9px] font-mono opacity-40">{formatBytes((file as MediaImage).size)}</div>
 					</div>
 				</div>
 			{/each}

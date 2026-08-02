@@ -1,34 +1,33 @@
 /**
  * @file src/utils/media/media-storage.server.ts
- * @description Core media storage (local + cloud) with resizing & avatar handling
+ * @description Core media storage operations, delegating to the unified StorageAdapter interface.
  *
  * Features:
- * - Unified local/cloud save/delete
- * - Sharp-based resizing
- * - Avatar processing (200x200)
- * - Safe path handling
- * - No DB logic
+ * - Resizing (sharp)
+ * - Avatar processing
+ * - Video thumbnail capturing (ffmpeg)
+ * - PDF thumbnail generation (imagemagick)
  */
 
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeFileSync, readFileSync, unlinkSync } from "node:fs";
-import { getPublicSettingSync } from "@src/services/core/settings-service";
-import { publicEnv } from "@src/stores/global-settings.svelte";
-import mime from "mime-types";
 import { logger } from "@utils/logger";
-
-import { exists, getConfig, getUrl, isCloud, remove, upload, download } from "./cloud-storage";
-
+import { getPublicSettingSync } from "@src/services/core/settings-service";
+import { getStorageAdapter, getConfig } from "./storage-adapters";
+import { getMimeType } from "./media-utils";
 import type { ResizedImage } from "./media-models";
+import type { SharpFactory } from "./media-processing.server";
+import { nowISODateString } from "@src/utils/date";
 
 /** Global lazy-loaded sharp instance to eliminate module resolution overhead */
-let _sharp: any = null;
-async function getSharp(): Promise<any> {
+let _sharp: SharpFactory | null = null;
+async function getSharp(): Promise<SharpFactory> {
   if (!_sharp) {
     const mod = await import("sharp");
-    _sharp = mod.default || mod;
+    _sharp = (mod.default || mod) as SharpFactory;
   }
   return _sharp;
 }
@@ -59,69 +58,32 @@ function spawnAsync(command: string, args: string[]): Promise<void> {
   });
 }
 
+/** Maximum buffer size (500MB) allowed for temp file writes. */
+const MAX_TEMP_BUFFER_SIZE = 500 * 1024 * 1024;
+
 // Image sizes
 const DEFAULT_SIZES = { sm: 600, md: 900, lg: 1200 } as const;
-export const SIZES = {
+export const SIZES: Readonly<Record<string, number>> = Object.freeze({
   ...DEFAULT_SIZES,
-  ...publicEnv.IMAGE_SIZES,
+  ...(getPublicSettingSync("IMAGE_SIZES") as Record<string, number> | undefined),
   original: 0,
   thumbnail: 200,
-};
+});
 
-/** Get configured image sizes */
-export function getImageSizes() {
+/** Get configured image sizes (returns a frozen, read-only copy). */
+export function getImageSizes(): Readonly<typeof SIZES> {
   return SIZES;
 }
 
-function resolveMediaRoot(): string {
-  return getPublicSettingSync("MEDIA_FOLDER") ?? "mediaFolder";
-}
-
-/** Save buffer or stream to storage (local or cloud) */
+/** Save buffer or stream to storage using adapter */
 export async function saveFile(
   data: Buffer | ReadableStream | import("node:stream").Readable,
   relPath: string,
 ): Promise<string> {
-  const mediaRoot = resolveMediaRoot();
-  const MEDIA_ROOT_FULL = path.resolve(process.cwd(), mediaRoot) + path.sep;
-  const fullRelPath = path.resolve(process.cwd(), mediaRoot, relPath);
-
-  if (!fullRelPath.startsWith(MEDIA_ROOT_FULL)) {
-    throw new Error("Invalid path: Potential traversal attack");
-  }
-
-  if (isCloud()) {
-    await upload(data, relPath);
-    return getUrl(relPath);
-  }
-
-  // Local
-  const fs = await import("node:fs/promises");
-  await fs.mkdir(path.dirname(fullRelPath), { recursive: true });
-
-  if (data instanceof Buffer) {
-    await fs.writeFile(fullRelPath, data);
-  } else {
-    const { createWriteStream } = await import("node:fs");
-    const { Readable } = await import("node:stream");
-    const writeStream = createWriteStream(fullRelPath);
-    const nodeStream =
-      data instanceof ReadableStream
-        ? Readable.fromWeb(data as any)
-        : (data as import("node:stream").Readable);
-
-    await new Promise((resolve, reject) => {
-      nodeStream.pipe(writeStream);
-      writeStream.on("finish", resolve);
-      writeStream.on("error", reject);
-      nodeStream.on("error", reject);
-    });
-  }
-
-  return `/files/${relPath}`;
+  return await getStorageAdapter().upload(data, relPath);
 }
 
-/** Delete file from storage */
+/** Delete file from storage using adapter */
 export async function deleteFile(url: string): Promise<void> {
   let rel = url;
 
@@ -129,46 +91,22 @@ export async function deleteFile(url: string): Promise<void> {
     rel = new URL(url).pathname;
   }
 
-  if (isCloud()) {
-    // Strip prefix if needed (cloud handles full key)
-    const cfg = getConfig();
-    if (
-      cfg &&
-      "prefix" in cfg &&
-      typeof cfg.prefix === "string" &&
-      rel.startsWith(`/${cfg.prefix}/`)
-    ) {
-      rel = rel.slice(cfg.prefix.length + 1);
-    }
-    await remove(rel);
-    return;
+  const cfg = getConfig();
+  if (
+    cfg &&
+    "prefix" in cfg &&
+    typeof cfg.prefix === "string" &&
+    rel.startsWith(`/${cfg.prefix}/`)
+  ) {
+    rel = rel.slice(cfg.prefix.length + 1);
   }
 
-  // Local
   if (rel.startsWith("/files/")) {
     rel = rel.slice(7);
   }
   rel = rel.replace(/^\/+/, "");
 
-  // Path Traversal Protection
-  const mediaRoot = resolveMediaRoot();
-  const MEDIA_ROOT_FULL = path.resolve(process.cwd(), mediaRoot) + path.sep;
-  const full = path.resolve(process.cwd(), mediaRoot, rel);
-
-  if (!full.startsWith(MEDIA_ROOT_FULL)) {
-    const { logger } = await import("@utils/logger");
-    logger.error("Attempted path traversal delete blocked", {
-      path: rel,
-      resolved: full,
-    });
-    return;
-  }
-
-  const fs = await import("node:fs/promises");
-  const fullPath = path.join(process.cwd(), resolveMediaRoot(), rel);
-  await fs.unlink(fullPath).catch(() => {
-    logger.debug("Best-effort file deletion failed silently");
-  }); // best effort
+  await getStorageAdapter().remove(rel);
 }
 
 /** Alias for backward compatibility */
@@ -177,38 +115,23 @@ export const saveAvatarImage = saveAvatar;
 export const saveFileToDisk = saveFile;
 export const saveResizedImages = saveResized;
 
-/** Check if file exists */
-export async function fileExists(rel: string): Promise<boolean> {
-  if (rel.includes("..")) return false;
-  if (isCloud()) {
-    return await exists(rel);
+/** Check if file exists using adapter (with negative caching). */
+const _fileExistsCache = new Map<string, { exists: boolean; expires: number }>();
+const FILE_EXISTS_CACHE_TTL = 10_000; // 10 seconds — stale negatives clear quickly
+
+export async function fileExists(rel: string, opts?: { refresh?: boolean }): Promise<boolean> {
+  const cached = _fileExistsCache.get(rel);
+  if (!opts?.refresh && cached && Date.now() < cached.expires) {
+    return cached.exists;
   }
-  const fs = await import("node:fs/promises");
-  const full = path.join(process.cwd(), resolveMediaRoot(), rel);
-  try {
-    await fs.access(full);
-    return true;
-  } catch {
-    return false;
-  }
+  const exists = await getStorageAdapter().exists(rel);
+  _fileExistsCache.set(rel, { exists, expires: Date.now() + FILE_EXISTS_CACHE_TTL });
+  return exists;
 }
 
-/** Get file buffer */
+/** Get file buffer using adapter */
 export async function getFile(rel: string): Promise<Buffer> {
-  if (isCloud()) {
-    return await download(rel);
-  }
-
-  const mediaRoot = resolveMediaRoot();
-  const MEDIA_ROOT_FULL = path.resolve(process.cwd(), mediaRoot) + path.sep;
-  const fullPath = path.resolve(process.cwd(), mediaRoot, rel);
-
-  if (!fullPath.startsWith(MEDIA_ROOT_FULL)) {
-    throw new Error("Invalid path: Potential traversal attack");
-  }
-
-  const fs = await import("node:fs/promises");
-  return await fs.readFile(fullPath);
+  return await getStorageAdapter().download(rel);
 }
 
 /** Resize & save image variants with multi-format optimization */
@@ -223,14 +146,17 @@ export async function saveResized(
   const baseInstance = sharp(buffer);
   const meta = await baseInstance.metadata();
 
-  const format = publicEnv.MEDIA_OUTPUT_FORMAT_QUALITY?.format ?? "original";
-  const quality = publicEnv.MEDIA_OUTPUT_FORMAT_QUALITY?.quality ?? 80;
+  const formatConfig = getPublicSettingSync("MEDIA_OUTPUT_FORMAT_QUALITY") as
+    | { format?: string; quality?: number }
+    | undefined;
+  const format = formatConfig?.format ?? "original";
+  const quality = formatConfig?.quality ?? 80;
 
   // 🚀 PREMIUM FEATURE: Multi-format generation (AVIF + WebP)
   const variants = Object.entries(SIZES).filter(([_, w]) => w > 0);
-  const results: [string, ResizedImage][] = [];
 
-  for (const [key, w] of variants) {
+  // Run all thumbnail sizes in parallel — each is an independent sharp pipeline.
+  const tasks = variants.map(async ([key, w]) => {
     const baseVariant = baseInstance.clone().resize(w, null, {
       fit: "cover",
       position: "center",
@@ -238,44 +164,61 @@ export async function saveResized(
 
     // 1. Original format (or configured default)
     let outExt = ext;
-    let mimeType = mime.lookup(ext) || "application/octet-stream";
+    let mimeType = getMimeType(`file.${ext}`) || "application/octet-stream";
     let instance = baseVariant.clone();
 
-    if (format !== "original") {
-      instance = instance.toFormat(format as "webp" | "avif", { quality });
-      outExt = format;
-      mimeType = `image/${format}`;
+    if (format === "webp") {
+      instance = instance.webp({ quality });
+      outExt = "webp";
+      mimeType = "image/webp";
+    } else if (format === "avif") {
+      instance = instance.avif({ quality });
+      outExt = "avif";
+      mimeType = "image/avif";
+    } else if (format === "jpg") {
+      instance = instance.jpeg({ quality });
+      outExt = "jpg";
+      mimeType = "image/jpeg";
     }
 
     const fileName = `${baseName}-${hash}.${outExt}`;
     const relPath = path.posix.join(baseDir, key, fileName);
-    const resizedBuf = await instance.toBuffer();
-    const url = await saveFile(resizedBuf, relPath);
 
     const height = meta.height ? Math.round((w / (meta.width ?? w)) * meta.height) : w;
 
-    results.push([
-      key,
-      {
-        url,
-        width: w,
-        height,
-        size: resizedBuf.length,
-        mimeType,
-      },
-    ]);
+    // 2. Encode primary and webp variant in parallel (independent sharp pipelines)
+    const primaryBufP = instance.toBuffer();
+    const webpBufP =
+      outExt !== "webp"
+        ? baseVariant
+            .clone()
+            .webp({ quality: Math.max(quality, 75) })
+            .toBuffer()
+        : Promise.resolve(null);
 
-    // 2. ⚡ Auto-WebP generation (if not already WebP)
-    if (outExt !== "webp") {
-      const webpBuf = await baseVariant
-        .clone()
-        .webp({ quality: Math.max(quality, 75) })
-        .toBuffer();
+    const [resizedBuf, webpBuf] = await Promise.all([primaryBufP, webpBufP]);
+
+    // 3. Save files — primary always, WebP if generated
+    const url = await saveFile(resizedBuf, relPath);
+
+    const entries: [string, ResizedImage][] = [
+      [
+        key,
+        {
+          url,
+          width: w,
+          height,
+          size: resizedBuf.length,
+          mimeType,
+        },
+      ],
+    ];
+
+    if (webpBuf) {
       const webpFileName = `${baseName}-${hash}.webp`;
       const webpRelPath = path.posix.join(baseDir, key, webpFileName);
       const webpUrl = await saveFile(webpBuf, webpRelPath);
-
-      results.push([
+      entries.push([
         `${key}_webp`,
         {
           url: webpUrl,
@@ -286,16 +229,29 @@ export async function saveResized(
         },
       ]);
     }
-  }
 
-  return Object.fromEntries(results);
+    return entries;
+  });
+
+  const nested = await Promise.all(tasks);
+  return Object.fromEntries(nested.flat());
 }
 
-/** Save avatar (200x200) */
-export async function saveAvatar(file: File, userId: string): Promise<string> {
-  const buf = Buffer.from(await file.arrayBuffer());
-  const ext = path.extname(file.name) || ".jpg";
+/** Allowed extensions for avatar uploads */
+const AVATAR_EXT_WHITELIST = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif"]);
 
+/** Save avatar (200x200) with extension validation */
+export async function saveAvatar(file: File, userId: string): Promise<string> {
+  const rawExt = path.extname(file.name).toLowerCase();
+  if (!rawExt || !AVATAR_EXT_WHITELIST.has(rawExt)) {
+    throw new Error(
+      `Invalid avatar file type: "${rawExt || "(none)"}". Allowed: ${[...AVATAR_EXT_WHITELIST].join(", ")}`,
+    );
+  }
+  // Strip leading dot and sanitize (remove any path separators or special chars)
+  const ext = "." + rawExt.replace(/^\./, "").replace(/[^a-z0-9]/g, "");
+
+  const buf = Buffer.from(await file.arrayBuffer());
   const sharp = await getSharp();
   const resized = await sharp(buf)
     .resize(200, 200, { fit: "cover", position: "center" })
@@ -309,8 +265,13 @@ export async function saveAvatar(file: File, userId: string): Promise<string> {
  * Captures a thumbnail from a video at the 1s mark using ffmpeg
  */
 export async function captureVideoThumbnail(buffer: Buffer): Promise<Buffer | null> {
-  const tempInput = path.join(os.tmpdir(), `ffmpeg-input-${Date.now()}.mp4`);
-  const tempOutput = path.join(os.tmpdir(), `ffmpeg-output-${Date.now()}.jpg`);
+  if (buffer.length > MAX_TEMP_BUFFER_SIZE) {
+    logger.error("Video buffer too large for thumbnail capture", { size: buffer.length });
+    return null;
+  }
+
+  const tempInput = path.join(os.tmpdir(), `ffmpeg-input-${crypto.randomUUID()}.mp4`);
+  const tempOutput = path.join(os.tmpdir(), `ffmpeg-output-${crypto.randomUUID()}.jpg`);
   try {
     writeFileSync(tempInput, buffer);
     // Capture frame at 1s mark
@@ -332,14 +293,12 @@ export async function captureVideoThumbnail(buffer: Buffer): Promise<Buffer | nu
     return null;
   } finally {
     try {
-      if (os.platform() !== "win32") {
-        if (tempInput) {
-          unlinkSync(tempInput);
-        }
-        if (tempOutput) {
-          unlinkSync(tempOutput);
-        }
-      }
+      unlinkSync(tempInput);
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(tempOutput);
     } catch {
       /* ignore */
     }
@@ -350,8 +309,13 @@ export async function captureVideoThumbnail(buffer: Buffer): Promise<Buffer | nu
  * Generates a thumbnail from the first page of a PDF using ImageMagick
  */
 export async function generatePdfThumbnail(buffer: Buffer): Promise<Buffer | null> {
-  const tempInput = path.join(os.tmpdir(), `pdf-input-${Date.now()}.pdf`);
-  const tempOutput = path.join(os.tmpdir(), `pdf-output-${Date.now()}.jpg`);
+  if (buffer.length > MAX_TEMP_BUFFER_SIZE) {
+    logger.error("PDF buffer too large for thumbnail generation", { size: buffer.length });
+    return null;
+  }
+
+  const tempInput = path.join(os.tmpdir(), `pdf-input-${crypto.randomUUID()}.pdf`);
+  const tempOutput = path.join(os.tmpdir(), `pdf-output-${crypto.randomUUID()}.jpg`);
   try {
     writeFileSync(tempInput, buffer);
     // Use ImageMagick (magick) to extract the first page [0] at 150 DPI
@@ -384,16 +348,141 @@ export async function generatePdfThumbnail(buffer: Buffer): Promise<Buffer | nul
     return null;
   } finally {
     try {
-      if (os.platform() !== "win32") {
-        if (tempInput) {
-          unlinkSync(tempInput);
-        }
-        if (tempOutput) {
-          unlinkSync(tempOutput);
-        }
-      }
+      unlinkSync(tempInput);
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(tempOutput);
     } catch {
       /* ignore */
     }
   }
+}
+
+// ─── Version history ─────────────────────────────────────────────────────────
+
+import type { DatabaseId, ISODateString } from "@src/content/types";
+
+export interface FileVersion {
+  _id?: DatabaseId;
+  action: "create" | "update" | "replace" | "metadata_update";
+  changes: VersionChange[];
+  createdAt: ISODateString;
+  createdBy: DatabaseId;
+  fileId: DatabaseId;
+  hash: string;
+  metadata?: { reason?: string; automated?: boolean; restorePoint?: boolean };
+  path?: string;
+  size: number;
+  versionNumber: number;
+}
+
+export interface VersionChange {
+  field: string;
+  newValue?: unknown;
+  oldValue?: unknown;
+  type: "add" | "modify" | "remove";
+}
+
+export interface VersionComparison {
+  changes: VersionChange[];
+  contentChanged: boolean;
+  fromVersion: number;
+  metadataChanged: boolean;
+  sizeDifference: number;
+  toVersion: number;
+}
+
+export function createVersion(
+  fileId: DatabaseId,
+  userId: DatabaseId,
+  action: FileVersion["action"],
+  hash: string,
+  size: number,
+  changes: VersionChange[] = [],
+  options: {
+    path?: string;
+    reason?: string;
+    automated?: boolean;
+    restorePoint?: boolean;
+    nextVersionNumber?: number;
+  } = {},
+): FileVersion {
+  return {
+    fileId,
+    versionNumber: options.nextVersionNumber ?? 1,
+    createdAt: nowISODateString() as ISODateString,
+    createdBy: userId,
+    action,
+    changes,
+    hash,
+    size,
+    path: options.path,
+    metadata: {
+      reason: options.reason,
+      automated: options.automated,
+      restorePoint: options.restorePoint,
+    },
+  };
+}
+
+export function compareVersions(
+  fromVersion: FileVersion,
+  toVersion: FileVersion,
+): VersionComparison {
+  const contentChanged = fromVersion.hash !== toVersion.hash;
+  const sizeDifference = toVersion.size - fromVersion.size;
+  const changes = contentChanged
+    ? toVersion.changes
+    : toVersion.changes.filter((c) => c.field !== "content");
+  const metadataChanged = changes.some((c) => c.field !== "content" && c.field !== "size");
+  return {
+    fromVersion: fromVersion.versionNumber,
+    toVersion: toVersion.versionNumber,
+    changes,
+    contentChanged,
+    metadataChanged,
+    sizeDifference,
+  };
+}
+
+export function detectChanges(
+  oldObj: Record<string, unknown>,
+  newObj: Record<string, unknown>,
+  excludeFields: string[] = ["_id", "updatedAt", "updatedBy", "createdAt", "createdBy"],
+): VersionChange[] {
+  const changes: VersionChange[] = [];
+  const keys = new Set([...Object.keys(oldObj), ...Object.keys(newObj)]);
+  for (const key of keys) {
+    if (excludeFields.includes(key)) continue;
+    const oldVal = oldObj[key];
+    const newVal = newObj[key];
+    if (oldVal === newVal) continue;
+    if (JSON.stringify(oldVal) === JSON.stringify(newVal)) continue;
+    if (oldVal === undefined) changes.push({ field: key, newValue: newVal, type: "add" });
+    else if (newVal === undefined) changes.push({ field: key, oldValue: oldVal, type: "remove" });
+    else changes.push({ field: key, oldValue: oldVal, newValue: newVal, type: "modify" });
+  }
+  return changes;
+}
+
+export function getVersionStats(versions: FileVersion[]) {
+  if (!versions.length) return null;
+  let totalSize = 0;
+  let contentUpdates = 0;
+  const userActivity: Record<string, number> = {};
+  for (const v of versions) {
+    totalSize += v.size;
+    if (["create", "replace", "update"].includes(v.action)) contentUpdates++;
+    userActivity[v.createdBy as string] = (userActivity[v.createdBy as string] || 0) + 1;
+  }
+  const mostActive = Object.entries(userActivity).sort((a, b) => b[1] - a[1])[0];
+  return {
+    totalVersions: versions.length,
+    totalSize,
+    avgSize: Math.round(totalSize / versions.length),
+    contentUpdates,
+    mostActiveUser: mostActive ? mostActive[0] : null,
+  };
 }

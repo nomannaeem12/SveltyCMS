@@ -30,12 +30,13 @@
 	import Button from '@components/ui/button.svelte';
 	// Import types
 	import type { SystemVirtualFolder } from '@src/databases/db-interface';
-	import { setMode } from '@src/stores/collection-store.svelte.ts';
+	import { modeTransitionGuard } from '@src/stores/mode-transition-guard.svelte';
 	// Stores
 	import { publicEnv } from '@src/stores/global-settings.svelte';
 	import { screen } from '@src/stores/screen-size-store.svelte.ts';
 	import { ui } from '@src/stores/ui-store.svelte.ts';
 	import { logger } from '@utils/logger';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	import { toast } from '@src/stores/toast.svelte.ts';
 	import { onMount } from 'svelte';
 
@@ -94,7 +95,7 @@
 		try {
 			const response = await fetch('/api/systemVirtualFolder', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({
 					name: newFolderName,
 					parent: currentFolder?._id
@@ -127,7 +128,7 @@
 		try {
 			const response = await fetch('/api/systemVirtualFolder', {
 				method: 'PATCH',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({ folderId, name: newName })
 			});
 			const result = await response.json();
@@ -149,7 +150,7 @@
 		try {
 			const response = await fetch('/api/systemVirtualFolder', {
 				method: 'DELETE',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({ folderId })
 			});
 			const result = await response.json();
@@ -175,7 +176,7 @@
 
 	// Return to Collections - handle mode switching
 	function handleReturnToCollections() {
-		setMode('view');
+		modeTransitionGuard.setMode('view');
 		handleMobileSidebarClose();
 	}
 
@@ -234,7 +235,7 @@
 							href={`/mediagallery?folderId=${folder._id}`}
 							onclick={handleMobileSidebarClose}
 							aria-label={`Open folder: ${folder.name}`}
-							class="w-full items-center space-x-2 p-2 justify-start"
+							class="w-full items-center gap-2 p-2 justify-start"
 							data-sveltekit-preload-data="hover"
 						>
 							<iconify-icon icon="bi:folder" width="28" class="text-yellow-500"></iconify-icon>

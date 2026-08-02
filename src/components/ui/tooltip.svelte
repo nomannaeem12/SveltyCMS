@@ -61,12 +61,21 @@ reveal after position calculation prevents layout flash.
 	let floatingEl = $state<HTMLElement | null>(null);
 	let arrowEl = $state<HTMLElement | null>(null);
 	let hasFocusableDescendant = $state(false);
+	const tooltipId = `tooltip-${crypto.randomUUID().slice(0, 8)}`;
 
 	const placement = $derived(positioning.placement ?? "top");
 	const gutter = $derived(positioning.gutter ?? 8);
 
+	function resolveReference(): HTMLElement | null {
+		if (!referenceEl) return null;
+		const focusable = referenceEl.querySelector(
+			'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+		) as HTMLElement | null;
+		return focusable ?? referenceEl;
+	}
+
 	const floating = useFloating({
-		reference: () => referenceEl,
+		reference: resolveReference,
 		floating: () => floatingEl,
 		arrow: () => arrowEl,
 		placement: () => placement,
@@ -79,13 +88,13 @@ reveal after position calculation prevents layout flash.
 	$effect(() => {
 		if (referenceEl) {
 			const focusable = referenceEl.querySelectorAll(
-				'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+				'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
 			);
 			hasFocusableDescendant = focusable.length > 0;
 			if (hasFocusableDescendant) {
 				for (const el of focusable) {
 					if (open) {
-						el.setAttribute('aria-describedby', 'tooltip-content');
+						el.setAttribute('aria-describedby', tooltipId);
 					} else {
 						el.removeAttribute('aria-describedby');
 					}
@@ -96,6 +105,66 @@ reveal after position calculation prevents layout flash.
 
 	const activeTabindex = $derived(hasFocusableDescendant ? undefined : (tabindex === null ? undefined : (typeof tabindex === 'string' ? parseInt(tabindex, 10) : tabindex)));
 	const activeRole = $derived(hasFocusableDescendant ? undefined : (role === null ? undefined : role));
+
+	/**
+	 * Calculate arrow position relative to the tooltip's target top-left.
+	 * Uses floating.x/y (target coordinates from useFloating) so the
+	 * calculation is correct even before the DOM paints.
+	 */
+	let arrowX = $state<number | null>(null);
+	let arrowY = $state<number | null>(null);
+	let arrowSide = $state<string>('bottom');
+
+	$effect(() => {
+		if (!open || !referenceEl || !floatingEl) {
+			arrowX = null;
+			arrowY = null;
+			return;
+		}
+
+		if (!floating.positionCalculated) {
+			arrowX = null;
+			arrowY = null;
+			return;
+		}
+
+		const ref = resolveReference();
+		if (!ref) {
+			arrowX = null;
+			arrowY = null;
+			return;
+		}
+
+		const refRect = ref.getBoundingClientRect();
+		const floatRect = floatingEl.getBoundingClientRect();
+		const [side] = (floating.placement || 'top').split('-');
+
+		// Center of the reference element
+		const targetX = refRect.left + refRect.width / 2;
+		const targetY = refRect.top + refRect.height / 2;
+
+		// Arrow position relative to tooltip's target top-left
+		let ax: number, ay: number;
+		if (side === 'top' || side === 'bottom') {
+			ax = targetX - floating.x;
+			ay = side === 'top' ? floatRect.height : 0;
+		} else {
+			ax = side === 'left' ? floatRect.width : 0;
+			ay = targetY - floating.y;
+		}
+
+		ax = Math.max(9, Math.min(Math.round(ax), floatRect.width - 9));
+		ay = Math.max(9, Math.min(Math.round(ay), floatRect.height - 9));
+
+		arrowX = ax;
+		arrowY = ay;
+		arrowSide = floating.staticSide;
+	});
+
+	const arrowStyle = $derived.by(() => {
+		if (arrowY == null && arrowX == null) return '';
+		return `left: ${arrowX}px; top: ${arrowY}px; ${arrowSide}: -3px;`;
+	});
 
 	function show() {
 		open = true;
@@ -113,12 +182,12 @@ reveal after position calculation prevents layout flash.
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div
 	bind:this={referenceEl}
-	class={cn("inline-block", triggerClass)}
+	class={cn("inline-flex shrink-0", triggerClass)}
 	onmouseenter={show}
 	onmouseleave={hide}
 	onfocusin={show}
 	onfocusout={hide}
-	aria-describedby={open && !hasFocusableDescendant ? "tooltip-content" : undefined}
+	aria-describedby={open && !hasFocusableDescendant ? tooltipId : undefined}
 	tabindex={activeTabindex}
 	role={activeRole}
 	{...rest}
@@ -132,12 +201,12 @@ reveal after position calculation prevents layout flash.
 	<Portal>
 		<div
 			bind:this={floatingEl}
-			id="tooltip-content"
+			id={tooltipId}
 			role="tooltip"
 			class={cn(
-				"z-300 card px-2.5 py-1.5 text-xs font-medium shadow-xl fixed",
+				"z-300 pointer-events-none overflow-visible rounded px-2.5 py-1.5 text-xs font-medium shadow-xl fixed",
 				"bg-surface-900 dark:bg-white text-white dark:text-surface-900",
-				"transition duration-150 animate-in fade-in zoom-in-95 scale-95",
+				"transition-opacity duration-150",
 				!floating.positionCalculated ? "opacity-0" : "opacity-100",
 				className,
 			)}
@@ -149,15 +218,12 @@ reveal after position calculation prevents layout flash.
 				<span>{title}</span>
 			{/if}
 
-			<!-- Arrow -->
 			<div
 				bind:this={arrowEl}
-				class="absolute size-2 bg-surface-900 dark:bg-white rotate-45"
-				style="
-					left: {floating.arrowX != null ? `${floating.arrowX}px` : ''};
-					top: {floating.arrowY != null ? `${floating.arrowY}px` : ''};
-					{floating.staticSide}: -4px;
-				"
+				class={cn(
+					'pointer-events-none absolute size-3 bg-surface-900 dark:bg-white rotate-45',
+				)}
+				style={arrowStyle}
 			></div>
 		</div>
 	</Portal>

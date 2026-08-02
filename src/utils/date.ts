@@ -7,10 +7,17 @@
  * - Display formatting (Intl.DateTimeFormat, Intl.RelativeTimeFormat)
  * - Uptime and expiration calculators
  * - ISO duration parsing
+ *
+ * ### Note on locale
+ * `formatDisplayDate` and `formatRelativeDate` accept a `locale` parameter.
+ * Pass the app's current content language explicitly:
+ * ```ts
+ * import { app } from '@src/stores/store.svelte';
+ * formatDisplayDate(date, app.contentLanguage);
+ * ```
+ * This keeps date.ts free of store imports, making it safe to use server-side.
  */
 
-import { logger } from "./logger";
-import { app } from "@src/stores/store.svelte";
 import type { ISODateString } from "../content/types";
 
 // --- ISO Date Utilities (Merged from date-utils.ts) ---
@@ -19,19 +26,13 @@ import type { ISODateString } from "../content/types";
  * Type guard for ISODateString.
  */
 export function isISODateString(value: unknown): value is ISODateString {
-  if (typeof value !== "string") return false;
+  if (typeof value !== "string" || value.length < 10) return false;
   const date = new Date(value);
-  return !Number.isNaN(date.getTime()) && date.toISOString() === value;
+  return !Number.isNaN(date.getTime()) && value.startsWith(date.toISOString().slice(0, 10));
 }
 
 // Backward compatibility wrappers
 export const nowISODateString = (): ISODateString => dateToISODateString(new Date());
-
-export function stringToISODateString(value: string): ISODateString {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) throw new Error("Invalid date string");
-  return date.toISOString() as ISODateString;
-}
 
 export function isoDateStringToDate(isoString: ISODateString): Date {
   return new Date(isoString);
@@ -49,44 +50,16 @@ export function dateToISODateString(date: Date): ISODateString {
  * Handles Date objects, timestamps, and ISO strings from various databases.
  */
 export function toISOString(value: unknown): ISODateString {
-  if (
-    value &&
-    typeof value === "object" &&
-    "toISOString" in value &&
-    typeof (value as any).toISOString === "function"
-  ) {
-    const date = value as any;
-    if (!Number.isNaN(date.getTime?.() ?? NaN)) return date.toISOString() as ISODateString;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString() as ISODateString;
   }
-  if (typeof value === "string" && isISODateString(value)) return value;
-  if (value && (typeof value === "string" || typeof value === "number")) {
-    try {
-      const date = new Date(value);
-      if (!Number.isNaN(date.getTime())) return date.toISOString() as ISODateString;
-    } catch {
-      logger.warn("Failed to convert value to ISODateString, using current date", { value });
-    }
-  }
-  return new Date().toISOString() as ISODateString;
-}
 
-/**
- * Normalizes date input (Date, timestamp, or string) to ISODateString.
- */
-export function normalizeDateInput(
-  dateInput: Date | ISODateString | number | string,
-): ISODateString {
-  if (!dateInput) return dateToISODateString(new Date());
-  if (dateInput instanceof Date) return dateToISODateString(dateInput);
-  if (typeof dateInput === "number") {
-    return dateToISODateString(new Date(dateInput < 1e12 ? dateInput * 1000 : dateInput));
+  if (typeof value === "string" || typeof value === "number") {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date.toISOString() as ISODateString;
   }
-  if (typeof dateInput === "string") {
-    const num = Number(dateInput);
-    if (!Number.isNaN(num)) return dateToISODateString(new Date(num < 1e12 ? num * 1000 : num));
-    return dateToISODateString(new Date(dateInput));
-  }
-  return dateToISODateString(new Date());
+
+  return new Date().toISOString() as ISODateString;
 }
 
 // --- Display Formatting (Merged from date.ts & date-utils.ts) ---
@@ -124,12 +97,17 @@ export function formatDateString(
   }
 }
 
+// 🛡️ Intl formatter caches — avoids repeated instantiation on high-frequency calls
+const dateTimeFormatCache = new Map<string, Intl.DateTimeFormat>();
+const relativeTimeFormatCache = new Map<string, Intl.RelativeTimeFormat>();
+
 /**
  * Format date for localized display.
+ * Pass the app's content language explicitly: `app.contentLanguage` from `@src/stores/store.svelte`.
  */
 export function formatDisplayDate(
   dateInput: Date | number | string,
-  locale = app.contentLanguage || "en",
+  locale = "en",
   options: Intl.DateTimeFormatOptions = {
     year: "numeric",
     month: "short",
@@ -144,28 +122,34 @@ export function formatDisplayDate(
       typeof dateInput === "number" ? (dateInput > 1e12 ? dateInput : dateInput * 1000) : dateInput,
     );
     if (Number.isNaN(date.getTime())) return "Invalid Date";
-    return new Intl.DateTimeFormat(locale, options).format(date);
+    const cacheKey = `${locale}:${JSON.stringify(options)}`;
+    let formatter = dateTimeFormatCache.get(cacheKey);
+    if (!formatter) {
+      formatter = new Intl.DateTimeFormat(locale, options);
+      dateTimeFormatCache.set(cacheKey, formatter);
+    }
+    return formatter.format(date);
   } catch {
     return "Invalid Date";
   }
 }
 
-export const formatDate = formatDisplayDate;
-
 /**
  * Relative date formatting (e.g. "2 hours ago").
+ * Pass the app's content language explicitly: `app.contentLanguage` from `@src/stores/store.svelte`.
  */
-export function formatRelativeDate(
-  dateInput: Date | number | string,
-  locale = app.contentLanguage || "en",
-): string {
+export function formatRelativeDate(dateInput: Date | number | string, locale = "en"): string {
   try {
     const date = new Date(
       typeof dateInput === "number" ? (dateInput > 1e12 ? dateInput : dateInput * 1000) : dateInput,
     );
     if (Number.isNaN(date.getTime())) return "Invalid Date";
 
-    const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+    let formatter = relativeTimeFormatCache.get(locale);
+    if (!formatter) {
+      formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+      relativeTimeFormatCache.set(locale, formatter);
+    }
     const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
 
     if (seconds < 60) return formatter.format(-seconds, "second");
@@ -218,14 +202,15 @@ export function ReadableExpireIn(expiresIn: string): string {
 
 export function formatIsoDuration(isoDuration: string | undefined): string | undefined {
   if (!isoDuration) return undefined;
-  const matches = isoDuration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  // 🛡️ Anchored regex prevents ReDoS on long attacker-crafted strings
+  const matches = isoDuration.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
   if (!matches) return undefined;
   const h = matches[1] || "0";
   const m = matches[2] || "0";
   const s = matches[3] || "0";
-  return (h !== "0" ? [h, m.padStart(2, "0"), s.padStart(2, "0")] : [m, s.padStart(2, "0")]).join(
-    ":",
-  );
+  return h !== "0"
+    ? `${h}:${m.padStart(2, "0")}:${s.padStart(2, "0")}`
+    : `${m}:${s.padStart(2, "0")}`;
 }
 
 export const getCurrentDate = () => formatDateString(new Date(), "yyyy-MM-dd");

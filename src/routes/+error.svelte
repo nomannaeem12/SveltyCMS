@@ -11,6 +11,7 @@
 - Rotating animation effect for the site name to enhance visual appeal.
 - Clear call-to-action link to return to the homepage.
 - WCAG 2.2 AA Compliant + WCAG 3.0 Functional Performance focused
+- 429 Too Many Requests support with retry guidance
 
 -->
 
@@ -57,12 +58,15 @@ const isDatabaseError =
 		msg.includes("connection") ||
 		msg.includes("failed to initialize"));
 const isSetupMode = page.status === 503 && msg.includes("setup");
+const isRateLimited = page.status === 429;
 
 const errorTitle = isDatabaseError
 	? db_error_title()
 	: page.status === 404
 		? error_pagenotfound()
-		: "Error";
+		: isRateLimited
+			? "Too Many Requests"
+			: "Error";
 
 const errorSummary = isDatabaseError
 	? db_error_description()
@@ -70,7 +74,9 @@ const errorSummary = isDatabaseError
 		? "System in Setup Mode"
 		: page.status === 404
 			? error_pagenotfound()
-			: error_wrong();
+			: isRateLimited
+				? "Slow down — you're sending requests too quickly. Please wait and try again."
+				: error_wrong();
 </script>
 
 <svelte:head><title>{page.status} - {errorTitle} | {siteName}</title></svelte:head>
@@ -104,7 +110,7 @@ const errorSummary = isDatabaseError
 			</div>
 
 			<!-- Site Logo - Static, not rotating -->
-			<div class="pointer-events-none z-10"><SveltyCMSLogo className="text-error-500 w-20 h-20" size={80} /></div>
+			<div class="pointer-events-none z-10 absolute inset-0 flex items-center justify-center"><SveltyCMSLogo className="text-error-500 w-20 h-20" size={80} /></div>
 		</div>
 
 		<!-- Error Content -->

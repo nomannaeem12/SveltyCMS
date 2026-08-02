@@ -16,6 +16,7 @@
 -->
 
 <script lang="ts">
+	import Button from '@components/ui/button.svelte';
 	import { browser } from '$app/environment';
 	import { toast } from '@src/stores/toast.svelte.ts';
 	import { flip } from 'svelte/animate';
@@ -23,12 +24,19 @@
 	import { onMount } from 'svelte';
 	import type { ToastPosition, ToastType } from '@src/stores/toast.svelte.ts';
 
+	// Restricted DOMPurify config for toast messages — inline formatting only.
+	// Using explicit ALLOWED_TAGS/ALLOWED_ATTR avoids CVE-2026-65902 (hook mutation
+	// on defaults) and reduces attack surface vs. DOMPurify's default allowlist.
+	const TOAST_SANITIZE_CONFIG = {
+		ALLOWED_TAGS: ["b", "strong", "i", "em", "u", "br", "code", "a"],
+		ALLOWED_ATTR: ["href", "title", "rel", "target"],
+	};
+
 	let sanitize = $state<(str: string) => string>((str) => str);
 
 	onMount(async () => {
 		const { default: DOMPurify } = await import('dompurify');
-		const domSanitize = DOMPurify.sanitize;
-		sanitize = domSanitize;
+		sanitize = (str: string) => DOMPurify.sanitize(str, TOAST_SANITIZE_CONFIG);
 	});
 
 	interface Props {
@@ -188,6 +196,8 @@
 
 			<div
 				data-toast-id={t.id}
+				data-testid="app-toast"
+				data-toast-type={t.type}
 				animate:flip={{ duration: 300 }}
 				in:fly={{ ...animDir, duration: 300 }}
 				out:fade={{ duration: 200 }}
@@ -217,7 +227,8 @@
 							</p>
 
 							{#if t.action}
-								<button
+								<Button
+									variant="ghost"
 									onclick={() => {
 										t.action?.onClick();
 										toast.close(t.id);
@@ -225,22 +236,23 @@
 									class="mt-2 text-xs font-medium bg-white/20 hover:bg-white/30 px-2.5 py-1 sm:px-3 sm:py-1.5 rounded transition-colors"
 								>
 									{t.action.label}
-								</button>
+								</Button>
 							{/if}
 						</div>
 
-						<button
+						<Button
+							variant="ghost"
 							onclick={() => toast.close(t.id)}
 							class="shrink-0 opacity-70 hover:opacity-100 transition-opacity -me-1 -mt-1 sm:me-0 sm:mt-0 p-1"
 							aria-label="Dismiss notification"
 						>
 							<iconify-icon icon="mdi:close" class="text-lg"></iconify-icon>
-						</button>
+						</Button>
 					</div>
 				</div>
 
 				{#if t.duration !== Infinity && !isToastPaused(t.id)}
-					<div class="h-1 bg-black/20">
+					<div class="h-1 bg-black/20 pointer-events-none">
 						<div class="h-full bg-white/40 origin-left" style="animation: shrink {t.remainingTime}ms linear forwards"></div>
 					</div>
 				{/if}

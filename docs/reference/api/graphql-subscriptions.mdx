@@ -1,0 +1,118 @@
+---
+path: "docs/reference/api/graphql-subscriptions.mdx"
+title: "GraphQL Subscriptions Reference"
+description: "Real-time GraphQL subscriptions with secure WebSocket authentication, JIT optimization, and Svelte 5 integration via svelte-realtime."
+order: 8
+icon: "mdi:websocket"
+author: "SveltyCMS Team"
+created: "2025-10-29"
+updated: "2026-07-07"
+tags:
+  - "graphql"
+  - "websocket"
+  - "subscriptions"
+  - "real-time"
+  - "ws"
+---
+
+# GraphQL Subscriptions Reference
+
+> **Note:** SveltyCMS uses a highly stable production-ready stack based on **`@sveltejs/adapter-node`** and the standard **`ws`** library. The WebSocket server runs natively on the main application port at `ws://[domain]/ws`.
+
+> **Architecture Guide:** Real-time collaborative editing (CRDT) is supported via the integrated WebSocket server on `/ws`. For standard GraphQL queries, mutations, and subscriptions, standard HTTP Server-Sent Events (SSE) or REST-based fallbacks are recommended for maximum deployment compatibility.
+
+Real-time GraphQL subscriptions allow clients to receive instant updates when data changes. This guide covers the secure WebSocket implementation, JIT-optimized resolvers, and seamless Svelte 5 integration.
+
+---
+
+## ⚡ Quick Reference
+
+| Feature                     | Details                                                                |
+| :-------------------------- | :--------------------------------------------------------------------- |
+| **Endpoint**                | `ws://[domain]/ws` (Managed by built-in Yjs sync server)               |
+| **Protocol**                | Standard WebSockets (`ws` + `y-protocols`)                             |
+| **Auth Methods**            | Session ID, Cookie, or secure query parameter                          |
+| **Server-Side Alternative** | [**Real-Time Events API (SSE)**](./content.mdx#3-real-time-events-sse) |
+
+---
+
+## 1. The Goal
+
+Maintain a live, reactive UI (like a collaborative editor or a real-time dashboard) that updates instantly when content is modified by other users or background jobs. This provides a superior, type-safe alternative to traditional polling mechanisms.
+
+---
+
+## 2. Implementation Details
+
+### Svelte 5 Integration (Client Side)
+
+With the migration to `svelte-realtime`, setting up reactive subscriptions on the client is drastically simplified. You no longer need to manage complex WebSocket connection states manually.
+
+````typescript
+// Example: Using svelte-realtime to subscribe to the global event stream
+import { realtime } from "svelte-realtime/client";
+import { events } from "$live/system";
+
+// 1. Initialize the live stream (automatically manages connection and state)
+const eventStream = realtime(events);
+
+// 2. Derive reactive state directly from the stream using Svelte 5 runes
+const latestEvent = $derived(eventStream.value?.at(-1));
+```
+
+### Authentication and Connection
+
+Client connections must pass authentication parameters to establish a secure stream.
+The unified `ws://[domain]/live` endpoint handles auth via session cookies or
+connection parameters.
+
+```typescript
+// Client-side connection with svelte-realtime and auth context
+import { realtime } from "svelte-realtime/client";
+import { events } from "$live/system";
+
+const stream = realtime(events, {
+  auth: { token: "your-api-token-here" },
+});
+```
+
+---
+
+## 3. The Mechanics (Server-Side)
+
+SveltyCMS utilizes a **Unified Port Architecture** where `svelte-adapter-uws` manages both HTTP endpoints and WebSockets efficiently.
+
+````
+
+sequenceDiagram
+participant Client
+participant UWS as uWebSockets (Port 5173)
+participant Auth as WS Upgrade Hook
+participant Live as svelte-realtime
+
+    Client->>UWS: Connection Init
+    UWS->>Auth: Validate Session/Token (hooks.ws.ts)
+    Auth-->>UWS: Accept & Inject Context
+
+    Client->>Live: Subscribe (Topic)
+
+    Note over Live: Data Mutation in CMS
+    Live->>Live: live.publish(topic, payload)
+    Live-->>Client: Real-time Update
+
+```
+
+### Performance & Security
+
+- **Standard Node.js ws Engine**: Powered by the highly optimized pure JavaScript `ws` library, handling thousands of concurrent connections efficiently.
+- **Tenant Isolation**: WebSocket connection parameters (e.g. `tenantId`, `docId`) are automatically parsed at the handshake layer to isolate user updates per tenant.
+- **No Native Addons**: Avoids compiled binary requirements, ensuring compatibility across all cloud, Docker, and enterprise platforms.
+
+---
+
+## Related Documents
+
+- [GraphQL API Reference](./graphql.mdx)
+- [Content, Search & Events Reference](./content.mdx)
+- [Security Architecture](../security/index.mdx)
+```

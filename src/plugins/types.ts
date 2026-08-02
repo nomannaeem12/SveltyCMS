@@ -11,6 +11,29 @@ import type {
   IDBAdapter,
   ISODateString,
 } from "@databases/db-interface";
+import type { PluginPart } from "./define-plugin";
+export type { PluginPart };
+
+/** All possible capabilities a plugin can request */
+export type PluginCapability =
+  | "db:read" // Read database collections
+  | "db:write" // Write to database collections
+  | "db:delete" // Delete from database collections
+  | "network:fetch" // Make outbound HTTP requests
+  | "network:webhook" // Register webhook endpoints
+  | "file:read" // Read files from storage
+  | "file:write" // Write files to storage
+  | "media:read" // Access media library
+  | "media:write" // Upload/modify media
+  | "media:delete" // Delete media
+  | "user:read" // Read user data
+  | "user:write" // Create/update users
+  | "settings:read" // Read system settings
+  | "settings:write" // Modify system settings
+  | "ui:slot" // Inject UI into slot zones
+  | "ui:page" // Register custom admin pages
+  | "event:subscribe" // Subscribe to system events
+  | "event:publish"; // Publish system events
 
 /**
  * Plugin metadata and registration info
@@ -18,6 +41,9 @@ import type {
 export interface PluginMetadata {
   /** Plugin author */
   author?: string;
+
+  /** Declared capabilities — enforced at runtime by the RBAC dispatcher */
+  capabilities?: PluginCapability[];
 
   /** Short description of plugin functionality */
   description: string;
@@ -169,38 +195,113 @@ export interface PluginUIContribution {
     }>;
     sidebar?: any[]; // Svelte components
   };
+
+  /** UI slots for injection zones (config, dashboard, sidebar, plugin_workspace, etc.) */
+  slots?: PluginSlot[];
+}
+
+/** Server handlers exported by a plugin workspace slot module */
+export interface PluginServerModule {
+  actions?: Record<
+    string,
+    (event: {
+      request: Request;
+      locals: Record<string, unknown>;
+      params: Record<string, string>;
+    }) => Promise<Record<string, unknown>>
+  >;
 }
 
 // Injection Zones for Slot System
+// Any plugin can target these zones to inject UI into CMS routes
 export type InjectionZone =
-  | "dashboard"
-  | "sidebar"
-  | "entry_edit"
-  | "entry_edit_sidebar"
-  | "entry_edit_header"
-  | "config"
-  | "entry_list_actions"
-  | "global-toolbar"
-  | "global-footer"
-  | "sticky-action-bar";
+  | "dashboard" // Dashboard widgets
+  | "sidebar" // Global sidebar
+  | "entry_edit" // Content entry editor
+  | "entry_edit_sidebar" // Entry editor sidebar
+  | "entry_edit_header" // Entry editor header
+  | "config" // System configuration page
+  | "config_grid" // Config page icon grid (additional tiles)
+  | "plugin_workspace" // Fullscreen plugin GUI overlay (slot-driven, no routes)
+  | "collection_builder" // Collection builder page
+  | "media_gallery" // Media gallery page
+  | "media_gallery_toolbar" // Media gallery toolbar
+  | "user_profile" // User profile/settings page
+  | "user_profile_sidebar" // User profile sidebar
+  | "user_security" // User security settings section
+  | "user_preferences" // User preferences section
+  | "user_admin_strip" // User admin actions strip
+  | "entry_list_actions" // Entry list action buttons
+  | "global-toolbar" // Top-level toolbar (all routes)
+  | "global-footer" // Footer (all routes)
+  | "sticky-action-bar" // Sticky action bar at bottom
+  | "image_editor_tool"; // Image editor tool/widgets
 
 // Plugin Slot definition
 export interface PluginSlot {
   component: () => Promise<any>; // Lazy loaded Svelte component
   condition?: (context: any) => boolean; // Optional condition to show/hide slot
   id: string;
+  /** Owning plugin id (set automatically during registration) */
+  pluginId?: string;
   permissions?: string[]; // RBAC roles
   position?: number;
   props?: Record<string, any>;
+  /** Server module for `/api/plugins/[pluginId]` action delegation */
+  server?: () => Promise<PluginServerModule>;
   zone: InjectionZone;
 }
 
-// Lifecycle hooks for plugins to intercept CRUD operations
+// Lifecycle hooks for plugins to intercept CRUD operations and auth flows
 export interface PluginLifecycleHooks {
   afterDelete?: (context: PluginContext, collection: string, id: string) => Promise<void>;
   afterSave?: (context: PluginContext, collection: string, result: any) => Promise<void>;
+  /**
+   * Fired after successful authentication (password, OAuth, passkey, API key, token).
+   * Plugins can use this to enforce additional security policies or enrich the session.
+   *
+   * @param event - Information about the authentication event
+   * @returns May return `{ requires2FA: true }` to gate the session behind 2FA,
+   *          or `{ deny: true, message: "..." }` to block the login.
+   */
+  afterAuthenticate?: (event: AuthHookEvent) => Promise<AuthHookResult | void>;
   beforeDelete?: (context: PluginContext, collection: string, id: string) => Promise<void>;
   beforeSave?: (context: PluginContext, collection: string, data: any) => Promise<any>;
+}
+
+/**
+ * Event payload passed to the afterAuthenticate plugin hook.
+ * Fires after credential verification but before session cookie issuance.
+ */
+export interface AuthHookEvent {
+  /** The authenticated user. */
+  user: User;
+  /** Authentication method: "password", "oauth", "passkey", "api_key", "token", "magic_link". */
+  method: "password" | "oauth" | "passkey" | "api_key" | "token" | "magic_link";
+  /** Client IP address. */
+  ip: string;
+  /** User-Agent header. */
+  userAgent: string;
+  /** Whether 2FA is already enabled on the user account. */
+  userHas2FA: boolean;
+  /** Tenant ID (or null for single-tenant). */
+  tenantId: string | null;
+}
+
+/**
+ * Return value from the afterAuthenticate hook.
+ *
+ * - `void` → no action, proceed normally
+ * - `{ requires2FA: true }` → gate the user behind 2FA (regardless of user settings)
+ * - `{ deny: true, message: "..." }` → block the login with the given message
+ */
+export interface AuthHookResult {
+  /** Force 2FA gating even if the user hasn't enabled it. */
+  requires2FA?: boolean;
+  /** Deny the authentication with a message. */
+  deny?: boolean;
+  /** Human-readable message for deny. */
+  message?: string;
 }
 
 /**
@@ -221,6 +322,23 @@ export interface Plugin {
 
   /** Plugin migrations (executed in version order) */
   migrations?: PluginMigration[];
+
+  /**
+   * Structured parts contributed by definePlugin. Resolved at boot.
+   *
+   * Each part is a discriminated union variant — the registry dispatches
+   * on `type` to route schemas, routes, capabilities, settings, admin
+   * tools, field components, and document actions into the right subsystem.
+   */
+  parts?: PluginPart[];
+
+  /**
+   * Plugin settings declaration (aphexcms-style SettingsPart).
+   * Defines the settings shape this plugin accepts — core renders the form,
+   * stores values per tenant, and injects them into the plugin's server code.
+   * Supports `secret` field type for AES-256-GCM encrypted values.
+   */
+  settings?: import("./settings-declaration").SettingsPart;
 
   /** SSR hook for data enrichment (optional) */
   ssrHook?: PluginSSRHook;
@@ -286,6 +404,14 @@ export interface IPluginService {
     hookName: K,
     tenantId?: string | null,
   ): Promise<Exclude<PluginLifecycleHooks[K], undefined>[]>;
+
+  /**
+   * Run afterAuthenticate hooks across all enabled plugins.
+   * Returns the first deny result, or the first requires2FA result, or null.
+   */
+  runAuthHooks(
+    event: import("./types").AuthHookEvent,
+  ): Promise<import("./types").AuthHookResult | null>;
 
   /** Get SSR hooks for enabled plugins on a collection */
   getSSRHooks(collectionId: string, tenantId?: string | null): Promise<PluginSSRHook[]>;

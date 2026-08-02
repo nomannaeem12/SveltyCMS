@@ -16,12 +16,12 @@ import { sql } from "drizzle-orm";
 import { index, integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
 // --- Direct Exports from Sub-modules ---
-export { fourOhFourLogs } from "./404Logs";
+export { fourOhFourLogs } from "./404-logs";
 export { redirectsMV } from "./seo";
 export { workflowDefinitions, workflowInstances } from "./workflow";
 
 // --- Local Schema Definitions ---
-import { fourOhFourLogs } from "./404Logs";
+import { fourOhFourLogs } from "./404-logs";
 import { redirectsMV } from "./seo";
 import { workflowDefinitions, workflowInstances } from "./workflow";
 import type { TenantQuota, TenantUsage } from "../db-interface";
@@ -70,6 +70,14 @@ export const authUsers = sqliteTable(
     last2FAVerification: integer("last2FAVerification", {
       mode: "timestamp_ms",
     }),
+    authenticators: text("authenticators", { mode: "json" }).$type<
+      import("../auth/types").Authenticator[]
+    >(),
+    preferences: text("preferences", { mode: "json" }).$type<
+      import("../auth/types").User["preferences"]
+    >(),
+    failedAttempts: integer("failedAttempts").notNull().default(0),
+    lockoutUntil: integer("lockoutUntil", { mode: "timestamp_ms" }),
     tenantId: tenantField(),
     ...timestamps,
   },
@@ -352,6 +360,32 @@ export const systemPreferences = sqliteTable(
   }),
 );
 
+// Outbox Events Table — Transactional Outbox Pattern
+// Events are written in the same transaction as the data change,
+// then a background process reads and delivers them reliably.
+export const sveltyOutbox = sqliteTable(
+  "svelty_outbox",
+  {
+    _id: uuidPk(),
+    tenantId: tenantField(),
+    eventType: text("eventType", { length: 255 }).notNull(),
+    aggregateType: text("aggregateType", { length: 255 }).notNull(),
+    aggregateId: text("aggregateId", { length: 255 }).notNull(),
+    payload: text("payload").notNull(),
+    status: text("status", { length: 50 }).notNull().default("pending"),
+    deliveredAt: integer("deliveredAt", { mode: "timestamp_ms" }),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("lastError"),
+    ...timestamps,
+  },
+  (table) => ({
+    statusIdx: index("outbox_status_idx").on(table.status),
+    tenantIdx: index("outbox_tenant_idx").on(table.tenantId),
+    eventTypeIdx: index("outbox_event_type_idx").on(table.eventType),
+    createdAtIdx: index("outbox_created_at_idx").on(table.createdAt),
+  }),
+);
+
 // Background Jobs Table
 export const sveltyJobs = sqliteTable(
   "svelty_jobs",
@@ -396,6 +430,7 @@ export const websiteTokens = sqliteTable(
     tokenIdx: unique("token_unique").on(table.token),
     nameIdx: index("name_idx").on(table.name),
     tenantIdx: index("tenant_idx").on(table.tenantId),
+    tenantNameIdx: index("tenant_name_idx").on(table.tenantId, table.name),
   }),
 );
 
@@ -440,6 +475,28 @@ export const pluginStates = sqliteTable(
     pluginIdx: index("plugin_idx").on(table.pluginId),
     tenantIdx: index("tenant_idx").on(table.tenantId),
     pluginTenantUnique: unique("plugin_tenant_unique").on(table.pluginId, table.tenantId),
+  }),
+);
+
+// Plugin Storage Table
+export const pluginStorage = sqliteTable(
+  "plugin_storage",
+  {
+    _id: uuidPk(),
+    plugin: text("plugin", { length: 255 }).notNull(),
+    collectionName: text("collection", { length: 255 }).notNull(),
+    tenantId: tenantField(),
+    data: text("data", { mode: "json" }).notNull().default({}),
+    ...timestamps,
+  },
+  (table) => ({
+    pluginIdx: index("plugin_storage_plugin_idx").on(table.plugin),
+    collectionIdx: index("plugin_storage_collection_idx").on(table.collectionName),
+    tenantIdx: index("plugin_storage_tenant_idx").on(table.tenantId),
+    pluginCollectionIdx: index("plugin_storage_plugin_collection_idx").on(
+      table.plugin,
+      table.collectionName,
+    ),
   }),
 );
 
@@ -538,11 +595,45 @@ export const auditLogs = sqliteTable(
   }),
 );
 
+// Auth API Keys Table
+export const authApiKeys = sqliteTable(
+  "auth_api_keys",
+  {
+    _id: uuidPk(),
+    name: text("name", { length: 255 }).notNull(),
+    hash: text("hash", { length: 255 }).notNull(),
+    prefix: text("prefix", { length: 12 }).notNull(),
+    userId: text("userId", { length: 36 }).notNull(),
+    scopes: text("scopes", { mode: "json" })
+      .$type<string[]>()
+      .notNull()
+      .default([] as any),
+    permissions: text("permissions", { mode: "json" })
+      .$type<string[]>()
+      .notNull()
+      .default([] as any),
+    revoked: integer("revoked", { mode: "boolean" }).notNull().default(false),
+    usageCount: integer("usageCount").notNull().default(0),
+    lastUsedAt: integer("lastUsedAt", { mode: "timestamp_ms" }),
+    lastUsedIp: text("lastUsedIp"),
+    expiresAt: integer("expiresAt", { mode: "timestamp_ms" }),
+    tenantId: tenantField(),
+    ...timestamps,
+  },
+  (table) => ({
+    hashIdx: unique("hash_unique").on(table.hash),
+    userIdx: index("api_key_user_idx").on(table.userId),
+    tenantIdx: index("api_key_tenant_idx").on(table.tenantId),
+    tenantHashIdx: index("tenant_hash_idx").on(table.tenantId, table.hash), // 🚀 Compound index for optimization
+  }),
+);
+
 // Export all tables as a schema object for Drizzle
 export const schema = {
   authUsers,
   authSessions,
   authTokens,
+  authApiKeys,
   roles,
   contentNodes,
   contentDrafts,
@@ -552,10 +643,12 @@ export const schema = {
   mediaItems,
   systemVirtualFolders,
   systemPreferences,
+  sveltyOutbox,
   sveltyJobs,
   websiteTokens,
   pluginPagespeedResults,
   pluginStates,
+  pluginStorage,
   pluginMigrations,
   tenants,
   auditLogs,

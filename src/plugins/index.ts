@@ -4,9 +4,16 @@
  */
 
 export * from "./types";
+export * from "./define-plugin";
+export * from "./settings";
+export * from "./settings-crypto";
+export * from "./settings-declaration";
+export * from "./storage";
 
+import { pluginServerRegistry } from "./plugin-server-registry";
 import { pluginRegistry } from "./registry";
-export { pluginRegistry };
+import { slotRegistry } from "./slot-registry.svelte.ts";
+export { pluginRegistry, pluginServerRegistry, slotRegistry };
 
 import { logger } from "@utils/logger";
 import type { Plugin } from "./types";
@@ -76,6 +83,22 @@ for (const path in pluginModulesRaw) {
   }
 }
 
+// Isomorphic UI registration — available on client and server for slot/page renderers
+for (const plugin of availablePlugins) {
+  const pluginId = plugin.metadata.id;
+
+  if (plugin.ui?.slots) {
+    for (const slot of plugin.ui.slots) {
+      const registered = { ...slot, pluginId };
+      slotRegistry.register(registered);
+
+      if (slot.zone === "plugin_workspace" && slot.server) {
+        pluginServerRegistry.register(pluginId, slot.server);
+      }
+    }
+  }
+}
+
 /**
  * Initialize plugin system
  * Registers all plugins and runs migrations
@@ -89,13 +112,30 @@ export async function initializePlugins(dbAdapter: any, tenantId = "default"): P
     // 1. Initialize settings service
     await pluginRegistry.initializeSettings(dbAdapter);
 
-    // 2. Register all available plugins
+    // 2. Register all available plugins (merge index.server hooks/migrations per architecture)
     for (const plugin of availablePlugins) {
+      try {
+        const serverMod = await import(`./${plugin.metadata.id}/index.server`);
+        if (serverMod.hooks) {
+          plugin.hooks = { ...plugin.hooks, ...serverMod.hooks };
+        }
+        if ((!plugin.migrations || plugin.migrations.length === 0) && serverMod.migrations) {
+          plugin.migrations = serverMod.migrations;
+        }
+      } catch {
+        /* UI-only plugin — no index.server.ts */
+      }
       await pluginRegistry.register(plugin);
+
+      // Resolve discriminated-union parts (schema, routes, capabilities, settings, etc.)
+      pluginRegistry.resolveParts(plugin);
     }
 
     // 3. Run migrations for all plugins
     await pluginRegistry.runAllMigrations(dbAdapter, tenantId);
+
+    // 3.5 Reconcile plugin capabilities into merged catalog
+    await pluginRegistry.reconcileCapabilities();
 
     // 4. Mark as initialized
     pluginRegistry.markInitialized();

@@ -8,6 +8,10 @@ import { getGlobal, setGlobal } from "@src/utils/native-utils";
 import type { IDBAdapter } from "./db-interface";
 import { dbPluginRegistry } from "./core/plugin-registry";
 
+// 🟢 Bun/Node compatibility: Shim `node:v8` for the `bson` package
+// so MongoDB adapter works under Bun without requiring Node.js/vitest.
+import "@utils/v8-shim";
+
 /**
  * 🚀 AGNOSTIC CORE: Loads the physical database adapter based on config.
  */
@@ -55,7 +59,7 @@ export async function loadAdapters(config: any): Promise<IDBAdapter | null> {
 export async function initializeDatabase(adapter: IDBAdapter): Promise<void> {
   const { setSystemState, getSystemState, updateServiceHealth, startServiceInitialization } =
     await import("@src/stores/system/state.svelte.ts");
-  const { isSetupComplete } = await import("@utils/setup-check");
+  const { isSetupComplete } = await import("../utils/server/setup-check");
 
   const setupComplete = isSetupComplete();
 
@@ -149,7 +153,7 @@ export async function initializeDatabase(adapter: IDBAdapter): Promise<void> {
       updateServiceHealth("cache", "healthy", "Cache service online");
 
       // Warm critical paths on startup in background if setup complete
-      const { isSetupComplete } = await import("@utils/setup-check");
+      const { isSetupComplete } = await import("../utils/server/setup-check");
       if (isSetupComplete()) {
         const { cacheWarmingService } = await import("./cache/cache-warming-service");
         cacheWarmingService.initialize(adapter).catch((err) => {
@@ -260,7 +264,12 @@ export async function loadSettingsFromDB(adapter: IDBAdapter, force = false): Pr
     if (!force && getGlobal("__SETTINGS_LOADED__", false)) return true;
 
     // Load from system_preferences table
-    const result = await adapter.crud.findMany<any>("system_preferences", {});
+    const { withSystemScope } = await import("@src/databases/system-tenant-scope");
+    const result = await adapter.crud.findMany<any>(
+      "system_preferences",
+      {},
+      withSystemScope("bootstrap"),
+    );
     if (result.success && result.data) {
       const settings: Record<string, any> = {};
       for (const pref of result.data) {

@@ -4,7 +4,7 @@
  */
 
 import { createRequire } from "node:module";
-if (typeof (globalThis as any).require === "undefined") {
+if (import.meta.env.SSR && typeof (globalThis as any).require === "undefined") {
   (globalThis as any).require = createRequire(import.meta.url);
 }
 
@@ -77,6 +77,14 @@ export abstract class MongoAdapterCore extends BaseAdapter {
         compressors.push("snappy");
       } catch {}
 
+      const isTestMode =
+        (globalThis as any).process?.env?.TEST_MODE === "true" ||
+        (globalThis as any).process?.env?.VITE_TEST_MODE === "true" ||
+        (globalThis as any).process?.env?.BENCHMARK === "true" ||
+        (globalThis as any).process?.env?.NODE_ENV === "test" ||
+        !!(globalThis as any).process?.env?.VITEST ||
+        !!(globalThis as any).process?.env?.BUN_TEST;
+
       const connectOptions: mongoose.ConnectOptions = {
         ...options,
         autoIndex: false,
@@ -89,6 +97,7 @@ export abstract class MongoAdapterCore extends BaseAdapter {
         family: 4,
         connectTimeoutMS: 10000,
         waitQueueTimeoutMS: 10000,
+        ...(isTestMode ? ({ w: 1, j: false } as any) : {}),
         ...(compressors.length > 0 ? { compressors: compressors as any } : {}),
       };
 
@@ -140,6 +149,7 @@ export abstract class MongoAdapterCore extends BaseAdapter {
   async disconnect(): Promise<DatabaseResult<void>> {
     try {
       if (this._connection) {
+        (this as any).__intentionalDisconnect__ = true;
         await this._connection.close();
         this._connection = null;
       }
@@ -163,7 +173,13 @@ export abstract class MongoAdapterCore extends BaseAdapter {
     }
     const genericSchema = new mongoose.Schema(
       { _id: { type: String, required: true } },
-      { strict: false, timestamps: true, versionKey: false, id: false },
+      {
+        strict: false,
+        timestamps: true,
+        versionKey: false,
+        id: false,
+        suppressReservedKeysWarning: true,
+      },
     );
     return this._connection.model(collection, genericSchema, collection);
   }

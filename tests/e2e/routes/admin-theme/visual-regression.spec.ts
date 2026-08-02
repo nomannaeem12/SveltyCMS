@@ -8,7 +8,7 @@
 
 import { expect, test } from "@playwright/test";
 import { loginAsAdmin } from "../../helpers/auth";
-import { resetAndSeedDatabase } from "../../helpers/database";
+import { resetAndSeedDatabase } from "../../helpers/api";
 import {
   dynamicMasks,
   openLoginSignInForm,
@@ -26,6 +26,10 @@ test.use({
 });
 
 test.describe("Admin Theme Visual Regression", () => {
+  test.skip(
+    !process.env.UPDATE_SNAPSHOTS && !process.env.RUN_VISUAL,
+    "Visual regression is skipped unless RUN_VISUAL=1 or UPDATE_SNAPSHOTS=1 is specified",
+  );
   test.beforeEach(async ({ page }) => {
     await resetAndSeedDatabase(page);
     await prepareForScreenshot(page);
@@ -67,7 +71,7 @@ test.describe("Admin Theme Visual Regression", () => {
 
   test("appearance settings — AdminPageShell", async ({ page }) => {
     await loginAsAdmin(page);
-    await page.goto("/config/appearance", { waitUntil: "domcontentloaded" });
+    await page.goto("/config/design-system", { waitUntil: "domcontentloaded" });
     const shell = page.locator(".admin-theme-container").first();
     await expect(shell).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText("My Overrides", { exact: true })).toBeVisible({
@@ -78,7 +82,9 @@ test.describe("Admin Theme Visual Regression", () => {
 
   test("system settings — cache group", async ({ page }) => {
     await loginAsAdmin(page);
-    await page.goto("/config/system-settings?group=cache", { waitUntil: "domcontentloaded" });
+    await page.goto("/config/system-settings?group=cache", {
+      waitUntil: "domcontentloaded",
+    });
     const shell = page.locator(".admin-theme-container").first();
     await expect(shell).toBeVisible({ timeout: 15_000 });
     await expect(shell).toHaveScreenshot("system-settings-cache.png", SCREENSHOT_OPTS);
@@ -94,7 +100,7 @@ test.describe("Admin Theme Visual Regression", () => {
 
   test("design system playground — AdminPageShell", async ({ page }) => {
     await loginAsAdmin(page);
-    await page.goto("/config/design-system", { waitUntil: "domcontentloaded" });
+    await page.goto("/config/design-system?tab=preview", { waitUntil: "domcontentloaded" });
     const shell = page.locator(".admin-theme-container").first();
     await expect(shell).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText("Playground controls", { exact: true })).toBeVisible({

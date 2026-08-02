@@ -8,12 +8,12 @@ import { describe, it, expect } from "vitest";
 import {
   isSkeletonPreset,
   isSkeletonCssExport,
-  mapSkeletonPresetToAdminTheme,
-  mapSkeletonPropertiesToCss,
+  mapPresetToAdminTheme,
+  mapThemePropertiesToCss,
   parseSkeletonCssBlock,
   normalizeSkeletonThemePayload,
   expandShorthandPaletteProperties,
-} from "../../src/utils/skeleton-preset-mapper";
+} from "../../src/utils/theme-preset-mapper";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -39,7 +39,7 @@ describe("skeleton-preset-mapper", () => {
   });
 
   it("maps properties to scoped admin CSS", () => {
-    const css = mapSkeletonPropertiesToCss(sampleProperties);
+    const css = mapThemePropertiesToCss(sampleProperties);
     expect(css).toContain(".admin-theme-container, [data-admin-theme]");
     expect(css).toContain("--color-primary-500: oklch(0.57 0.21 258.29deg);");
     expect(css).toContain("--color-tertiary-500: oklch(0.55 0.2 300deg);");
@@ -49,7 +49,7 @@ describe("skeleton-preset-mapper", () => {
   });
 
   it("blocks unsafe CSS values", () => {
-    const css = mapSkeletonPropertiesToCss({
+    const css = mapThemePropertiesToCss({
       "--color-primary-500": "url('http://evil.com/x.png')",
       "--color-error-500": "oklch(0.5 0.2 20deg)",
     });
@@ -58,7 +58,7 @@ describe("skeleton-preset-mapper", () => {
   });
 
   it("maps Skeleton JSON preset to admin theme fields", () => {
-    const mapped = mapSkeletonPresetToAdminTheme({
+    const mapped = mapPresetToAdminTheme({
       name: "Midnight",
       properties: sampleProperties,
     });
@@ -78,7 +78,7 @@ describe("skeleton-preset-mapper", () => {
   });
 
   it("maps CSS-only Skeleton exports with name", () => {
-    const mapped = mapSkeletonPresetToAdminTheme({
+    const mapped = mapPresetToAdminTheme({
       name: "From CSS",
       css: "[data-theme='x'] { --color-primary-500: oklch(0.5 0.2 260deg); }",
     });
@@ -107,13 +107,15 @@ describe("skeleton-preset-mapper", () => {
     expect(expanded["--color-primary-950"]).toContain("color-mix");
     expect(expanded["--color-surface-50"]).toBe("#f8fafc");
     expect(expanded["--color-surface-500"]).toContain("color-mix");
+    expect(expanded["--color-surface-800"]).toContain("color-mix");
+    expect(expanded["--color-surface-950"]).toContain("color-mix");
   });
 
-  it("maps corporate.json shorthand properties to customCss", () => {
-    const corporate = JSON.parse(
-      readFileSync(join(process.cwd(), "src", "themes", "corporate.json"), "utf-8"),
+  it("maps default.json shorthand properties to customCss", () => {
+    const preset = JSON.parse(
+      readFileSync(join(process.cwd(), "src", "themes", "default.json"), "utf-8"),
     );
-    const mapped = mapSkeletonPresetToAdminTheme(corporate);
+    const mapped = mapPresetToAdminTheme(preset);
     expect(mapped.customCss).toContain("--color-primary-500: #0f766e");
     expect(mapped.customCss).toContain("--color-tertiary-500: #1d4ed8");
     expect(mapped.customCss).toContain(".admin-theme-container, [data-admin-theme]");

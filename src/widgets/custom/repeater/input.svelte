@@ -17,8 +17,9 @@ Renders a list of forms, one for each item in the array. Supports Drag-and-Drop 
 	import { getCachedWidgetInputLoader } from '@widgets/widget-loader-registry';
 	import { getFieldName } from '@utils/utils';
 	import { flip } from 'svelte/animate';
-	import type { DndEvent } from 'svelte-dnd-action';
-	import { dndzone } from 'svelte-dnd-action';
+	import { untrack } from 'svelte';
+	import { draggable, droppable } from '@thisux/sveltednd';
+	import type { DragDropState } from '@thisux/sveltednd';
 	const uuidv4 = () => crypto.randomUUID();
 	import type { FieldType } from './index';
 	import Button from '@components/ui/button.svelte';
@@ -63,12 +64,33 @@ Renders a list of forms, one for each item in the array. Supports Drag-and-Drop 
 		value = items.map((i) => i.data);
 	}
 
-	function handleDndConsider(e: CustomEvent<DndEvent<{ id: string; data: any }>>) {
-		items = e.detail.items;
-	}
+	function handleRepeaterDrop(state: DragDropState<{ id: string; data: Record<string, any> }>) {
+		const dragged = state.draggedItem;
+		if (!dragged) return;
+		const fromIndex = items.indexOf(dragged);
+		if (fromIndex < 0) return;
 
-	function handleDndFinalize(e: CustomEvent<DndEvent<{ id: string; data: any }>>) {
-		items = e.detail.items;
+		const targetEl = state.targetElement?.closest('[data-item-id]') as HTMLElement | null;
+		const targetItemId = targetEl?.dataset?.itemId;
+
+		let targetIndex: number;
+		if (targetItemId) {
+			targetIndex = items.findIndex(i => i.id === targetItemId);
+			if (state.dropPosition === 'after') targetIndex++;
+		} else {
+			targetIndex = items.length;
+		}
+		targetIndex = Math.max(0, Math.min(targetIndex, items.length));
+
+		if (fromIndex === targetIndex) return;
+		const newItems = untrack(() => {
+			const copy = [...items];
+			copy.splice(fromIndex, 1);
+			const adjusted = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
+			copy.splice(adjusted, 0, dragged);
+			return copy;
+		});
+		items = newItems;
 		updateValue();
 	}
 
@@ -117,44 +139,54 @@ Renders a list of forms, one for each item in the array. Supports Drag-and-Drop 
 
 <div class="w-full space-y-2">
 	<div
-		use:dndzone={{ items, flipDurationMs: 300, dropTargetStyle: { outline: '2px solid var(--color-primary-500)', 'border-radius': '0.5rem' } }}
-		onconsider={handleDndConsider}
-		onfinalize={handleDndFinalize}
+		use:droppable={{
+			container: 'repeater',
+			callbacks: { onDrop: handleRepeaterDrop },
+			direction: 'vertical',
+			attributes: { dragOverClass: 'bg-secondary-200' }
+		}}
 		class="flex flex-col gap-2"
+		role="list"
+		aria-label="Repeater items"
 	>
 		{#each items as item, index (item.id)}
+			<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 			<div
-				class="rounded-container-token border border-surface-200 bg-surface-50 dark:border-surface-700 dark:bg-surface-800"
+				class="rounded-lg border border-surface-200 bg-surface-50 dark:border-surface-700 dark:bg-surface-800"
 				animate:flip={{ duration: 300 }}
+				use:draggable={{ container: 'repeater', dragData: item, keyboard: true }}
+				role="listitem"
+				tabindex="0"
 			>
 				<!-- Header / Handle -->
 				<header class="flex items-center justify-between border-b border-surface-200 p-2 dark:border-surface-700">
 					<div class="flex items-center gap-2">
 						<!-- Drag Handle -->
-						<button
-							class="cursor-grab active:cursor-grabbing p-1 text-surface-400 hover:text-tertiary-500 dark:text-primary-500"
+						<Button
+							variant="ghost"
+							class="cursor-grab active:cursor-grabbing p-1"
 							aria-label="Drag to reorder"
 							title="Drag to reorder"
 						>
 							<iconify-icon icon="mdi:drag" width="20"></iconify-icon>
-						</button>
+						</Button>
 
-						<button onclick={() => toggleCollapse(item.id)} class="flex items-center gap-2 text-sm font-semibold">
+						<Button variant="ghost" onclick={() => toggleCollapse(item.id)} class="flex items-center gap-2 text-sm font-semibold">
 							<iconify-icon icon={collapsedItems[item.id] ? 'mdi:chevron-right' : 'mdi:chevron-down'} width="16"></iconify-icon>
 							{getItemLabel(item.data, index)}
-						</button>
-					</div>
+													</Button>
+												</div>
 
-					<button onclick={() => removeItem(item.id)} class="text-error-500 hover:text-error-600 p-1" aria-label="Remove Item" title="Remove Item">
-						<iconify-icon icon="mdi:delete" width="18"></iconify-icon>
-					</button>
+												<Button variant="ghost" onclick={() => removeItem(item.id)} class="text-error-500 hover:text-error-600 p-1" aria-label="Remove Item" title="Remove Item">
+													<iconify-icon icon="mdi:delete" width="18"></iconify-icon>
+												</Button>
 				</header>
 
 				<!-- Body -->
 				{#if !collapsedItems[item.id]}
 					<div class="p-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
 						{#if (field as any).fields}
-							{#each (field as any).fields as subField}
+							{#each (field as any).fields as subField (subField.db_fieldName ?? subField.label)}
 								{const subFieldName = subField.db_fieldName || getFieldName(subField)}
 								{const widgetName = subField.widget?.Name || subField.type || 'Input'}
 								{const widgetLoader = getWidgetLoader(widgetName)}

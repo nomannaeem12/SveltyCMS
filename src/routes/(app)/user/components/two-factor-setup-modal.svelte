@@ -27,6 +27,7 @@ This modal displays the QR code for setting up 2FA and handles verification.
 	import { toast } from '@src/stores/toast.svelte.ts';
 	// Utils
 	import { logger } from '@utils/logger';
+	import { clientJsonHeaders } from '@utils/security/client-csrf';
 	import QrCode from '@components/ui/qr-code.svelte';
 
 	// Native UI Components
@@ -103,7 +104,7 @@ This modal displays the QR code for setting up 2FA and handles verification.
 		try {
 			const response = await fetch('/api/auth/2fa/verify-setup', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
+				headers: clientJsonHeaders(),
 				body: JSON.stringify({ code: verificationCode.trim() })
 			});
 
@@ -202,7 +203,7 @@ This modal displays the QR code for setting up 2FA and handles verification.
 						{twofa_verify_setup_description()}
 					</label>
 					<div class="relative">
-						<input
+						<input aria-label="Verification code"
 							id="verification-code"
 							type="text"
 							bind:value={verificationCode}
@@ -213,7 +214,6 @@ This modal displays the QR code for setting up 2FA and handles verification.
 							autocomplete="off"
 							class:border-error-500={error}
 							class:focus\:border-error-500={error}
-							aria-label="Verification code"
 						/>
 					</div>
 
@@ -273,7 +273,7 @@ This modal displays the QR code for setting up 2FA and handles verification.
 				type="submit"
 				form="twofa-form"
 				disabled={verificationCode.length !== 6 || isVerifying}
-			 class="dark: {parent?.buttonPositive ?? ''}">
+			class={parent?.buttonPositive ?? ''}>
 				{#if isVerifying}
 					<iconify-icon icon="mdi:loading" width="24" class="animate-spin"></iconify-icon>
 					{twofa_verifying()}
@@ -285,7 +285,7 @@ This modal displays the QR code for setting up 2FA and handles verification.
 		{:else}
 			<!-- Complete Footer -->
 			<Button variant="outline" type="button" onclick={cancelSetup}>{button_cancel()}</Button>
-			<Button variant="success" type="button" onclick={completeSetup} class="{parent?.buttonPositive ?? ''}">
+			<Button variant="success" type="button" onclick={completeSetup} class={parent?.buttonPositive ?? ''}>">
 				<iconify-icon icon="mdi:check" width="20" class="me-2"></iconify-icon>
 				{button_complete()}
 			</Button>

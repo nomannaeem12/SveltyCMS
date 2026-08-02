@@ -70,7 +70,10 @@ declare global {
       cspNonce?: string;
       customCss: string;
       darkMode: boolean;
+      /** Tenant-scoped adapter when MULTI_TENANT + tenantId (use for request DB work). */
       dbAdapter?: DatabaseAdapter | null;
+      /** Raw adapter without tenant injection (scheduler, migrations, cross-tenant admin). */
+      dbAdapterUnscoped?: DatabaseAdapter | null;
       degradedServices?: string[];
       getSession: () => Promise<import("@auth/core/types").Session | null>;
       hasManageUsersPermission: boolean;
@@ -100,5 +103,21 @@ declare global {
     errors: string[];
     message: string;
     success: boolean;
+  }
+
+  // Bun runtime global (used in typeof Bun !== "undefined" guards)
+  var Bun: {
+    version: string;
+    gc(expose?: boolean): void;
+    [key: string]: any;
+  };
+}
+
+declare module "bun:sqlite" {
+  export class Database {
+    constructor(path: string, options?: { create?: boolean; readonly?: boolean });
+    query(sql: string): any;
+    run(sql: string, ...params: any[]): any;
+    close(): void;
   }
 }

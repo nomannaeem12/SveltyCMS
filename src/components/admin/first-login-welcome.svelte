@@ -166,16 +166,17 @@
 
 		<!-- Progress Indicator -->
 		<div class="mb-8 flex justify-center">
-			<div class="flex space-x-2">
+			<div class="flex gap-2">
 				{#each welcomeSteps as step, index (index)}
-					<button aria-label="Go to step {index + 1}: {step.title}"
+					<Button aria-label="Go to step {index + 1}: {step.title}"
+						variant="ghost"
 						class="h-3 w-3 rounded-full transition-colors duration-200 {index === currentStep
 							? 'bg-blue-600'
 							: step.completed
 								? 'bg-green-500'
 								: 'bg-gray-300 dark:bg-gray-600'}"
 						onclick={() => (currentStep = index)}
-					></button>
+					></Button>
 				{/each}
 			</div>
 		</div>
@@ -203,7 +204,7 @@
 				<!-- Special content for data management step -->
 				{#if step.id === 'data-management'}
 					<div class="mb-6 rounded bg-blue-50 p-4 dark:bg-blue-900/20">
-						<div class="flex items-start space-x-3">
+						<div class="flex items-start gap-3">
 							<iconify-icon icon="mdi:information" width={20} class="mt-0.5 text-blue-600 dark:text-blue-400"></iconify-icon>
 							<div class="text-sm">
 								<p class="mb-1 font-medium text-blue-900 dark:text-blue-100">Data Management Tips</p>
@@ -255,15 +256,15 @@
 
 	<!-- Footer -->
 	<div class="flex w-full items-center justify-between">
-		<div class="flex space-x-2">
-			<Button onclick={previousStep} variant="ghost" disabled={currentStep === 0} aria-label="Previous step">
+		<div class="flex gap-2">
+						<Button onclick={previousStep} variant="ghost" disabled={currentStep === 0} aria-label="Previous step">
 				<iconify-icon icon="mdi:chevron-left" width={16} class="me-1"></iconify-icon>
 				Previous
 			</Button>
 		</div>
 
-		<div class="flex space-x-2">
-			<Button onclick={dismissWelcome} variant="ghost" aria-label="Skip tour">Skip Tour</Button>
+		<div class="flex gap-2">
+						<Button onclick={dismissWelcome} variant="ghost" aria-label="Skip tour">Skip Tour</Button>
 
 			{#if currentStep < welcomeSteps.length - 1}
 				<Button onclick={nextStep} variant="secondary" aria-label="Next step">
@@ -301,8 +302,8 @@
 					<iconify-icon icon="mdi:shield-check" width={16} class="me-1 inline"></iconify-icon>
 					Your data is securely managed and never leaves your server
 				</div>
-				<div class="flex space-x-2">
-					<Button aria-label="Done with import/export"
+				<div class="flex gap-2">
+										<Button aria-label="Done with import/export"
 						onclick={() => {
 							showImportExport = false;
 							markStepCompleted('data-management');
